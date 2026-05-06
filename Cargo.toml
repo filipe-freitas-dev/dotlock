@@ -2,6 +2,16 @@
 name = "dotlock"
 version = "0.1.0"
 edition = "2024"
+description = "Encrypted project-local environment variables manager"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/filipe-freitas-dev/dotlock"
+readme = "README.md"
+keywords = ["cli", "secrets", "env", "encryption"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "dl"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.102"

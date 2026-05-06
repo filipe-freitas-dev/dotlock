@@ -47,32 +47,29 @@ It is designed to replace ad‑hoc `.env` files for local development and small 
 
 ## Installation
 
-Build from source with Cargo (Rust edition 2024 toolchain required):
+The crate is `dotlock`, but the installed binary is named **`dl`** — short and quick to type.
+
+### From crates.io
+
+```bash
+cargo install dotlock
+# binary `dl` will be at ~/.cargo/bin/dl
+```
+
+### From source
+
+Rust edition 2024 toolchain required:
 
 ```bash
 cargo build --release
-# binary will be at ./target/release/dotlock
+# binary will be at ./target/release/dl
 ```
 
 Drop the binary somewhere on your `PATH`, e.g.:
 
 ```bash
-install -m 0755 target/release/dotlock ~/.local/bin/dotlock
+install -m 0755 target/release/dl ~/.local/bin/dl
 ```
-
-### Recommended: alias `dl`
-
-You will type the command often. **Set up a `dl` alias** so daily flows feel like `dl set X Y` and `dl run npm start`:
-
-```bash
-# bash / zsh — append to ~/.bashrc or ~/.zshrc
-alias dl='dotlock'
-
-# fish — persistent alias
-alias --save dl=dotlock
-```
-
-Reload your shell (`exec $SHELL`) and you're set. Every example below works with `dl` in place of `dotlock`.
 
 ---
 
@@ -192,7 +189,7 @@ dl lock                        # explicit cleanup at the end
 
 ## Command reference
 
-All commands accept short aliases — for example `dotlock s` is `set`, `dotlock g` is `get`, `dotlock l` is `list`, `dotlock rm` / `dotlock del` is `unset`.
+All commands accept short aliases — for example `dl s` is `set`, `dl g` is `get`, `dl l` is `list`, `dl rm` / `dl del` is `unset`.
 
 ### Project lifecycle
 
@@ -332,4 +329,9 @@ src/
 
 ## License
 
-See repository for license information.
+Dual‑licensed under either:
+
+- **MIT** license ([LICENSE-MIT](./LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+- **Apache License, Version 2.0** ([LICENSE-APACHE](./LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+
+at your option.
