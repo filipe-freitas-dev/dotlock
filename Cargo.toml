@@ -1,5 +1,5 @@
 [package]
-name = "dotlock"
+name = "dotlock-bin"
 version = "0.1.0"
 edition = "2024"
 description = "Encrypted project-local environment variables manager"

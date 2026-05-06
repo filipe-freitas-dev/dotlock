@@ -47,12 +47,12 @@ It is designed to replace ad‑hoc `.env` files for local development and small 
 
 ## Installation
 
-The crate is `dotlock`, but the installed binary is named **`dl`** — short and quick to type.
+The crate is `dotlock-bin` (the name `dotlock` was already taken on crates.io by an unrelated lockfile crate). The installed binary is named **`dl`** — short and quick to type.
 
 ### From crates.io
 
 ```bash
-cargo install dotlock
+cargo install dotlock-bin
 # binary `dl` will be at ~/.cargo/bin/dl
 ```
 
