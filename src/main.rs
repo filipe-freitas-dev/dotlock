@@ -250,33 +250,65 @@ fn print_get_result(name: &str, id: &str, value: &str) {
     }
 
     let short = short_uuid(id);
-    let id_w = "ID".len().max(short.chars().count());
-    let name_w = "NAME".len().max(name.chars().count());
+    let title = name.to_string();
+    let id_line = format!("id: {}", short);
+    let value_lines: Vec<&str> = if value.is_empty() {
+        vec![""]
+    } else {
+        value.lines().collect()
+    };
 
-    let pad = |s: &str, w: usize| {
+    let center = |s: &str, w: usize| {
         let len = s.chars().count();
         if len >= w {
             s.to_string()
         } else {
-            format!("{}{}", s, " ".repeat(w - len))
+            let total = w - len;
+            let left = total / 2;
+            let right = total - left;
+            format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
         }
     };
+    let content_w = title
+        .chars()
+        .count()
+        .max(id_line.chars().count())
+        .max(value_lines.iter().map(|line| line.chars().count()).max().unwrap_or(0));
+    let inner_w = content_w + 2;
 
     println!();
     println!(
-        "  {}  {}",
-        pad("ID", id_w).dimmed().bold(),
-        pad("NAME", name_w).dimmed().bold()
+        "  {}{}{}",
+        "┌".dimmed(),
+        "─".repeat(inner_w).dimmed(),
+        "┐".dimmed()
     );
     println!(
-        "  {}  {}",
-        "─".repeat(id_w).dimmed(),
-        "─".repeat(name_w).dimmed()
+        "  {}{}{}",
+        "│ ".dimmed(),
+        center(&title, content_w).bold(),
+        " │".dimmed()
     );
     println!(
-        "  {}  {}",
-        pad(&short, id_w).yellow(),
-        pad(name, name_w).bold()
+        "  {}{}{}",
+        "│ ".dimmed(),
+        center(&id_line, content_w).yellow(),
+        " │".dimmed()
+    );
+    println!("  {}{}{}", "│ ".dimmed(), " ".repeat(content_w), " │".dimmed());
+    for line in value_lines {
+        println!(
+            "  {}{}{}",
+            "│ ".dimmed(),
+            center(line, content_w),
+            " │".dimmed()
+        );
+    }
+    println!(
+        "  {}{}{}",
+        "└".dimmed(),
+        "─".repeat(content_w + 2).dimmed(),
+        "┘".dimmed()
     );
     println!();
     println!(
