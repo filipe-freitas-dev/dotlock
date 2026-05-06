@@ -62,7 +62,7 @@ install -m 0755 target/release/dotlock ~/.local/bin/dotlock
 
 ### Recommended: alias `dl`
 
-You will type the command often. **Set up a `dl` alias** so daily flows feel like `dl set X Y` and `dl run -- npm start`:
+You will type the command often. **Set up a `dl` alias** so daily flows feel like `dl set X Y` and `dl run npm start`:
 
 ```bash
 # bash / zsh — append to ~/.bashrc or ~/.zshrc
@@ -84,7 +84,7 @@ Reload your shell (`exec $SHELL`) and you're set. Every example below works with
 cd ~/code/my-app
 
 # Initialize the vault (prompts for a master password, or generates one for you)
-dl init
+dl init 
 
 # Pull in everything from your existing .env in one shot
 dl migrate .env
@@ -99,9 +99,9 @@ rm .env
 Now run your app with the secrets injected only into the child process:
 
 ```bash
-dl run -- npm start
-dl run -- python manage.py runserver
-dl run -- cargo test
+dl run npm start
+dl run python manage.py runserver
+dl run cargo test
 ```
 
 Need to add or update one variable on the fly:
