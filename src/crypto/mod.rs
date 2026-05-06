@@ -8,6 +8,7 @@ use base64::{Engine as _, engine::general_purpose};
 use colored::Colorize;
 use inquire::{Confirm, Password, PasswordDisplayMode, Select, validator::Validation};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
@@ -26,6 +27,7 @@ const GENERATED_PASSWORD_LEN: usize = 32;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultKeyMetadata {
     pub version: u32,
+    pub project_uuid: String,
     pub project: String,
     pub environment: String,
 
@@ -144,6 +146,7 @@ pub fn initialize_vault_keys(project: &str, environment: &str) -> DotLockResult<
 
     let metadata = VaultKeyMetadata {
         version: 1,
+        project_uuid: Uuid::new_v4().to_string(),
         project: project.to_string(),
         environment: environment.to_string(),
 

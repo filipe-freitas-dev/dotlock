@@ -14,7 +14,7 @@ pub enum DotLockError {
     #[error("a DotLock vault already exists in `.lock/`")]
     ProjectAlreadyInitialized,
 
-    #[error("vault is in a legacy format (missing UUIDs on secrets or the integrity hash)")]
+    #[error("vault is in a legacy format (missing vault UUID, secret UUIDs, or the integrity hash)")]
     LegacyVaultFormat,
 
     #[error("secret `{name}` not found")]

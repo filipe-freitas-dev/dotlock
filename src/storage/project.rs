@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::PathBuf;
 
 use crate::domain::{error::DotLockError, model::DotLockResult};
 
@@ -7,7 +7,7 @@ pub const VAULT_FILE: &str = ".lock/vault.toml";
 pub const SECRETS_FILE: &str = ".lock/secrets.lock";
 
 pub fn is_project_initialized() -> bool {
-    Path::new(VAULT_FILE).exists()
+    PathBuf::from(VAULT_FILE).exists()
 }
 
 pub fn ensure_project_initialized() -> DotLockResult<()> {
