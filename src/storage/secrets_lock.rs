@@ -50,15 +50,15 @@ pub fn load_secrets_file<P: AsRef<Path>>(path: P) -> DotLockResult<SecretsFile> 
         return Ok(SecretsFile::default());
     }
 
-    let file = toml::from_str::<SecretsFile>(&content).map_err(|_| DotLockError::LegacyVaultFormat)?;
+    let file =
+        toml::from_str::<SecretsFile>(&content).map_err(|_| DotLockError::LegacyVaultFormat)?;
     Ok(file)
 }
 
 fn write_secrets_file<P: AsRef<Path>>(path: P, file: &SecretsFile) -> DotLockResult<()> {
     let path = path.as_ref();
 
-    let content =
-        toml::to_string_pretty(file).map_err(|e| DotLockError::Crypto(e.to_string()))?;
+    let content = toml::to_string_pretty(file).map_err(|e| DotLockError::Crypto(e.to_string()))?;
     secure_fs::write_string_atomic(path, &content, 0o700, 0o600)
 }
 
@@ -93,7 +93,8 @@ pub fn upsert_secret<P: AsRef<Path>>(
     let path = path.as_ref();
     let mut file = load_secrets_file(path)?;
 
-    let data_str = String::from_utf8(encrypted.data).map_err(|e| DotLockError::Crypto(e.to_string()))?;
+    let data_str =
+        String::from_utf8(encrypted.data).map_err(|e| DotLockError::Crypto(e.to_string()))?;
 
     if let Some(existing) = file
         .secrets
@@ -173,11 +174,7 @@ pub fn upsert_many<P: AsRef<Path>>(
     Ok(summary)
 }
 
-pub fn remove_secret_by_name(
-    name: &str,
-    dek: &[u8; 32],
-    vault_path: &str,
-) -> DotLockResult<()> {
+pub fn remove_secret_by_name(name: &str, dek: &[u8; 32], vault_path: &str) -> DotLockResult<()> {
     let mut file = load_secrets_file(SECRETS_FILE)?;
     let before = file.secrets.len();
     file.secrets.retain(|secret| secret.name != name);

@@ -83,7 +83,12 @@ pub fn read_to_string(path: &Path) -> DotLockResult<String> {
     fs::read_to_string(path).map_err(DotLockError::from)
 }
 
-pub fn write_string_atomic(path: &Path, content: &str, dir_mode: u32, file_mode: u32) -> DotLockResult<()> {
+pub fn write_string_atomic(
+    path: &Path,
+    content: &str,
+    dir_mode: u32,
+    file_mode: u32,
+) -> DotLockResult<()> {
     let parent = path.parent().ok_or_else(|| invalid_path(path))?;
     ensure_dir(parent, dir_mode)?;
     reject_symlink(path)?;

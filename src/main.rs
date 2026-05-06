@@ -1,4 +1,3 @@
-use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -7,20 +6,35 @@ use colored::Colorize;
 use zeroize::Zeroize;
 
 use crate::{
-    domain::{error::DotLockError, model::Alg, model::DotLockResult},
+    crypto::{ask_master_password, dek::generate_dek, update_master_password_metadata},
+    domain::{
+        error::DotLockError,
+        model::{Alg, DotLockResult},
+    },
     runtime::{decryption_process, encryption_process, run_with_secrets},
     storage::{
         cache::invalidate_cache,
         env_file::parse_env_file,
+        identity::{
+            initialize_local_identity, load_local_identity, private_key_path, public_key_path,
+        },
         init_project::init_project,
         project::{SECRETS_FILE, VAULT_FILE, ensure_project_initialized},
         secrets_lock::{
-            EncryptedEntry, find_secret_by_name, list_secrets, remove_secret_by_name,
-            upsert_many, upsert_secret,
+            EncryptedEntry, SecretRecord, find_secret_by_name, list_secrets, load_secrets_file,
+            remove_secret_by_name, save_secrets_file, upsert_many, upsert_secret,
         },
-        unlock_file::unlock_vault,
+        shared_access::{
+            enable_shared_access, grant_recipient, list_recipients, load_public_key_from_file,
+            revoke_recipient_in_memory, rewrap_recipients,
+        },
+        unlock_file::{
+            unlock_vault, unlock_vault_with_master_password,
+            unlock_vault_with_master_password_and_passphrase,
+        },
+        vault_file::{load_vault_metadata, save_vault_metadata},
     },
-    utils::{normalize_var_name, parse_alg},
+    utils::{normalize_var_name, parse_alg, print_get_result, print_secrets_table, report_error},
 };
 
 mod crypto;
@@ -30,7 +44,10 @@ mod storage;
 mod utils;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "DotLock encrypts your project's environment variables.")]
+#[command(
+    version,
+    about = "DotLock encrypts your project's environment variables."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -69,6 +86,12 @@ enum Commands {
     #[command(alias = "m")]
     #[command(alias = "import")]
     Migrate(MigrateArgs),
+    /// Manage the local identity used for shared access
+    Cert(CertArgs),
+    /// Manage shared project access
+    Share(ShareArgs),
+    /// Rotate project access material
+    Rotate(RotateArgs),
 }
 
 #[derive(Args, Debug)]
@@ -100,6 +123,62 @@ struct MigrateArgs {
     /// Path to the .env file to import
     #[arg(default_value = ".env")]
     path: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct CertArgs {
+    #[command(subcommand)]
+    command: CertCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum CertCommand {
+    /// Generate a local key pair for shared access
+    Init {
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show the local identity fingerprint and paths
+    Show,
+    /// Print or save the local public key
+    ExportPub { path: Option<PathBuf> },
+}
+
+#[derive(Args, Debug)]
+struct ShareArgs {
+    #[command(subcommand)]
+    command: ShareCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ShareCommand {
+    /// Turn the current project into shared mode
+    Enable,
+    /// Grant project access to a public key
+    Grant {
+        #[arg(long)]
+        pubkey: PathBuf,
+        #[arg(long)]
+        label: String,
+    },
+    /// Revoke project access from a recipient
+    Revoke { query: String },
+    /// List current recipients
+    List,
+}
+
+#[derive(Args, Debug)]
+struct RotateArgs {
+    #[command(subcommand)]
+    command: RotateCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum RotateCommand {
+    /// Change the master password wrapping the project key
+    MasterPassword,
+    /// Generate a new project key and re-encrypt the secrets
+    ProjectKey,
 }
 
 fn main() -> ExitCode {
@@ -240,151 +319,209 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
             );
             Ok(())
         }
+
+        Commands::Cert(CertArgs { command }) => match command {
+            CertCommand::Init { force } => {
+                let identity = initialize_local_identity(force)?;
+                println!(
+                    "{} local identity ready ({})",
+                    "ok:".green().bold(),
+                    identity.fingerprint.bold()
+                );
+                println!(
+                    "     {} {}",
+                    "private".dimmed(),
+                    private_key_path().display()
+                );
+                println!("     {} {}", "public".dimmed(), public_key_path().display());
+                Ok(())
+            }
+            CertCommand::Show => {
+                let identity = load_local_identity()?;
+                println!(
+                    "{} {}",
+                    "fingerprint:".cyan().bold(),
+                    identity.fingerprint.bold()
+                );
+                println!(
+                    "{} {}",
+                    "private:".cyan().bold(),
+                    private_key_path().display()
+                );
+                println!(
+                    "{} {}",
+                    "public:".cyan().bold(),
+                    public_key_path().display()
+                );
+                Ok(())
+            }
+            CertCommand::ExportPub { path } => {
+                let identity = load_local_identity()?;
+                if let Some(path) = path {
+                    storage::secure_fs::write_string_atomic(
+                        &path,
+                        &identity.public_key_pem,
+                        0o700,
+                        0o644,
+                    )?;
+                    println!(
+                        "{} public key exported to {}",
+                        "ok:".green().bold(),
+                        path.display().to_string().bold()
+                    );
+                } else {
+                    print!("{}", identity.public_key_pem);
+                }
+                Ok(())
+            }
+        },
+
+        Commands::Share(ShareArgs { command }) => match command {
+            ShareCommand::Enable => {
+                ensure_project_initialized()?;
+                let changed = enable_shared_access(VAULT_FILE)?;
+                if changed {
+                    println!("{} shared access enabled", "ok:".green().bold());
+                } else {
+                    println!("{} shared access already enabled", "info:".cyan().bold());
+                }
+                Ok(())
+            }
+            ShareCommand::Grant { pubkey, label } => {
+                ensure_project_initialized()?;
+                let dek = unlock_vault_with_master_password(VAULT_FILE)?;
+                let public_key_pem = load_public_key_from_file(&pubkey)?;
+                let recipient = grant_recipient(VAULT_FILE, &public_key_pem, &label, &dek)?;
+                println!(
+                    "{} access granted to {} ({})",
+                    "ok:".green().bold(),
+                    recipient.label.bold(),
+                    recipient.public_key_fingerprint.yellow()
+                );
+                Ok(())
+            }
+            ShareCommand::Revoke { query } => {
+                ensure_project_initialized()?;
+                let (dek, passphrase) =
+                    unlock_vault_with_master_password_and_passphrase(VAULT_FILE)?;
+                let mut metadata = load_vault_metadata(VAULT_FILE)?;
+                let mut secrets_file = load_secrets_file(SECRETS_FILE)?;
+                let removed = revoke_recipient_in_memory(&mut metadata, &query)?;
+                let new_dek = generate_dek().map_err(|e| DotLockError::Crypto(e.to_string()))?;
+
+                for secret in &mut secrets_file.secrets {
+                    reencrypt_secret(secret, &dek, &new_dek)?;
+                }
+
+                update_master_password_metadata(&mut metadata, &new_dek, &passphrase)?;
+                rewrap_recipients(&mut metadata, &new_dek)?;
+                save_vault_metadata(VAULT_FILE, &metadata)?;
+                save_secrets_file(SECRETS_FILE, &secrets_file, &new_dek, VAULT_FILE)?;
+                invalidate_cache()?;
+                println!(
+                    "{} access revoked for {} ({}); project key rotated",
+                    "ok:".green().bold(),
+                    removed.label.bold(),
+                    removed.public_key_fingerprint.yellow()
+                );
+                Ok(())
+            }
+            ShareCommand::List => {
+                ensure_project_initialized()?;
+                let mut recipients = list_recipients(VAULT_FILE)?;
+                recipients.sort_by(|a, b| a.label.cmp(&b.label));
+                print_recipients_table(&recipients);
+                Ok(())
+            }
+        },
+
+        Commands::Rotate(RotateArgs { command }) => match command {
+            RotateCommand::MasterPassword => {
+                ensure_project_initialized()?;
+                let dek = unlock_vault_with_master_password(VAULT_FILE)?;
+                let mut metadata = load_vault_metadata(VAULT_FILE)?;
+                let passphrase = ask_master_password()?;
+                update_master_password_metadata(&mut metadata, &dek, &passphrase)?;
+                save_vault_metadata(VAULT_FILE, &metadata)?;
+                println!("{} master password rotated", "ok:".green().bold());
+                Ok(())
+            }
+            RotateCommand::ProjectKey => {
+                ensure_project_initialized()?;
+                let dek = unlock_vault_with_master_password(VAULT_FILE)?;
+                let mut metadata = load_vault_metadata(VAULT_FILE)?;
+                let mut secrets_file = load_secrets_file(SECRETS_FILE)?;
+                let new_dek = generate_dek().map_err(|e| DotLockError::Crypto(e.to_string()))?;
+
+                for secret in &mut secrets_file.secrets {
+                    reencrypt_secret(secret, &dek, &new_dek)?;
+                }
+
+                let passphrase = ask_master_password()?;
+                update_master_password_metadata(&mut metadata, &new_dek, &passphrase)?;
+                rewrap_recipients(&mut metadata, &new_dek)?;
+                save_vault_metadata(VAULT_FILE, &metadata)?;
+                save_secrets_file(SECRETS_FILE, &secrets_file, &new_dek, VAULT_FILE)?;
+                println!("{} project key rotated", "ok:".green().bold());
+                Ok(())
+            }
+        },
     }
 }
 
-fn print_get_result(name: &str, id: &str, value: &str) {
-    if !std::io::stdout().is_terminal() {
-        println!("{}", value);
-        return;
-    }
-
-    let short = short_uuid(id);
-    let title = name.to_string();
-    let id_line = format!("id: {}", short);
-    let value_lines: Vec<&str> = if value.is_empty() {
-        vec![""]
-    } else {
-        value.lines().collect()
-    };
-
-    let center = |s: &str, w: usize| {
-        let len = s.chars().count();
-        if len >= w {
-            s.to_string()
-        } else {
-            let total = w - len;
-            let left = total / 2;
-            let right = total - left;
-            format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
-        }
-    };
-    let content_w = title
-        .chars()
-        .count()
-        .max(id_line.chars().count())
-        .max(value_lines.iter().map(|line| line.chars().count()).max().unwrap_or(0));
-    let inner_w = content_w + 2;
-
-    println!();
-    println!(
-        "  {}{}{}",
-        "┌".dimmed(),
-        "─".repeat(inner_w).dimmed(),
-        "┐".dimmed()
-    );
-    println!(
-        "  {}{}{}",
-        "│ ".dimmed(),
-        center(&title, content_w).bold(),
-        " │".dimmed()
-    );
-    println!(
-        "  {}{}{}",
-        "│ ".dimmed(),
-        center(&id_line, content_w).yellow(),
-        " │".dimmed()
-    );
-    println!("  {}{}{}", "│ ".dimmed(), " ".repeat(content_w), " │".dimmed());
-    for line in value_lines {
-        println!(
-            "  {}{}{}",
-            "│ ".dimmed(),
-            center(line, content_w),
-            " │".dimmed()
-        );
-    }
-    println!(
-        "  {}{}{}",
-        "└".dimmed(),
-        "─".repeat(content_w + 2).dimmed(),
-        "┘".dimmed()
-    );
-    println!();
-    println!(
-        "  {} pipe to a command to read the value (e.g. `dotlock get {} | pbcopy`)",
-        "hint:".cyan().bold(),
-        name
-    );
-    println!();
+fn reencrypt_secret(
+    secret: &mut SecretRecord,
+    old_dek: &[u8; 32],
+    new_dek: &[u8; 32],
+) -> DotLockResult<()> {
+    let alg = parse_alg(&secret.alg)?;
+    let value = decryption_process(secret.data.clone(), alg.clone(), old_dek)?;
+    let encrypted = encryption_process(secret.name.clone(), value, alg, new_dek)?;
+    secret.data =
+        String::from_utf8(encrypted.data).map_err(|e| DotLockError::Crypto(e.to_string()))?;
+    Ok(())
 }
 
-fn print_secrets_table(entries: &[storage::secrets_lock::SecretRecord]) {
-    if entries.is_empty() {
-        println!("{} no secrets stored", "info:".cyan().bold());
+fn print_recipients_table(recipients: &[crypto::VaultRecipient]) {
+    if recipients.is_empty() {
+        println!("{} no shared recipients", "info:".cyan().bold());
         return;
     }
 
-    let id_header = "ID";
-    let name_header = "NAME";
-
-    let id_w = id_header.len().max(8);
-    let name_w = entries
+    let label_w = recipients
         .iter()
-        .map(|e| e.name.chars().count())
+        .map(|entry| entry.label.len())
         .max()
-        .unwrap_or(0)
-        .max(name_header.len());
-
-    let pad = |s: &str, w: usize| {
-        let len = s.chars().count();
-        if len >= w {
-            s.to_string()
-        } else {
-            format!("{}{}", s, " ".repeat(w - len))
-        }
-    };
+        .unwrap_or(5)
+        .max(5);
+    let fp_w = recipients
+        .iter()
+        .map(|entry| entry.public_key_fingerprint.len())
+        .max()
+        .unwrap_or(11)
+        .max(11);
 
     println!();
     println!(
-        "  {}  {}",
-        pad(id_header, id_w).dimmed().bold(),
-        pad(name_header, name_w).dimmed().bold()
+        "  {:label_w$}  {:fp_w$}",
+        "LABEL".dimmed().bold(),
+        "FINGERPRINT".dimmed().bold(),
+        label_w = label_w,
+        fp_w = fp_w
     );
     println!(
         "  {}  {}",
-        "─".repeat(id_w).dimmed(),
-        "─".repeat(name_w).dimmed()
+        "─".repeat(label_w).dimmed(),
+        "─".repeat(fp_w).dimmed()
     );
-    for entry in entries {
-        let short = short_uuid(&entry.id);
+    for recipient in recipients {
         println!(
-            "  {}  {}",
-            pad(&short, id_w).yellow(),
-            pad(&entry.name, name_w).bold()
+            "  {:label_w$}  {:fp_w$}",
+            recipient.label.as_str().bold(),
+            recipient.public_key_fingerprint.as_str().yellow(),
+            label_w = label_w,
+            fp_w = fp_w
         );
     }
     println!();
-    println!(
-        "  {} {}",
-        "total:".cyan().bold(),
-        format!(
-            "{} secret{}",
-            entries.len(),
-            if entries.len() == 1 { "" } else { "s" }
-        )
-        .bold()
-    );
-    println!();
-}
-
-fn short_uuid(id: &str) -> String {
-    id.chars().take(8).collect()
-}
-
-fn report_error(err: &DotLockError) {
-    eprintln!("{} {}", "error:".red().bold(), err);
-    if let Some(hint) = err.hint() {
-        eprintln!("{} {}", "hint: ".cyan().bold(), hint);
-    }
 }

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::{
-    crypto::VaultKeyMetadata,
+    crypto::{AccessMode, VaultKeyMetadata},
     domain::{error::DotLockError, model::DotLockResult},
     storage::{secure_fs, vault_file::load_vault_metadata},
 };
@@ -33,6 +33,13 @@ fn ttl_secs() -> u64 {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_TTL_SECS)
+}
+
+fn shared_cache_enabled() -> bool {
+    std::env::var("DOTLOCK_SHARED_CACHE")
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 pub fn cache_path() -> PathBuf {
@@ -83,6 +90,12 @@ fn read_project_uuid() -> DotLockResult<String> {
     Ok(metadata.project_uuid)
 }
 
+fn shared_mode_active() -> bool {
+    load_vault_metadata(VAULT_FILE)
+        .map(|metadata| metadata.access_mode == AccessMode::Shared)
+        .unwrap_or(false)
+}
+
 fn short_uuid(uuid: &str) -> String {
     uuid.chars().take(8).collect()
 }
@@ -95,6 +108,11 @@ fn now_secs() -> u64 {
 }
 
 pub fn read_cached_dek() -> Option<Zeroizing<[u8; 32]>> {
+    if shared_mode_active() && !shared_cache_enabled() {
+        let _ = invalidate_cache();
+        return None;
+    }
+
     let path = cache_path();
     let legacy_path = legacy_cache_path();
     let path = if path.exists() {
@@ -119,6 +137,11 @@ pub fn read_cached_dek() -> Option<Zeroizing<[u8; 32]>> {
 }
 
 pub fn write_cached_dek(dek: &[u8; 32]) -> DotLockResult<()> {
+    if shared_mode_active() && !shared_cache_enabled() {
+        let _ = invalidate_cache();
+        return Ok(());
+    }
+
     let path = cache_path();
 
     let cache = SessionCache {
@@ -135,6 +158,77 @@ pub fn write_cached_dek(dek: &[u8; 32]) -> DotLockResult<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_cached_dek, shared_cache_enabled, write_cached_dek};
+    use crate::{
+        crypto::{AccessMode, VaultKeyMetadata},
+        storage::vault_file::save_vault_metadata,
+    };
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("dotlock-{name}-{unique}"));
+        fs::create_dir_all(&dir).expect("create dir");
+        dir
+    }
+
+    fn shared_metadata() -> VaultKeyMetadata {
+        VaultKeyMetadata {
+            version: 1,
+            project_uuid: "project".to_string(),
+            project: "dotlock".to_string(),
+            environment: "dev".to_string(),
+            kdf: "argon2id".to_string(),
+            salt_b64: "salt".to_string(),
+            memory_kib: 1,
+            iterations: 1,
+            parallelism: 1,
+            kek_version: 1,
+            wrapped_dek_nonce_b64: "nonce".to_string(),
+            wrapped_dek_b64: "wrapped".to_string(),
+            access_mode: AccessMode::Shared,
+            recipients: Vec::new(),
+            secrets_hash_nonce_b64: "hash_nonce".to_string(),
+            secrets_hash_b64: "hash".to_string(),
+        }
+    }
+
+    #[test]
+    fn shared_mode_does_not_cache_by_default() {
+        let dir = temp_dir("cache");
+        let project_dir = dir.join("project");
+        fs::create_dir_all(project_dir.join(".lock")).expect("project dir");
+        let cache_dir = dir.join("cache");
+        unsafe {
+            std::env::set_var("DOTLOCK_CACHE_DIR", &cache_dir);
+            std::env::set_var("DOTLOCK_SHARED_CACHE", "false");
+        }
+        save_vault_metadata(project_dir.join(".lock/vault.toml"), &shared_metadata())
+            .expect("save vault");
+        let cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&project_dir).expect("chdir");
+
+        assert!(!shared_cache_enabled());
+        write_cached_dek(&[5u8; 32]).expect("write cache");
+        assert!(read_cached_dek().is_none());
+
+        std::env::set_current_dir(cwd).expect("restore cwd");
+        let _ = fs::remove_dir_all(dir);
+        unsafe {
+            std::env::remove_var("DOTLOCK_CACHE_DIR");
+            std::env::remove_var("DOTLOCK_SHARED_CACHE");
+        }
+    }
 }
 
 pub fn invalidate_cache() -> DotLockResult<bool> {

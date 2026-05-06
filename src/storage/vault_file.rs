@@ -19,8 +19,8 @@ pub fn save_vault_metadata<P: AsRef<Path>>(
 
 pub fn load_vault_metadata<P: AsRef<Path>>(path: P) -> DotLockResult<VaultKeyMetadata> {
     let content = secure_fs::read_to_string(path.as_ref())?;
-    let metadata =
-        toml::from_str::<VaultKeyMetadata>(&content).map_err(|_| DotLockError::LegacyVaultFormat)?;
+    let metadata = toml::from_str::<VaultKeyMetadata>(&content)
+        .map_err(|_| DotLockError::LegacyVaultFormat)?;
 
     Ok(metadata)
 }
