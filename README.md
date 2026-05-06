@@ -37,7 +37,7 @@ It is designed to replace ad‑hoc `.env` files for local development and small 
 - **Short‑lived session cache** (`sudo`‑style): after the first unlock the DEK is cached for 30 seconds in your user directory, so you don't retype the master password on every command.
 - **Shared access mode** (`dotlock share`): each recipient gets the DEK wrapped with their own RSA public key, so a project can be unlocked by any authorized identity without a shared password.
 - **Local identity** (`dotlock cert`): generates a passphrase‑protected RSA key pair under `~/.lock/identity/` for use as a recipient.
-- **Run with secrets** (`dotlock run -- <cmd>`): decrypts in memory and spawns the child process with the variables injected as environment.
+- **Run with secrets** (`dotlock run <cmd>`): decrypts in memory and spawns the child process with the variables injected as environment.
 - **Rotation primitives**: rotate the master password or generate a brand‑new project key (re‑encrypting every secret).
 - **`.env` import** (`dotlock migrate`): bulk‑import an existing `.env` file in one step.
 - **Integrity check**: the vault metadata stores an authenticated hash of the secrets file so tampering is detected on unlock.
@@ -119,7 +119,7 @@ The first command of the day prompts for the master password. Subsequent command
 ```bash
 dl set API_KEY "abc"        # ← prompts for master password
 dl set ANOTHER_KEY "xyz"    # ← no prompt, uses cached key
-dl run -- npm test          # ← still no prompt
+dl run npm test          # ← still no prompt
 
 # Done for the day — drop the cached key:
 dl lock
@@ -182,9 +182,9 @@ For non‑interactive contexts, the typical pattern is to export `DOTLOCK_CACHE_
 ```bash
 export DOTLOCK_CACHE_TTL=600
 dl list > /dev/null            # primes the session cache
-dl run -- ./scripts/migrate.sh
-dl run -- ./scripts/seed.sh
-dl run -- npm test
+dl run ./scripts/migrate.sh
+dl run ./scripts/seed.sh
+dl run npm test
 dl lock                        # explicit cleanup at the end
 ```
 
@@ -210,7 +210,7 @@ All commands accept short aliases — for example `dotlock s` is `set`, `dotlock
 | `dl unset <NAME>` | Remove a variable. |
 | `dl list` | List variable names (no plaintext). |
 | `dl migrate [path]` | Import every variable from a `.env` file (defaults to `./.env`) in a single transaction. |
-| `dl run -- <cmd> [args...]` | Decrypt every secret in memory and spawn `<cmd>` with them as environment variables. |
+| `dl run <cmd> [args...]` | Decrypt every secret in memory and spawn `<cmd>` with them as environment variables. |
 
 ### Local identity (for shared mode)
 
