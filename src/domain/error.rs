@@ -38,7 +38,7 @@ pub enum DotLockError {
     #[error("algorithm `{alg}` is not supported")]
     UnsupportedAlgorithm { alg: String },
 
-    #[error("no command was provided to `dotlock run`")]
+    #[error("no command was provided to `dl run`")]
     MissingCommand,
 
     #[error("the command exited with status {status}")]
@@ -76,19 +76,19 @@ impl DotLockError {
                 Some("use at least 12 characters with lowercase, uppercase, a digit and a symbol")
             }
             DotLockError::ProjectNotInitialized => {
-                Some("run `dotlock init` in this directory before using other commands")
+                Some("run `dl init` in this directory before using other commands")
             }
             DotLockError::ProjectAlreadyInitialized => {
                 Some("use `set/get/list/unset`, or remove `.lock/` to start over")
             }
             DotLockError::LegacyVaultFormat => {
-                Some("delete the `.lock/` directory and run `dotlock init` to create a fresh vault")
+                Some("delete the `.lock/` directory and run `dl init` to create a fresh vault")
             }
             DotLockError::SecretNotFound { .. } => {
-                Some("list available secrets with `dotlock list`")
+                Some("list available secrets with `dl list`")
             }
             DotLockError::TamperedSecretsFile => Some(
-                "someone modified `.lock/secrets.lock` outside DotLock; restore from a trusted backup or start over with `dotlock init`",
+                "someone modified `.lock/secrets.lock` outside DotLock; restore from a trusted backup or start over with `dl init`",
             ),
             DotLockError::InvalidVariableName { .. } => {
                 Some("use only letters, digits and underscores; the name cannot start with a digit")
@@ -100,19 +100,19 @@ impl DotLockError {
                 Some("supported algorithms: xchacha20-poly1305")
             }
             DotLockError::MissingCommand => {
-                Some("pass the command after `--`, e.g. `dotlock run -- node app.js`")
+                Some("pass the command after `--`, e.g. `dl run -- node app.js`")
             }
             DotLockError::LocalIdentityNotInitialized => Some(
-                "run `dotlock cert init` to create your local key pair before using shared access",
+                "run `dl cert init` to create your local key pair before using shared access",
             ),
             DotLockError::LocalIdentityAlreadyInitialized => Some(
-                "use `dotlock cert show` to inspect the existing identity, or delete it manually before reinitializing",
+                "use `dl cert show` to inspect the existing identity, or delete it manually before reinitializing",
             ),
             DotLockError::RecipientNotFound { .. } => {
-                Some("list current recipients with `dotlock share list`")
+                Some("list current recipients with `dl share list`")
             }
             DotLockError::InvalidIdentityPassphrase => Some(
-                "enter the passphrase used when `dotlock cert init` created this local identity",
+                "enter the passphrase used when `dl cert init` created this local identity",
             ),
             DotLockError::Aborted => None,
             DotLockError::CommandFailed { .. } => None,

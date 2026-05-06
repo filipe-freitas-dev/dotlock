@@ -117,7 +117,7 @@ pub fn print_get_result(name: &str, id: &str, value: &str) {
     );
     println!();
     println!(
-        "  {} pipe to a command to read the value (e.g. `dotlock get {} | pbcopy`)",
+        "  {} pipe to a command to read the value (e.g. `dl get {} | pbcopy`)",
         "hint:".cyan().bold(),
         name
     );
