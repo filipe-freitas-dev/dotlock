@@ -87,8 +87,10 @@ enum Commands {
     #[command(alias = "import")]
     Migrate(MigrateArgs),
     /// Manage the local identity used for shared access
+    #[command(alias = "c")]
     Cert(CertArgs),
     /// Manage shared project access
+    #[command(alias = "shr")]
     Share(ShareArgs),
     /// Rotate project access material
     Rotate(RotateArgs),
@@ -134,13 +136,16 @@ struct CertArgs {
 #[derive(Subcommand, Debug)]
 enum CertCommand {
     /// Generate a local key pair for shared access
+    #[command(alias = "i")]
     Init {
-        #[arg(long)]
+        #[arg(long, short)]
         force: bool,
     },
     /// Show the local identity fingerprint and paths
+    #[command(alias = "sh")]
     Show,
     /// Print or save the local public key
+    #[command(alias = "x")]
     ExportPub { path: Option<PathBuf> },
 }
 
@@ -153,17 +158,21 @@ struct ShareArgs {
 #[derive(Subcommand, Debug)]
 enum ShareCommand {
     /// Turn the current project into shared mode
+    #[command(alias = "en")]
     Enable,
     /// Grant project access to a public key
+    #[command(alias = "gr")]
     Grant {
-        #[arg(long)]
+        #[arg(long, short)]
         pubkey: PathBuf,
-        #[arg(long)]
+        #[arg(long, short)]
         label: String,
     },
     /// Revoke project access from a recipient
+    #[command(alias = "rev")]
     Revoke { query: String },
     /// List current recipients
+    #[command(alias = "l")]
     List,
 }
 
@@ -176,8 +185,10 @@ struct RotateArgs {
 #[derive(Subcommand, Debug)]
 enum RotateCommand {
     /// Change the master password wrapping the project key
+    #[command(alias = "mp")]
     MasterPassword,
     /// Generate a new project key and re-encrypt the secrets
+    #[command(alias = "pk")]
     ProjectKey,
 }
 
