@@ -118,18 +118,27 @@ pub fn initialize_local_identity(force: bool) -> DotLockResult<LocalIdentityMeta
     Ok(meta)
 }
 
-pub fn load_local_identity() -> DotLockResult<LocalIdentity> {
+pub fn load_local_identity_metadata() -> DotLockResult<LocalIdentityMetadata> {
     let meta_path = metadata_path();
-    let private_path = private_key_path();
-    let public_path = public_key_path();
 
-    if !meta_path.exists() || !private_path.exists() || !public_path.exists() {
+    if !meta_path.exists() {
         return Err(DotLockError::LocalIdentityNotInitialized);
     }
 
     let meta_content = secure_fs::read_to_string(&meta_path)?;
-    let metadata = toml::from_str::<LocalIdentityMetadata>(&meta_content)
-        .map_err(|e| DotLockError::Crypto(format!("failed to parse identity metadata: {e}")))?;
+    toml::from_str::<LocalIdentityMetadata>(&meta_content)
+        .map_err(|e| DotLockError::Crypto(format!("failed to parse identity metadata: {e}")))
+}
+
+pub fn load_local_identity() -> DotLockResult<LocalIdentity> {
+    let private_path = private_key_path();
+    let public_path = public_key_path();
+
+    if !private_path.exists() || !public_path.exists() {
+        return Err(DotLockError::LocalIdentityNotInitialized);
+    }
+
+    let metadata = load_local_identity_metadata()?;
 
     let encrypted_private_key_pem = secure_fs::read_to_string(&private_path)?;
     let private_key_pem = if metadata.encrypted {
@@ -148,7 +157,7 @@ pub fn load_local_identity() -> DotLockResult<LocalIdentity> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalIdentityMetadata, load_local_identity};
+    use super::{LocalIdentityMetadata, load_local_identity, load_local_identity_metadata};
     use crate::storage::secure_fs;
     use std::{
         fs,
@@ -186,10 +195,13 @@ mod tests {
             .expect("write public");
 
         let loaded = load_local_identity().expect("load identity");
+        let loaded_meta = load_local_identity_metadata().expect("load identity metadata");
 
         assert_eq!(loaded.fingerprint, "abc");
         assert_eq!(loaded.private_key_pem, private);
         assert_eq!(loaded.public_key_pem, public);
+        assert_eq!(loaded_meta.fingerprint, "abc");
+        assert!(!loaded_meta.encrypted);
 
         let _ = fs::remove_dir_all(&dir);
         unsafe {

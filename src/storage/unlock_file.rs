@@ -1,4 +1,5 @@
 use base64::{Engine, engine::general_purpose};
+use colored::Colorize;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
@@ -14,7 +15,7 @@ use crate::{
     domain::{error::DotLockError, model::DotLockResult},
     storage::{
         cache::{invalidate_cache, read_cached_dek, write_cached_dek},
-        identity::load_local_identity,
+        identity::{load_local_identity, load_local_identity_metadata},
         project::SECRETS_FILE,
         vault_file::load_vault_metadata,
     },
@@ -100,16 +101,69 @@ pub fn unlock_vault_with_master_password_and_passphrase(
 fn try_unlock_vault_with_local_identity(
     metadata: &crate::crypto::VaultKeyMetadata,
 ) -> DotLockResult<Zeroizing<[u8; 32]>> {
-    let identity = load_local_identity()?;
+    let identity_meta = load_local_identity_metadata()?;
     let recipient = metadata
         .recipients
         .iter()
-        .find(|recipient| recipient.public_key_fingerprint == identity.fingerprint)
+        .find(|recipient| recipient.public_key_fingerprint == identity_meta.fingerprint)
         .ok_or_else(|| DotLockError::RecipientNotFound {
-            query: identity.fingerprint.clone(),
+            query: identity_meta.fingerprint.clone(),
         })?;
+    let identity = load_local_identity()?;
     let dek = unwrap_dek_with_private_key(&recipient.wrapped_dek_b64, &identity.private_key_pem)?;
     unlock_vault_with_dek(metadata, dek)
+}
+
+fn print_shared_recipients(metadata: &crate::crypto::VaultKeyMetadata) {
+    if metadata.recipients.is_empty() {
+        return;
+    }
+
+    let mut recipients = metadata.recipients.clone();
+    recipients.sort_by(|a, b| a.label.cmp(&b.label));
+
+    let label_w = recipients
+        .iter()
+        .map(|entry| entry.label.len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+    let fp_w = recipients
+        .iter()
+        .map(|entry| entry.public_key_fingerprint.len())
+        .max()
+        .unwrap_or(11)
+        .max(11);
+
+    println!();
+    println!(
+        "  {}",
+        "shared recipients available for certificate unlock:"
+            .cyan()
+            .bold()
+    );
+    println!(
+        "  {:label_w$}  {:fp_w$}",
+        "LABEL".dimmed().bold(),
+        "FINGERPRINT".dimmed().bold(),
+        label_w = label_w,
+        fp_w = fp_w
+    );
+    println!(
+        "  {}  {}",
+        "─".repeat(label_w).dimmed(),
+        "─".repeat(fp_w).dimmed()
+    );
+    for recipient in recipients {
+        println!(
+            "  {:label_w$}  {:fp_w$}",
+            recipient.label.as_str().bold(),
+            recipient.public_key_fingerprint.as_str().yellow(),
+            label_w = label_w,
+            fp_w = fp_w
+        );
+    }
+    println!();
 }
 
 pub fn unlock_vault(path: &str) -> DotLockResult<Zeroizing<[u8; 32]>> {
@@ -139,6 +193,8 @@ pub fn unlock_vault(path: &str) -> DotLockResult<Zeroizing<[u8; 32]>> {
             }
             Err(_) => {}
         }
+
+        print_shared_recipients(&metadata);
     }
 
     unlock_vault_with_master_password(path)
