@@ -3,7 +3,11 @@ pub mod integrity;
 pub mod kdf;
 pub mod kek;
 pub mod passgen;
+pub mod sdk;
+pub mod secret_cipher;
 pub mod share;
+
+use std::collections::HashMap;
 
 use base64::{Engine as _, engine::general_purpose};
 use colored::Colorize;
@@ -43,7 +47,26 @@ pub struct VaultRecipient {
     pub alg: String,
     pub public_key_fingerprint: String,
     pub public_key_b64: String,
+    #[serde(default)]
     pub wrapped_dek_b64: String,
+    #[serde(default)]
+    pub wrapped_sdks: HashMap<String, String>,
+    #[serde(default)]
+    pub full_access: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct VaultConfig {
+    #[serde(default)]
+    pub auto_fetch_on_run: bool,
+    #[serde(default)]
+    pub auto_fetch_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub auto_fetch_remote: Option<String>,
+    #[serde(default)]
+    pub auto_ratchet_after_writes: Option<u32>,
+    #[serde(default)]
+    pub dynamic_resolve_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,17 +83,25 @@ pub struct VaultKeyMetadata {
     pub parallelism: u32,
 
     pub kek_version: u32,
+    #[serde(default)]
+    pub kek_writes_since_rotate: u32,
 
     pub wrapped_dek_nonce_b64: String,
     pub wrapped_dek_b64: String,
+    #[serde(default)]
+    pub wrapped_sdks_under_kek: HashMap<String, String>,
 
     #[serde(default = "default_access_mode")]
     pub access_mode: AccessMode,
     #[serde(default)]
     pub recipients: Vec<VaultRecipient>,
+    #[serde(default)]
+    pub config: VaultConfig,
 
     pub secrets_hash_nonce_b64: String,
     pub secrets_hash_b64: String,
+    #[serde(default)]
+    pub secrets_hash_sha256_b64: String,
 }
 
 pub struct InitializedVault {
@@ -191,7 +222,7 @@ pub fn initialize_vault_keys(project: &str, environment: &str) -> DotLockResult<
     let dek = generate_dek().map_err(|e| DotLockError::Crypto(e.to_string()))?;
 
     let mut metadata = VaultKeyMetadata {
-        version: 1,
+        version: 2,
         project_uuid: Uuid::new_v4().to_string(),
         project: project.to_string(),
         environment: environment.to_string(),
@@ -203,15 +234,19 @@ pub fn initialize_vault_keys(project: &str, environment: &str) -> DotLockResult<
         parallelism: 0,
 
         kek_version: 1,
+        kek_writes_since_rotate: 0,
 
         wrapped_dek_nonce_b64: String::new(),
         wrapped_dek_b64: String::new(),
+        wrapped_sdks_under_kek: HashMap::new(),
 
         access_mode: AccessMode::MasterPassword,
         recipients: Vec::new(),
+        config: VaultConfig::default(),
 
         secrets_hash_nonce_b64: String::new(),
         secrets_hash_b64: String::new(),
+        secrets_hash_sha256_b64: String::new(),
     };
     update_master_password_metadata(&mut metadata, &dek, &passphrase)?;
 
@@ -231,4 +266,39 @@ pub fn prompt_unlock_password() -> DotLockResult<String> {
             | inquire::InquireError::OperationInterrupted => DotLockError::Aborted,
             other => DotLockError::Io(other.to_string()),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VaultKeyMetadata;
+
+    #[test]
+    fn vault_metadata_defaults_missing_config() {
+        let metadata = toml::from_str::<VaultKeyMetadata>(
+            r#"
+version = 2
+project_uuid = "project"
+project = "dotlock"
+environment = "dev"
+kdf = "argon2id"
+salt_b64 = "salt"
+memory_kib = 1
+iterations = 1
+parallelism = 1
+kek_version = 1
+wrapped_dek_nonce_b64 = "nonce"
+wrapped_dek_b64 = "wrapped"
+secrets_hash_nonce_b64 = "hash_nonce"
+secrets_hash_b64 = "hash"
+"#,
+        )
+        .expect("metadata");
+
+        assert!(!metadata.config.auto_fetch_on_run);
+        assert_eq!(metadata.config.auto_fetch_timeout_secs, None);
+        assert_eq!(metadata.config.auto_fetch_remote, None);
+        assert_eq!(metadata.config.auto_ratchet_after_writes, None);
+        assert_eq!(metadata.config.dynamic_resolve_timeout_secs, None);
+        assert_eq!(metadata.kek_writes_since_rotate, 0);
+    }
 }

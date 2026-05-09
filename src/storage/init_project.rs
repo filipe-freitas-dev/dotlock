@@ -1,8 +1,12 @@
 use colored::Colorize;
 
 use crate::{
-    crypto::{initialize_vault_keys, integrity::build_encrypted_hash_fields},
+    crypto::{
+        initialize_vault_keys,
+        integrity::{build_encrypted_hash_fields, file_sha256_b64},
+    },
     domain::model::DotLockResult,
+    git::install::install_merge_driver_if_in_git_repo,
     storage::{
         cache::write_cached_dek,
         project::{DOTLOCK_DIR, SECRETS_FILE, VAULT_FILE, ensure_project_not_initialized},
@@ -25,6 +29,7 @@ pub fn init_project() -> DotLockResult<()> {
     let (nonce_b64, hash_b64) = build_encrypted_hash_fields(SECRETS_FILE, &vault.dek)?;
     vault.metadata.secrets_hash_nonce_b64 = nonce_b64;
     vault.metadata.secrets_hash_b64 = hash_b64;
+    vault.metadata.secrets_hash_sha256_b64 = file_sha256_b64(SECRETS_FILE)?;
 
     save_vault_metadata(VAULT_FILE, &vault.metadata)?;
 
@@ -37,6 +42,8 @@ pub fn init_project() -> DotLockResult<()> {
     );
     println!("     {} {}", "created".dimmed(), VAULT_FILE.bold());
     println!("     {} {}", "created".dimmed(), SECRETS_FILE.bold());
+
+    let _ = install_merge_driver_if_in_git_repo()?;
 
     Ok(())
 }

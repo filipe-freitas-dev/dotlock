@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod config;
 pub mod env_file;
 pub mod identity;
 pub mod init_project;

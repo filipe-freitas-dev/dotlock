@@ -4,7 +4,9 @@ use inquire::{Password, PasswordDisplayMode};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    crypto::share::{GeneratedIdentity, decrypt_private_key_pem, generate_identity},
+    crypto::share::{
+        GeneratedIdentity, IdentityProtection, decrypt_private_key_pem, generate_identity,
+    },
     domain::{error::DotLockError, model::DotLockResult},
     storage::secure_fs,
 };
@@ -91,6 +93,13 @@ fn prompt_new_identity_passphrase() -> DotLockResult<String> {
 }
 
 pub fn initialize_local_identity(force: bool) -> DotLockResult<LocalIdentityMetadata> {
+    initialize_local_identity_with_options(force, false)
+}
+
+pub fn initialize_local_identity_with_options(
+    force: bool,
+    plain: bool,
+) -> DotLockResult<LocalIdentityMetadata> {
     let private_path = private_key_path();
     let public_path = public_key_path();
     let meta_path = metadata_path();
@@ -99,18 +108,22 @@ pub fn initialize_local_identity(force: bool) -> DotLockResult<LocalIdentityMeta
         return Err(DotLockError::LocalIdentityAlreadyInitialized);
     }
 
-    let passphrase = prompt_new_identity_passphrase()?;
     let GeneratedIdentity {
         private_key_pem,
         public_key_pem,
         fingerprint,
-    } = generate_identity(&passphrase)?;
+    } = if plain {
+        generate_identity(IdentityProtection::Plain)?
+    } else {
+        let passphrase = prompt_new_identity_passphrase()?;
+        generate_identity(IdentityProtection::Encrypted(&passphrase))?
+    };
 
     secure_fs::write_string_atomic(&private_path, &private_key_pem, 0o700, 0o600)?;
     secure_fs::write_string_atomic(&public_path, &public_key_pem, 0o700, 0o644)?;
     let meta = LocalIdentityMetadata {
         fingerprint: fingerprint.clone(),
-        encrypted: true,
+        encrypted: !plain,
     };
     let content = toml::to_string_pretty(&meta).map_err(|e| DotLockError::Crypto(e.to_string()))?;
     secure_fs::write_string_atomic(&meta_path, &content, 0o700, 0o600)?;
@@ -157,12 +170,21 @@ pub fn load_local_identity() -> DotLockResult<LocalIdentity> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalIdentityMetadata, load_local_identity, load_local_identity_metadata};
+    use super::{
+        LocalIdentityMetadata, initialize_local_identity_with_options, load_local_identity,
+        load_local_identity_metadata,
+    };
     use crate::storage::secure_fs;
     use std::{
         fs,
+        sync::{Mutex, OnceLock},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn temp_dir() -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -176,6 +198,7 @@ mod tests {
 
     #[test]
     fn initializes_and_loads_local_identity() {
+        let _guard = env_lock().lock().expect("lock");
         let dir = temp_dir();
         unsafe {
             std::env::set_var("DOTLOCK_IDENTITY_DIR", &dir);
@@ -202,6 +225,28 @@ mod tests {
         assert_eq!(loaded.public_key_pem, public);
         assert_eq!(loaded_meta.fingerprint, "abc");
         assert!(!loaded_meta.encrypted);
+
+        let _ = fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("DOTLOCK_IDENTITY_DIR");
+        }
+    }
+
+    #[test]
+    fn initializes_plain_identity_without_passphrase() {
+        let _guard = env_lock().lock().expect("lock");
+        let dir = temp_dir();
+        unsafe {
+            std::env::set_var("DOTLOCK_IDENTITY_DIR", &dir);
+        }
+
+        let meta = initialize_local_identity_with_options(false, true).expect("init identity");
+        let loaded = load_local_identity().expect("load identity");
+
+        assert!(!meta.encrypted);
+        assert_eq!(loaded.fingerprint, meta.fingerprint);
+        assert!(loaded.private_key_pem.contains("BEGIN PRIVATE KEY"));
+        assert!(!loaded.private_key_pem.contains("ENCRYPTED PRIVATE KEY"));
 
         let _ = fs::remove_dir_all(&dir);
         unsafe {

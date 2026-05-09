@@ -53,6 +53,9 @@ pub enum DotLockError {
     #[error("shared recipient `{query}` not found")]
     RecipientNotFound { query: String },
 
+    #[error("access denied to secret `{secret}`")]
+    AccessDenied { secret: String },
+
     #[error("invalid identity passphrase")]
     InvalidIdentityPassphrase,
 
@@ -84,9 +87,7 @@ impl DotLockError {
             DotLockError::LegacyVaultFormat => {
                 Some("delete the `.lock/` directory and run `dl init` to create a fresh vault")
             }
-            DotLockError::SecretNotFound { .. } => {
-                Some("list available secrets with `dl list`")
-            }
+            DotLockError::SecretNotFound { .. } => Some("list available secrets with `dl list`"),
             DotLockError::TamperedSecretsFile => Some(
                 "someone modified `.lock/secrets.lock` outside DotLock; restore from a trusted backup or start over with `dl init`",
             ),
@@ -102,18 +103,21 @@ impl DotLockError {
             DotLockError::MissingCommand => {
                 Some("pass the command after `--`, e.g. `dl run -- node app.js`")
             }
-            DotLockError::LocalIdentityNotInitialized => Some(
-                "run `dl cert init` to create your local key pair before using shared access",
-            ),
+            DotLockError::LocalIdentityNotInitialized => {
+                Some("run `dl cert init` to create your local key pair before using shared access")
+            }
             DotLockError::LocalIdentityAlreadyInitialized => Some(
                 "use `dl cert show` to inspect the existing identity, or delete it manually before reinitializing",
             ),
             DotLockError::RecipientNotFound { .. } => {
                 Some("list current recipients with `dl share list`")
             }
-            DotLockError::InvalidIdentityPassphrase => Some(
-                "enter the passphrase used when `dl cert init` created this local identity",
-            ),
+            DotLockError::AccessDenied { .. } => {
+                Some("ask the vault owner to grant access to this secret")
+            }
+            DotLockError::InvalidIdentityPassphrase => {
+                Some("enter the passphrase used when `dl cert init` created this local identity")
+            }
             DotLockError::Aborted => None,
             DotLockError::CommandFailed { .. } => None,
             DotLockError::Crypto(_) | DotLockError::Io(_) => None,

@@ -20,6 +20,7 @@ const CACHE_FILE_NAME: &str = "sessions.toml";
 const LEGACY_CACHE_FILE_NAME: &str = "sessions.lock";
 const APP_CACHE_DIR: &str = ".lock";
 const DEFAULT_TTL_SECS: u64 = 30;
+const MAX_TTL_SECS: u64 = 60 * 60;
 const VAULT_FILE: &str = ".lock/vault.toml";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -32,6 +33,7 @@ fn ttl_secs() -> u64 {
     std::env::var("DOTLOCK_CACHE_TTL")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
+        .map(|ttl| ttl.min(MAX_TTL_SECS))
         .unwrap_or(DEFAULT_TTL_SECS)
 }
 
@@ -164,7 +166,7 @@ pub fn write_cached_dek(dek: &[u8; 32]) -> DotLockResult<()> {
 mod tests {
     use super::{read_cached_dek, shared_cache_enabled, write_cached_dek};
     use crate::{
-        crypto::{AccessMode, VaultKeyMetadata},
+        crypto::{AccessMode, VaultConfig, VaultKeyMetadata},
         storage::vault_file::save_vault_metadata,
     };
     use std::{
@@ -194,12 +196,16 @@ mod tests {
             iterations: 1,
             parallelism: 1,
             kek_version: 1,
+            kek_writes_since_rotate: 0,
             wrapped_dek_nonce_b64: "nonce".to_string(),
             wrapped_dek_b64: "wrapped".to_string(),
+            wrapped_sdks_under_kek: std::collections::HashMap::new(),
             access_mode: AccessMode::Shared,
             recipients: Vec::new(),
+            config: VaultConfig::default(),
             secrets_hash_nonce_b64: "hash_nonce".to_string(),
             secrets_hash_b64: "hash".to_string(),
+            secrets_hash_sha256_b64: "hash_plain".to_string(),
         }
     }
 

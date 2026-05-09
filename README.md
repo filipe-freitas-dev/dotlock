@@ -9,329 +9,647 @@
     ╚═════╝   ╚═════╝     ╚═╝    ╚══════╝  ╚═════╝   ╚═════╝ ╚═╝  ╚═╝
 ```
 
-### **Encrypt your `.env`. Share by key, not by password.**
+### Encrypt your `.env`. Share by key, not by password.
 
 [![Made with Rust](https://img.shields.io/badge/Made%20with-Rust-DEA584?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Cipher](https://img.shields.io/badge/Cipher-XChaCha20--Poly1305-FF1744?style=for-the-badge)](https://en.wikipedia.org/wiki/ChaCha20-Poly1305)
 [![KDF](https://img.shields.io/badge/KDF-Argon2id-7C4DFF?style=for-the-badge)](https://en.wikipedia.org/wiki/Argon2)
 [![Sharing](https://img.shields.io/badge/Sharing-RSA--OAEP-00BFA5?style=for-the-badge)](https://en.wikipedia.org/wiki/Optimal_asymmetric_encryption_padding)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-2962FF?style=for-the-badge&logo=linux&logoColor=white)](#)
-[![Status](https://img.shields.io/badge/Status-Alpha-FF9800?style=for-the-badge)](#)
+[![Status](https://img.shields.io/badge/Status-Alpha-FF9800?style=for-the-badge)](#status)
 
 </div>
 
 ---
 
-DotLock is a small Rust CLI that encrypts a project's environment variables and lets you run commands with the decrypted values injected into the process environment — without ever writing plaintext secrets to disk.
+## Description
 
-It is designed to replace ad‑hoc `.env` files for local development and small teams: secrets stay encrypted at rest, are decrypted only in memory, and can be shared between developers using public‑key cryptography instead of shipping a shared password around.
+DotLock is a local, file-based secrets manager for project environment variables. It stores secrets in a `.lock/` vault next to your code and injects decrypted values only into child processes launched with `dl run`.
 
----
+Use DotLock when you want:
 
-## Features
+- to keep `.env` values encrypted in a repository;
+- to run local commands with decrypted variables without writing plaintext back to disk;
+- to share project secrets with teammates through public keys instead of a shared password;
+- to keep a lightweight audit log of unlocks, runs, key ratchets and dynamic provider resolutions.
 
-- **Per‑project encrypted vault** stored under `.lock/` next to your code.
-- **XChaCha20‑Poly1305** authenticated encryption for individual secrets.
-- **Argon2id** key derivation from the master password, with HKDF on top to derive a key‑encryption key.
-- **DEK / KEK split**: a random 32‑byte Data Encryption Key (DEK) encrypts the secrets, and is itself wrapped by a Key Encryption Key (KEK) derived from your password — so rotating the password does not re‑encrypt every secret.
-- **Short‑lived session cache** (`sudo`‑style): after the first unlock the DEK is cached for 30 seconds in your user directory, so you don't retype the master password on every command.
-- **Shared access mode** (`dotlock share`): each recipient gets the DEK wrapped with their own RSA public key, so a project can be unlocked by any authorized identity without a shared password.
-- **Local identity** (`dotlock cert`): generates a passphrase‑protected RSA key pair under `~/.lock/identity/` for use as a recipient.
-- **Run with secrets** (`dotlock run <cmd>`): decrypts in memory and spawns the child process with the variables injected as environment.
-- **Rotation primitives**: rotate the master password or generate a brand‑new project key (re‑encrypting every secret).
-- **`.env` import** (`dotlock migrate`): bulk‑import an existing `.env` file in one step.
-- **Integrity check**: the vault metadata stores an authenticated hash of the secrets file so tampering is detected on unlock.
-- **Defensive memory handling**: keys and passwords are wiped with `zeroize` after use.
+DotLock is not a hosted production secret manager. For large production systems, prefer a dedicated service such as AWS Secrets Manager, GCP Secret Manager, HashiCorp Vault or your platform's native secret store.
 
----
+## Status
+
+DotLock is alpha software. The cryptographic building blocks are conservative, but the on-disk format and CLI surface may still change before `1.0`. Keep backups of `.lock/` and review changes before upgrading across `0.1.x` releases.
 
 ## Installation
-
-The crate is `dotlock-bin` (the name `dotlock` was already taken on crates.io by an unrelated lockfile crate). The installed binary is named **`dl`** — short and quick to type.
 
 ### From crates.io
 
 ```bash
 cargo install dotlock-bin
-# binary `dl` will be at ~/.cargo/bin/dl
 ```
+
+The crate is named `dotlock-bin`; the installed binary is named `dl`.
 
 ### From source
 
-Rust edition 2024 toolchain required:
-
 ```bash
 cargo build --release
-# binary will be at ./target/release/dl
-```
-
-Drop the binary somewhere on your `PATH`, e.g.:
-
-```bash
 install -m 0755 target/release/dl ~/.local/bin/dl
 ```
 
----
+DotLock uses Rust edition 2024.
 
-## Usage examples
-
-### 1. Solo developer — replace your `.env`
+## Quick Start
 
 ```bash
-cd ~/code/my-app
-
-# Initialize the vault (prompts for a master password, or generates one for you)
-dl init 
-
-# Pull in everything from your existing .env in one shot
+cd my-project
+dl init
 dl migrate .env
+dl run npm start
+```
 
-# Verify what's stored — names only, never plaintext
+What happens:
+
+1. `dl init` creates `.lock/vault.toml` and `.lock/secrets.lock`.
+2. `dl migrate .env` imports variables from an existing `.env` file.
+3. `dl run npm start` starts `npm start` with decrypted secrets in the child process environment.
+
+After migration, remove the plaintext `.env` only when you have verified the imported values:
+
+```bash
 dl list
-
-# (optional) once you trust the vault, delete the plaintext .env
+dl get DATABASE_URL
 rm .env
 ```
 
-Now run your app with the secrets injected only into the child process:
+## Core Workflow
+
+### Initialize a project
+
+**What:** `dl init` creates the project vault in the current directory.
+
+**How:**
+
+```bash
+dl init
+```
+
+You will choose whether DotLock generates a strong master password or lets you type one. The vault metadata goes into `.lock/vault.toml`; encrypted secret records go into `.lock/secrets.lock`.
+
+**When:** Run once per project before using any other project command.
+
+### Add or update a static secret
+
+**What:** `dl set NAME VALUE` stores a secret value under a normalized environment variable name.
+
+**How:**
+
+```bash
+dl set DATABASE_URL "postgres://localhost/app_dev"
+dl set STRIPE_KEY "sk_live_..."
+dl set API_KEY "secret" --alg xcha
+```
+
+Aliases:
+
+```bash
+dl s DATABASE_URL "postgres://localhost/app_dev"
+dl add DATABASE_URL "postgres://localhost/app_dev"
+```
+
+Names must use letters, digits and underscores, and cannot start with a digit. DotLock normalizes names to uppercase.
+
+`--alg` (short `-a`) selects the encryption algorithm for static secrets. The current supported value is `xcha`, which maps to XChaCha20-Poly1305.
+
+**When:** Use this when adding a new secret or replacing an existing value.
+
+### Read a secret
+
+**What:** `dl get NAME` decrypts one secret and prints it.
+
+**How:**
+
+```bash
+dl get DATABASE_URL
+dl get DATABASE_URL | pbcopy
+```
+
+When stdout is a terminal, DotLock renders a boxed display with the secret name and short id. When stdout is piped, it prints the raw value.
+
+**When:** Use sparingly for copying or debugging a single value. Prefer `dl run` for normal command execution.
+
+### List secrets
+
+**What:** `dl list` shows stored secret names and short ids without plaintext values.
+
+**How:**
+
+```bash
+dl list
+dl l
+```
+
+**When:** Use before `get`, `unset`, ACL changes or audits to confirm what is stored.
+
+### Remove a secret
+
+**What:** `dl unset NAME` removes a secret and its access wrapping metadata.
+
+**How:**
+
+```bash
+dl unset OLD_FEATURE_FLAG
+dl rm OLD_FEATURE_FLAG
+```
+
+Other aliases: `remove`, `u`, `d`, `del`, `delete`.
+
+**When:** Use when a variable is no longer needed or should no longer be available to `dl run`.
+
+### Run a command with secrets
+
+**What:** `dl run CMD [args...]` decrypts accessible secrets and starts a child process with those values in its environment.
+
+**How:**
 
 ```bash
 dl run npm start
 dl run python manage.py runserver
-dl run cargo test
+dl r cargo test
 ```
 
-Need to add or update one variable on the fly:
+The `--` separator is important when the command has its own flags.
+
+**When:** Use this as the normal way to consume secrets locally or in scripts.
+
+### Lock the session
+
+**What:** `dl lock` deletes the cached project key for the current project.
+
+**How:**
 
 ```bash
-dl set STRIPE_KEY "sk_live_..."
-dl set DATABASE_URL "postgres://localhost/app_dev"
-dl unset OLD_FEATURE_FLAG
-```
-
-### 2. Daily workflow with the session cache
-
-The first command of the day prompts for the master password. Subsequent commands within **30 seconds** (default TTL) reuse the cached key — `sudo`‑style:
-
-```bash
-dl set API_KEY "abc"        # ← prompts for master password
-dl set ANOTHER_KEY "xyz"    # ← no prompt, uses cached key
-dl run npm test          # ← still no prompt
-
-# Done for the day — drop the cached key:
 dl lock
+dl logout
 ```
 
-Want the cache to last longer? Bump the TTL in your shell rc:
+**When:** Use after a sensitive session, before handing off a machine, or at the end of CI/scripted workflows.
+
+## Import and Export `.env` Files
+
+### Import from `.env`
+
+**What:** `dl migrate [PATH]` imports variables from a `.env` file into the encrypted vault.
+
+**How:**
 
 ```bash
-export DOTLOCK_CACHE_TTL=900   # 15 minutes
+dl migrate
+dl migrate .env.local
+dl import .env.production
 ```
 
-### 3. Team workflow — shared access by public key
+The parser accepts:
 
-Every developer keeps a personal RSA identity once, then projects grant access to their public key.
+- `KEY=VALUE`;
+- `export KEY=VALUE`;
+- single-quoted values;
+- double-quoted values with escapes such as `\n`, `\r`, `\t`, `\\` and `\"`;
+- comments and blank lines.
 
-**One‑time, on each developer's machine:**
+**When:** Use when adopting DotLock in an existing project or bulk-loading variables.
+
+### Export to `.env`
+
+**What:** `dl export [PATH]` writes missing static secrets into a `.env` file.
+
+**How:**
 
 ```bash
-dl cert init                   # creates ~/.lock/identity/{identity.pem,identity.pub.pem}
-dl cert show                   # show fingerprint + paths
-dl cert export-pub alice.pub   # share this file with the project owner
+dl export
+dl export .env.local
 ```
 
-**On the project (the owner does this once per teammate):**
+Existing keys are never overwritten. Dynamic secrets are skipped because their values are resolved at runtime.
+
+**When:** Use for tools that still require a `.env` file, or when bridging DotLock with legacy local workflows.
+
+## Team Sharing
+
+DotLock supports shared access through a local RSA identity. The project owner keeps the master password; recipients unlock with their own private key.
+
+### Create a local identity
+
+**What:** `dl cert init` creates a local RSA key pair.
+
+**How:**
 
 ```bash
-dl share enable                                    # switch the project to shared mode
-dl share grant --pubkey alice.pub --label alice    # wrap the project key for Alice
-dl share grant --pubkey bob.pub   --label bob
-dl share list                                      # who has access?
+dl cert init
+dl cert init --plain
+dl cert init --force
 ```
 
-Commit `.lock/vault.toml` and `.lock/secrets.lock` to your repo. From now on, **anyone listed as a recipient can unlock the project with their identity passphrase** — no shared master password ever leaves a developer's laptop.
-
-When someone leaves the team:
+Aliases:
 
 ```bash
+dl crt init
+dl crt i
+```
+
+By default, the private key is passphrase-protected. `--plain` creates an unencrypted private key. `--force` replaces an existing identity.
+
+**When:** Each developer or CI environment should do this once before requesting shared access.
+
+### Show or export the public key
+
+**What:** `dl cert show` prints the local identity fingerprint and paths. `dl cert export-pub [PATH]` prints or writes the public key.
+
+**How:**
+
+```bash
+dl cert show
+dl cert export-pub alice.pub
+dl cert export-pub
+```
+
+Aliases: `dl crt sh`, `dl crt x`.
+
+**When:** Use `show` to confirm which identity is active. Use `export-pub` when sending a public key to a vault owner.
+
+### Enable shared mode
+
+**What:** `dl share enable` marks the vault as shared.
+
+**How:**
+
+```bash
+dl share enable
+dl shr en
+```
+
+**When:** Use before granting access to teammates or CI.
+
+### Grant access
+
+**What:** `dl share grant` adds or updates a recipient.
+
+**How:**
+
+```bash
+dl share grant --pubkey alice.pub --label alice
+dl share grant --pubkey ci.pub --label ci --allow DATABASE_URL,REDIS_URL
+```
+
+Aliases: `dl shr gr`.
+
+Without `--allow`, the recipient gets full access. With `--allow`, the recipient can decrypt only the listed secrets.
+
+**When:** Use when onboarding a developer, adding a CI identity, or changing a recipient's access scope.
+
+### Manage a recipient ACL
+
+**What:** `dl share allow` lists, adds or removes per-secret access for a recipient.
+
+**How:**
+
+```bash
+dl share allow ci --list
+dl share allow ci --add STRIPE_KEY
+dl share allow ci --remove REDIS_URL
+```
+
+The recipient query can be the recipient id, label or public key fingerprint. Removing a secret from a recipient rotates that secret's SDK so the old recipient wrapping cannot decrypt future values.
+
+**When:** Use for least-privilege access, especially for CI identities.
+
+### List or revoke recipients
+
+**What:** `dl share list` shows recipients. `dl share revoke QUERY` removes a recipient and rotates project access material.
+
+**How:**
+
+```bash
+dl share list
 dl share revoke alice
-# DotLock automatically:
-#   1. removes Alice from the recipients list
-#   2. generates a new project DEK
-#   3. re-encrypts every secret with the new DEK
-#   4. re-wraps the new DEK for the remaining recipients
 ```
 
-### 4. Rotating credentials
+Aliases: `dl shr l`, `dl shr rev`.
+
+**When:** Use `list` before access reviews. Use `revoke` when someone leaves the project or an identity is compromised.
+
+## Rotation and Ratcheting
+
+### Rotate the master password
+
+**What:** `dl rotate master-password` changes the password used to unlock the project key.
+
+**How:**
 
 ```bash
-# Change the master password (keeps existing secrets, only re-wraps the DEK):
 dl rotate master-password
-
-# Roll the project key (re-encrypts every secret — do this if you suspect leakage):
-dl rotate project-key
+dl rotate mp
 ```
 
-### 5. CI / scripted use
+**When:** Use when a password may have been exposed but the encrypted vault itself does not need a full project-key rotation.
 
-For non‑interactive contexts, the typical pattern is to export `DOTLOCK_CACHE_TTL` to something workflow‑sized, unlock once, then run several commands:
+### Rotate key wrapping material
+
+**What:** `dl rotate kek` rotates the key wrapping layer and rewraps secret SDKs and full-access recipient project keys.
+
+**How:**
 
 ```bash
-export DOTLOCK_CACHE_TTL=600
-dl list > /dev/null            # primes the session cache
-dl run ./scripts/migrate.sh
-dl run ./scripts/seed.sh
-dl run npm test
-dl lock                        # explicit cleanup at the end
+dl rotate kek
 ```
 
----
+**When:** Use as hygiene after many writes, or let DotLock trigger it automatically with `auto_ratchet_after_writes`.
 
-## Command reference
+### Rotate the project key
 
-All commands accept short aliases — for example `dl s` is `set`, `dl g` is `get`, `dl l` is `list`, `dl rm` / `dl del` is `unset`.
+**What:** `dl rotate project-key` generates a new project key and rewrites encrypted secret records.
 
-### Project lifecycle
+**How:**
 
-| Command | Purpose |
-|---|---|
-| `dl init` | Initialize the current directory as a DotLock project. Prompts for a master password (or generates a strong one), creates `.lock/vault.toml` and `.lock/secrets.lock`. |
-| `dl lock` (alias `logout`) | Invalidate the cached DEK so the next operation re‑prompts for the master password. |
+```bash
+dl rotate project-key
+dl rotate pk
+```
 
-### Secrets
+**When:** Use after a suspected project-key exposure or after major access changes that justify a heavier rotation.
 
-| Command | Purpose |
-|---|---|
-| `dl set <NAME> <VALUE>` | Store or overwrite a variable. Default algorithm is `xchacha20-poly1305`. |
-| `dl get <NAME>` | Show the metadata of a variable. The plaintext is **not** printed by default — use `dl run` to consume it. |
-| `dl unset <NAME>` | Remove a variable. |
-| `dl list` | List variable names (no plaintext). |
-| `dl migrate [path]` | Import every variable from a `.env` file (defaults to `./.env`) in a single transaction. |
-| `dl run <cmd> [args...]` | Decrypt every secret in memory and spawn `<cmd>` with them as environment variables. |
+## Dynamic Secret Providers
 
-### Local identity (for shared mode)
+Dynamic secrets are resolved by external executables instead of storing a fixed plaintext value. Provider binaries must be named `dotlock-provider-NAME` and be available on `PATH`.
 
-| Command | Purpose |
-|---|---|
-| `dl cert init [--force]` | Generate a passphrase‑encrypted RSA key pair under `~/.lock/identity/`. |
-| `dl cert show` | Print the fingerprint and key paths of the local identity. |
-| `dl cert export-pub [path]` | Print the local public key, or write it to `path` so it can be shared. |
+### Discover providers
 
-### Shared project access
+**What:** `dl provider list` lists provider binaries found on `PATH`. `dl provider info NAME` runs a provider's `--describe` command.
 
-| Command | Purpose |
-|---|---|
-| `dl share enable` | Switch the project from master‑password mode to shared mode. |
-| `dl share grant --pubkey <PATH> --label <NAME>` | Wrap the project DEK for the given public key and add it as a recipient. |
-| `dl share revoke <ID\|LABEL\|FINGERPRINT>` | Remove a recipient and **rotate** the project key, re‑encrypting every secret and re‑wrapping for the remaining recipients. |
-| `dl share list` | Show every recipient with label and fingerprint. |
+**How:**
 
-### Rotation
+```bash
+dl provider list
+dl provider info aws
+dl p list
+dl p info aws
+```
 
-| Command | Purpose |
-|---|---|
-| `dl rotate master-password` | Change the master password without re‑encrypting secrets — only the wrapping of the DEK changes. |
-| `dl rotate project-key` | Generate a brand‑new project DEK and re‑encrypt every secret. Recipients are re‑wrapped automatically. |
+**When:** Use before creating a dynamic secret, or when debugging provider installation.
 
----
+### Store a dynamic secret
 
-## How it works
+**What:** `dl set NAME --provider PROVIDER` stores encrypted provider metadata instead of a static value.
+
+**How:**
+
+```bash
+dl set DATABASE_URL --provider aws --config '{"name":"prod/db/url"}'
+dl set API_TOKEN --provider vault --config '{"path":"secret/api"}' --bootstrap VAULT_TOKEN
+```
+
+`--config` must be valid JSON. `--bootstrap` is a comma-separated list of existing static secrets that DotLock decrypts and passes to the provider at resolve time.
+
+**When:** Use when the value should be minted or fetched just-in-time from another local provider, while DotLock still controls bootstrap material and runtime injection.
+
+### Provider protocol
+
+Providers are executed as child processes:
+
+- `dotlock-provider-NAME --describe` prints human-readable provider information.
+- `dotlock-provider-NAME --resolve` reads JSON on stdin and prints the resolved secret value on stdout.
+
+The resolve input has this shape:
+
+```json
+{
+  "config": {},
+  "bootstrap": {
+    "VAULT_TOKEN": "decrypted bootstrap value"
+  }
+}
+```
+
+DotLock records the provider path and SHA-256 digest when the dynamic secret is created. Later resolutions verify the digest before running the provider. Provider stdout is limited to 64 KiB and stderr to 16 KiB.
+
+## Git Integration
+
+### Install the merge driver
+
+**What:** `dl git install-merge-driver` configures Git to use DotLock's merge driver for `.lock/secrets.lock` and `.lock/vault.toml`.
+
+**How:**
+
+```bash
+dl git install-merge-driver
+```
+
+`dl init` also attempts to install the merge driver when the project is inside a Git work tree.
+
+**When:** Use in repositories where multiple branches or teammates may edit the vault.
+
+### Auto-fetch before run
+
+**What:** when enabled, `dl run` tries a short `git pull --ff-only --no-rebase REMOTE BRANCH` before unlocking.
+
+**How:**
+
+```bash
+dl config set auto_fetch_on_run true
+dl config set auto_fetch_timeout_secs 3
+dl config set auto_fetch_remote origin
+
+DOTLOCK_AUTO_FETCH=0 dl run npm test
+```
+
+If pull fails, DotLock tries `git fetch` and then continues with the local vault.
+
+**When:** Use when teams commit `.lock/` changes frequently and want `dl run` to pick up fast-forward updates automatically.
+
+## Audit Log
+
+DotLock keeps a local audit log outside the project by default. Entries are hash-chained. If a local plain identity is available, entries are signed; otherwise they are anonymous.
+
+### Show audit entries
+
+**What:** `dl audit show` prints audit entries.
+
+**How:**
+
+```bash
+dl audit show
+dl audit show --verbose
+dl audit show --since 2026-05-01
+dl audit show --action run
+```
+
+Aliases: `dl audit s`, `dl a show`.
+
+**When:** Use during local review, debugging or incident response.
+
+### Verify or rotate logs
+
+**What:** `dl audit verify` checks the hash chain and signatures. `dl audit rotate` compresses the current log with `gzip`. `dl audit path` prints the current log path.
+
+**How:**
+
+```bash
+dl audit verify
+dl audit verify --strict
+dl audit path
+dl audit rotate
+```
+
+`--strict` rejects anonymous entries. Logs rotate automatically when they reach 10 MiB or are older than 90 days.
+
+**When:** Use `verify` before trusting audit history. Use `rotate` for manual cleanup or archival.
+
+## Configuration
+
+### Project configuration
+
+Project configuration is stored in `.lock/vault.toml`.
+
+```bash
+dl config show
+dl config set auto_fetch_on_run true
+dl config set auto_fetch_timeout_secs 3
+dl config set auto_fetch_remote origin
+dl config set auto_ratchet_after_writes 50
+dl config set dynamic_resolve_timeout_secs 10
+dl config unset auto_fetch_remote
+```
+
+Aliases: `dl c show`, `dl c set`, `dl c unset`.
+
+| Key | Default | Accepted values | Effect |
+|---|---:|---|---|
+| `auto_fetch_on_run` | `false` | `true`, `false`, `1`, `0`, `yes`, `no`, `on`, `off` | Enables Git auto-fetch before `dl run` |
+| `auto_fetch_timeout_secs` | `3` | positive integer | Timeout for Git auto-fetch operations |
+| `auto_fetch_remote` | `origin` | non-empty string | Remote used by auto-fetch |
+| `auto_ratchet_after_writes` | off | non-negative integer | Automatically rotates key wrapping after this many vault writes; `0` disables it |
+| `dynamic_resolve_timeout_secs` | `10` | positive integer | Timeout for dynamic provider resolution |
+
+### Environment variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `DOTLOCK_CACHE_TTL` | `30` | Cached project key lifetime in seconds, capped at 3600 |
+| `DOTLOCK_CACHE_DIR` | `$HOME/.lock` on Unix, `%LOCALAPPDATA%\dotlock` on Windows | Overrides the session cache root |
+| `DOTLOCK_SHARED_CACHE` | off | Set to `1`, `true`, `TRUE`, `yes` or `YES` to enable caching in shared mode |
+| `DOTLOCK_IDENTITY_DIR` | `$HOME/.lock/identity` | Overrides local identity storage |
+| `DOTLOCK_AUDIT_DIR` | `$HOME/.lock/audit` on Unix, `%LOCALAPPDATA%\dotlock\audit` on Windows | Overrides audit log storage |
+| `DOTLOCK_AUTO_FETCH` | unset | Set to `0`, `false`, `no` or `off` to disable auto-fetch for one command |
+
+## Command Reference
+
+| Command | Aliases | Purpose |
+|---|---|---|
+| `dl init` | `i` | Initialize `.lock/` in the current project |
+| `dl set [--alg xcha] NAME VALUE` | `s`, `add` | Store or update a static secret |
+| `dl set NAME --provider PROVIDER [--config JSON] [--bootstrap A,B]` | `s`, `add` | Store a dynamic secret definition |
+| `dl get NAME` | `g` | Print a secret value |
+| `dl unset NAME` | `rm`, `remove`, `u`, `d`, `del`, `delete` | Remove a secret |
+| `dl list` | `l` | List stored secrets without plaintext |
+| `dl run CMD [args...]` | `r` | Run a command with decrypted secrets in its environment |
+| `dl lock` | `logout` | Drop the cached project key |
+| `dl migrate [PATH]` | `m`, `import` | Import variables from `.env` |
+| `dl export [PATH]` | `x` | Append missing static secrets to `.env` |
+| `dl cert init [--force] [--plain]` | `crt init`, `crt i` | Create a local RSA identity |
+| `dl cert show` | `crt show`, `crt sh` | Show local identity information |
+| `dl cert export-pub [PATH]` | `crt export-pub`, `crt x` | Print or write the public key |
+| `dl share enable` | `shr enable`, `shr en` | Enable shared mode |
+| `dl share grant --pubkey FILE --label LABEL [--allow A,B]` | `shr grant`, `shr gr` | Grant recipient access |
+| `dl share allow QUERY --list` | none | List recipient ACL |
+| `dl share allow QUERY --add A,B` | none | Add secrets to recipient ACL |
+| `dl share allow QUERY --remove A,B` | none | Remove secrets from recipient ACL and rotate affected SDKs |
+| `dl share revoke QUERY` | `shr revoke`, `shr rev` | Revoke a recipient |
+| `dl share list` | `shr list`, `shr l` | List recipients |
+| `dl rotate kek` | none | Rotate key wrapping material |
+| `dl rotate master-password` | `rotate mp` | Change master password |
+| `dl rotate project-key` | `rotate pk` | Rotate project key |
+| `dl audit show [--verbose] [--since YYYY-MM-DD] [--action ACTION]` | `a show`, `audit s` | Show audit entries |
+| `dl audit verify [--strict]` | `a verify`, `audit v` | Verify audit log |
+| `dl audit path` | `a path` | Print audit log path |
+| `dl audit rotate` | `a rotate` | Rotate and gzip current audit log |
+| `dl git install-merge-driver` | none | Configure Git merge support |
+| `dl config show` | `c show` | Show project config |
+| `dl config set KEY VALUE` | `c set` | Set project config |
+| `dl config unset KEY` | `c unset` | Reset project config |
+| `dl provider list` | `p list` | List provider binaries on `PATH` |
+| `dl provider info NAME` | `p info` | Show provider description |
+
+## How It Works
 
 ### Files on disk
 
-```
-<project>/
-└── .lock/
-    ├── vault.toml      # public metadata: KDF params, salt, wrapped DEK, recipients, integrity hash
-    └── secrets.lock    # encrypted secret records (one per variable)
+Project vault:
 
+```text
+.lock/
+├── vault.toml
+└── secrets.lock
+```
+
+Local user state:
+
+```text
 ~/.lock/
-├── identity/           # local RSA key pair (passphrase-encrypted)
+├── identity/
 │   ├── identity.pem
 │   ├── identity.pub.pem
 │   └── identity.toml
-└── run/sessions/<project-uuid-prefix>/
-    └── sessions.toml   # short-lived cached DEK (default 30s TTL)
+├── run/sessions/<project>/
+│   └── sessions.toml
+└── audit/<project-uuid>/
+    └── audit.log
 ```
 
-The `.lock/` directory is created with `0700` permissions; secret and key files use `0600`.
+On Unix, private directories are created with `0700`, secret/private files with `0600`, and public key files with `0644`. Writes use an atomic temp-file-and-rename flow.
 
 ### Key hierarchy
 
-```
+```text
 master password
-  └── Argon2id (salt, m=64MiB, t=3, p=1) ──► master_key (32 B)
-        └── HKDF-SHA256 (project, environment, kek_version) ──► KEK (32 B)
-              └── XChaCha20-Poly1305 wrap ──► DEK (32 B, random)
-                    └── XChaCha20-Poly1305 ──► each secret value
+  -> Argon2id derives master key
+    -> HKDF derives KEK
+      -> KEK wraps project key
+        -> project key wraps per-secret SDKs
+          -> SDK encrypts each secret value or dynamic provider metadata
 ```
 
-- The **master password** never leaves the prompt — only the derived key material is kept (and zeroized as soon as it's consumed).
-- The **DEK** is what actually encrypts secrets. It is generated once at `init` and only ever changes during `rotate project-key` or `share revoke`.
-- The **KEK** is ephemeral: it is re‑derived from the master password on every unlock and discarded.
-- Rotating the master password therefore only rewraps the DEK; rotating the project key re‑encrypts every secret in `secrets.lock`.
+Terms:
+
+- Master password: typed or generated during `dl init`.
+- Master key: derived from the password and salt; held briefly and zeroized.
+- KEK: key-encryption key derived for wrapping the project key.
+- Project key: random 32-byte key stored only in wrapped form.
+- SDK: per-secret data key used to encrypt one secret's stored data.
+
+This is why changing a master password is fast, while project-key and ACL rotations touch more vault metadata.
 
 ### Integrity
 
-Every time the secrets file is written, the vault metadata stores a fresh nonce and authenticated hash of its contents (encrypted under the DEK). On unlock, this is verified — if `secrets.lock` was edited or replaced out‑of‑band, the operation aborts.
+Every write to `secrets.lock` updates an authenticated hash in `vault.toml`. On unlock, DotLock verifies the hash before decrypting secrets. If `secrets.lock` was modified outside DotLock, the command aborts with a tamper error.
 
 ### Session cache
 
-After the first successful unlock, the DEK is base64‑encoded and written to `~/.lock/run/sessions/<short-uuid>/sessions.toml` with an expiry timestamp. Subsequent commands within the TTL skip the password prompt entirely.
+After successful unlock, DotLock may cache the project key for a short time. The default TTL is 30 seconds. Shared mode disables caching unless `DOTLOCK_SHARED_CACHE` is enabled.
 
-- Default TTL is **30 seconds**. Override with the `DOTLOCK_CACHE_TTL` environment variable (in seconds).
-- The cache is **per project**, keyed by the project's UUID stored in `vault.toml`.
-- In shared mode the cache is **disabled by default** — set `DOTLOCK_SHARED_CACHE=1` to opt in.
-- `dl lock` deletes the cache file immediately.
+### Shared mode and ACLs
 
-### Shared mode
+Full-access recipients receive wrapped access to the project key and per-secret SDKs. Limited recipients receive only wrapped SDKs for allowed secrets. Removing a secret from a recipient ACL rotates the affected SDKs.
 
-When you run `dl share enable` and grant access to one or more public keys, the vault metadata gains a `recipients` table. Each recipient stores its label, fingerprint, and the project DEK wrapped with that recipient's RSA public key (RSA‑OAEP). A user that holds the matching private key (managed via `dl cert`) can unlock the project without ever knowing the master password.
+## Security Notes
 
-Revocation is destructive on purpose: `dl share revoke` removes the recipient, generates a new DEK, re‑encrypts every secret with it, and re‑wraps the new DEK for every remaining recipient. The revoked party cannot decrypt anything written after the revocation, even if they kept a copy of the old vault.
-
----
-
-## Environment variables
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `DOTLOCK_CACHE_TTL` | `30` | Lifetime in seconds of the cached DEK. |
-| `DOTLOCK_CACHE_DIR` | `$HOME/.lock` | Override the root for the session cache. |
-| `DOTLOCK_SHARED_CACHE` | `false` | Set to `1`/`true` to enable session caching while in shared mode. |
-| `DOTLOCK_IDENTITY_DIR` | `$HOME/.lock/identity` | Override where the local RSA identity is stored. |
-
----
-
-## Project layout
-
-```
-src/
-├── main.rs              # CLI surface (clap)
-├── runtime/             # encrypt / decrypt / `run` orchestration
-├── crypto/              # KDF, KEK, DEK, integrity hash, RSA share, password generator
-├── storage/             # vault file, secrets file, identity, cache, .env parser, atomic FS helpers
-├── domain/              # error types and shared model definitions
-└── utils.rs             # small helpers (variable name normalization, pretty printing)
-```
-
----
-
-## Security notes
-
-- Master passwords are validated for length and character mix, or you can let DotLock generate a 32‑character random one (printed once, never stored).
-- All secret files are written **atomically** with restricted permissions (`0600`).
-- Sensitive byte buffers are wrapped in `Zeroizing<…>` and explicitly zeroed when no longer needed.
-- The local identity's private key is stored encrypted under a separate passphrase, distinct from any project's master password.
-- `dl get` deliberately does **not** print the plaintext value — use `dl run` to consume secrets, so values stay out of shell history and terminal scrollback.
-
----
+- `dl get` prints plaintext. Prefer `dl run` when a command can consume secrets directly.
+- Do not commit plaintext `.env` files after migrating to DotLock.
+- Commit `.lock/vault.toml` and `.lock/secrets.lock` if your team shares the encrypted vault through Git.
+- Keep local identity private keys protected. Use `dl cert init --plain` only for controlled automation or ephemeral environments.
+- Dynamic providers are executable code. Install them from trusted sources and keep provider directories non-world-writable.
+- Audit logs are local by default. They are useful for local accountability and debugging, not a centralized compliance system.
 
 ## License
 
-Dual‑licensed under either:
+Dual-licensed under your choice of:
 
-- **MIT** license ([LICENSE-MIT](./LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
-- **Apache License, Version 2.0** ([LICENSE-APACHE](./LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
-
-at your option.
+- MIT: [LICENSE-MIT](./LICENSE-MIT)
+- Apache 2.0: [LICENSE-APACHE](./LICENSE-APACHE)

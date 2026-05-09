@@ -3,10 +3,11 @@ use colored::Colorize;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
+    audit::record_unlock,
     crypto::{
         AccessMode,
         dek::{WrappedDek, unwrap_dek},
-        integrity::verify_secrets_integrity,
+        integrity::{verify_public_secrets_hash, verify_secrets_integrity},
         kdf::{KdfParams, derive_master_key},
         kek::derive_kek,
         prompt_unlock_password,
@@ -85,7 +86,9 @@ pub fn unlock_vault_with_master_password(path: &str) -> DotLockResult<Zeroizing<
     let metadata = load_vault_metadata(path)?;
     let passphrase = prompt_unlock_password()?;
     let dek = unwrap_dek_with_passphrase(&metadata, &passphrase)?;
-    unlock_vault_with_dek(&metadata, dek)
+    let dek = unlock_vault_with_dek(&metadata, dek)?;
+    record_unlock_best_effort("password", &metadata);
+    Ok(dek)
 }
 
 pub fn unlock_vault_with_master_password_and_passphrase(
@@ -95,6 +98,7 @@ pub fn unlock_vault_with_master_password_and_passphrase(
     let passphrase = prompt_unlock_password()?;
     let dek = unwrap_dek_with_passphrase(&metadata, &passphrase)?;
     let dek = unlock_vault_with_dek(&metadata, dek)?;
+    record_unlock_best_effort("password", &metadata);
     Ok((dek, passphrase))
 }
 
@@ -110,8 +114,15 @@ fn try_unlock_vault_with_local_identity(
             query: identity_meta.fingerprint.clone(),
         })?;
     let identity = load_local_identity()?;
+    if recipient.wrapped_dek_b64.is_empty() && !recipient.wrapped_sdks.is_empty() {
+        verify_public_secrets_hash(SECRETS_FILE, metadata)?;
+        record_unlock_best_effort("identity", metadata);
+        return Ok(Zeroizing::new([0u8; 32]));
+    }
     let dek = unwrap_dek_with_private_key(&recipient.wrapped_dek_b64, &identity.private_key_pem)?;
-    unlock_vault_with_dek(metadata, dek)
+    let dek = unlock_vault_with_dek(metadata, dek)?;
+    record_unlock_best_effort("identity", metadata);
+    Ok(dek)
 }
 
 fn print_shared_recipients(metadata: &crate::crypto::VaultKeyMetadata) {
@@ -173,6 +184,7 @@ pub fn unlock_vault(path: &str) -> DotLockResult<Zeroizing<[u8; 32]>> {
         match verify_secrets_integrity(SECRETS_FILE, &metadata, &dek) {
             Ok(()) => {
                 write_cached_dek(&dek)?;
+                record_unlock_best_effort("cache", &metadata);
                 return Ok(dek);
             }
             Err(DotLockError::TamperedSecretsFile) => {
@@ -198,4 +210,18 @@ pub fn unlock_vault(path: &str) -> DotLockResult<Zeroizing<[u8; 32]>> {
     }
 
     unlock_vault_with_master_password(path)
+}
+
+fn record_unlock_best_effort(method: &str, metadata: &crate::crypto::VaultKeyMetadata) {
+    let access_mode = match metadata.access_mode {
+        AccessMode::MasterPassword => "master",
+        AccessMode::Shared => "shared",
+    };
+    if let Err(err) = record_unlock(method, access_mode) {
+        eprintln!(
+            "{} audit log write failed: {}",
+            "warn:".yellow().bold(),
+            err
+        );
+    }
 }

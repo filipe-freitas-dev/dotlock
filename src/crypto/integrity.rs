@@ -107,6 +107,30 @@ pub fn verify_secrets_integrity<P: AsRef<Path>>(
     Ok(())
 }
 
+pub fn verify_public_secrets_hash<P: AsRef<Path>>(
+    secrets_path: P,
+    metadata: &VaultKeyMetadata,
+) -> DotLockResult<()> {
+    if metadata.secrets_hash_sha256_b64.is_empty() {
+        return Err(DotLockError::LegacyVaultFormat);
+    }
+    let stored = general_purpose::STANDARD
+        .decode(&metadata.secrets_hash_sha256_b64)
+        .map_err(|_| DotLockError::LegacyVaultFormat)?;
+    let stored: [u8; HASH_LEN] = stored
+        .try_into()
+        .map_err(|_| DotLockError::LegacyVaultFormat)?;
+    let current = compute_file_sha256(secrets_path)?;
+    if stored != current {
+        return Err(DotLockError::TamperedSecretsFile);
+    }
+    Ok(())
+}
+
+pub fn file_sha256_b64(secrets_path: impl AsRef<Path>) -> DotLockResult<String> {
+    Ok(general_purpose::STANDARD.encode(compute_file_sha256(secrets_path)?))
+}
+
 pub fn build_encrypted_hash_fields(
     secrets_path: impl AsRef<Path>,
     dek: &[u8; 32],
