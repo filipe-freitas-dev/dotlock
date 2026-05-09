@@ -229,6 +229,7 @@ enum ShareCommand {
     #[command(alias = "rev")]
     Revoke { query: String },
     /// Manage a recipient's per-secret access list
+    #[command(alias = "al")]
     Allow {
         query: String,
         #[arg(long)]
