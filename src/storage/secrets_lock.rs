@@ -27,6 +27,8 @@ use crate::{
     },
 };
 
+pub const DEFAULT_SECRET_ALG: &str = "xchacha20-poly1305";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretsFile {
     pub version: u32,
@@ -38,7 +40,8 @@ pub struct SecretsFile {
 pub struct SecretRecord {
     pub id: String,
     pub name: String,
-    pub alg: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alg: Option<String>,
     pub data: String,
     #[serde(default)]
     pub updated_at: i64,
@@ -76,7 +79,7 @@ pub struct DynamicSecretMetadata {
 impl Default for SecretsFile {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             secrets: Vec::new(),
         }
     }
@@ -116,6 +119,20 @@ fn migrate_legacy_secret_timestamps(file: &mut SecretsFile) {
     }
 }
 
+fn migrate_legacy_secret_algorithms(file: &mut SecretsFile) -> DotLockResult<()> {
+    file.version = file.version.max(2);
+    for secret in &mut file.secrets {
+        let Some(alg) = secret.alg.as_deref() else {
+            continue;
+        };
+        crate::utils::parse_alg(alg)?;
+        if alg == DEFAULT_SECRET_ALG {
+            secret.alg = None;
+        }
+    }
+    Ok(())
+}
+
 fn write_secrets_file<P: AsRef<Path>>(path: P, file: &SecretsFile) -> DotLockResult<()> {
     let path = path.as_ref();
 
@@ -131,6 +148,7 @@ pub fn save_secrets_file<P: AsRef<Path>>(
 ) -> DotLockResult<()> {
     let mut file = file.clone();
     migrate_legacy_secret_timestamps(&mut file);
+    migrate_legacy_secret_algorithms(&mut file)?;
     write_secrets_file(path.as_ref(), &file)?;
     refresh_vault_hash(path.as_ref(), dek, vault_path)
 }
@@ -167,7 +185,7 @@ pub fn upsert_secret<P: AsRef<Path>>(
         .iter_mut()
         .find(|secret| secret.name == encrypted.name)
     {
-        existing.alg = encrypted.alg.to_string();
+        existing.alg = None;
         existing.data = data_str;
         existing.updated_at = current_unix_timestamp();
         existing.kind = SecretKind::Static;
@@ -175,7 +193,7 @@ pub fn upsert_secret<P: AsRef<Path>>(
         file.secrets.push(SecretRecord {
             id: Uuid::new_v4().to_string(),
             name: encrypted.name,
-            alg: encrypted.alg.to_string(),
+            alg: None,
             data: data_str,
             updated_at: current_unix_timestamp(),
             kind: SecretKind::Static,
@@ -196,7 +214,7 @@ pub fn upsert_plain_secret<P: AsRef<Path>>(
     let path = path.as_ref();
     let mut file = load_secrets_file(path)?;
     let mut metadata = load_vault_metadata(vault_path)?;
-    metadata.version = metadata.version.max(3);
+    metadata.version = metadata.version.max(5);
     reject_limited_identity_write(&metadata)?;
 
     let now = current_unix_timestamp();
@@ -215,7 +233,7 @@ pub fn upsert_plain_secret<P: AsRef<Path>>(
 
     let record = if let Some(existing) = file.secrets.iter_mut().find(|secret| secret.name == name)
     {
-        existing.alg = encrypted.alg.to_string();
+        existing.alg = None;
         existing.data = data;
         existing.updated_at = now;
         existing.kind = SecretKind::Static;
@@ -224,7 +242,7 @@ pub fn upsert_plain_secret<P: AsRef<Path>>(
         let record = SecretRecord {
             id: record_id,
             name: encrypted.name,
-            alg: encrypted.alg.to_string(),
+            alg: None,
             data,
             updated_at: now,
             kind: SecretKind::Static,
@@ -246,6 +264,7 @@ pub fn upsert_plain_secret<P: AsRef<Path>>(
     }
 
     migrate_legacy_secret_timestamps(&mut file);
+    migrate_legacy_secret_algorithms(&mut file)?;
     write_secrets_file(path, &file)?;
     let (nonce_b64, hash_b64) = build_encrypted_hash_fields(path, dek)?;
     metadata.secrets_hash_nonce_b64 = nonce_b64;
@@ -298,20 +317,13 @@ pub fn migrate_all_secrets_to_envelope(dek: &[u8; 32], vault_path: &str) -> DotL
         if metadata.wrapped_sdks_under_kek.contains_key(&secret.id) {
             continue;
         }
-        let value = decryption_process(
-            secret.data.clone(),
-            crate::utils::parse_alg(&secret.alg)?,
-            dek,
-        )?;
+        let value = decryption_process(secret.data.clone(), secret_algorithm(secret)?, dek)?;
         let sdk = sdk::generate_sdk()?;
-        let encrypted = encryption_process(
-            secret.name.clone(),
-            value,
-            crate::utils::parse_alg(&secret.alg)?,
-            &sdk,
-        )?;
+        let encrypted =
+            encryption_process(secret.name.clone(), value, secret_algorithm(secret)?, &sdk)?;
         secret.data = String::from_utf8(encrypted.data)
             .map_err(|err| DotLockError::Crypto(err.to_string()))?;
+        secret.alg = None;
         secret.updated_at = current_unix_timestamp();
         metadata
             .wrapped_sdks_under_kek
@@ -331,7 +343,8 @@ pub fn migrate_all_secrets_to_envelope(dek: &[u8; 32], vault_path: &str) -> DotL
         return Ok(());
     }
 
-    metadata.version = metadata.version.max(3);
+    metadata.version = metadata.version.max(5);
+    migrate_legacy_secret_algorithms(&mut file)?;
     write_secrets_file(SECRETS_FILE, &file)?;
     let (nonce_b64, hash_b64) = build_encrypted_hash_fields(SECRETS_FILE, dek)?;
     metadata.secrets_hash_nonce_b64 = nonce_b64;
@@ -377,20 +390,17 @@ pub fn rotate_secret_sdks_after_acl_removal(
         }
 
         let old_sdk = secret_sdk_from_project_key(&metadata, secret, dek)?.unwrap_or(*dek);
-        let value = decryption_process(
-            secret.data.clone(),
-            crate::utils::parse_alg(&secret.alg)?,
-            &old_sdk,
-        )?;
+        let value = decryption_process(secret.data.clone(), secret_algorithm(secret)?, &old_sdk)?;
         let new_sdk = sdk::generate_sdk()?;
         let encrypted = encryption_process(
             secret.name.clone(),
             value,
-            crate::utils::parse_alg(&secret.alg)?,
+            secret_algorithm(secret)?,
             &new_sdk,
         )?;
         secret.data = String::from_utf8(encrypted.data)
             .map_err(|err| DotLockError::Crypto(err.to_string()))?;
+        secret.alg = None;
         secret.updated_at = current_unix_timestamp();
         metadata.wrapped_sdks_under_kek.insert(
             secret.id.clone(),
@@ -412,6 +422,7 @@ pub fn rotate_secret_sdks_after_acl_removal(
         }
     }
 
+    migrate_legacy_secret_algorithms(&mut file)?;
     write_secrets_file(SECRETS_FILE, &file)?;
     let (nonce_b64, hash_b64) = build_encrypted_hash_fields(SECRETS_FILE, dek)?;
     metadata.secrets_hash_nonce_b64 = nonce_b64;
@@ -439,11 +450,11 @@ pub fn decrypt_secret_value(secret: &SecretRecord, dek: &[u8; 32]) -> DotLockRes
         secret_sdk_from_project_key(&metadata, secret, dek)?.unwrap_or(*dek)
     };
 
-    decryption_process(
-        secret.data.clone(),
-        crate::utils::parse_alg(&secret.alg)?,
-        &key,
-    )
+    decryption_process(secret.data.clone(), secret_algorithm(secret)?, &key)
+}
+
+pub fn secret_algorithm(secret: &SecretRecord) -> DotLockResult<Alg> {
+    crate::utils::parse_alg(secret.alg.as_deref().unwrap_or(DEFAULT_SECRET_ALG))
 }
 
 fn secret_sdk_from_project_key(
@@ -514,7 +525,7 @@ pub fn upsert_many<P: AsRef<Path>>(
     let path = path.as_ref();
     let mut file = load_secrets_file(path)?;
     let mut metadata = load_vault_metadata(vault_path)?;
-    metadata.version = metadata.version.max(3);
+    metadata.version = metadata.version.max(5);
     reject_limited_identity_write(&metadata)?;
     let mut summary = UpsertSummary {
         created: 0,
@@ -541,7 +552,7 @@ pub fn upsert_many<P: AsRef<Path>>(
 
         let record = if let Some(index) = existing_index {
             let existing = &mut file.secrets[index];
-            existing.alg = encrypted.alg.to_string();
+            existing.alg = None;
             existing.data = data;
             existing.updated_at = now;
             existing.kind = SecretKind::Static;
@@ -551,7 +562,7 @@ pub fn upsert_many<P: AsRef<Path>>(
             let record = SecretRecord {
                 id: record_id,
                 name: encrypted.name,
-                alg: encrypted.alg.to_string(),
+                alg: None,
                 data,
                 updated_at: now,
                 kind: SecretKind::Static,
@@ -575,6 +586,7 @@ pub fn upsert_many<P: AsRef<Path>>(
     }
 
     migrate_legacy_secret_timestamps(&mut file);
+    migrate_legacy_secret_algorithms(&mut file)?;
     write_secrets_file(path, &file)?;
     let (nonce_b64, hash_b64) = build_encrypted_hash_fields(path, dek)?;
     metadata.secrets_hash_nonce_b64 = nonce_b64;
@@ -596,7 +608,7 @@ pub fn upsert_dynamic_secret<P: AsRef<Path>>(
     let path = path.as_ref();
     let mut file = load_secrets_file(path)?;
     let mut metadata = load_vault_metadata(vault_path)?;
-    metadata.version = metadata.version.max(4);
+    metadata.version = metadata.version.max(5);
     reject_limited_identity_write(&metadata)?;
 
     let now = current_unix_timestamp();
@@ -622,7 +634,7 @@ pub fn upsert_dynamic_secret<P: AsRef<Path>>(
     };
     let record = if let Some(existing) = file.secrets.iter_mut().find(|secret| secret.name == name)
     {
-        existing.alg = encrypted.alg.to_string();
+        existing.alg = None;
         existing.data = data;
         existing.updated_at = now;
         existing.kind = kind;
@@ -631,7 +643,7 @@ pub fn upsert_dynamic_secret<P: AsRef<Path>>(
         let record = SecretRecord {
             id: record_id,
             name: encrypted.name,
-            alg: encrypted.alg.to_string(),
+            alg: None,
             data,
             updated_at: now,
             kind,
@@ -653,6 +665,7 @@ pub fn upsert_dynamic_secret<P: AsRef<Path>>(
     }
 
     migrate_legacy_secret_timestamps(&mut file);
+    migrate_legacy_secret_algorithms(&mut file)?;
     write_secrets_file(path, &file)?;
     let (nonce_b64, hash_b64) = build_encrypted_hash_fields(path, dek)?;
     metadata.secrets_hash_nonce_b64 = nonce_b64;
@@ -721,6 +734,7 @@ pub fn remove_secret_by_name(name: &str, dek: &[u8; 32], vault_path: &str) -> Do
         }
     }
 
+    migrate_legacy_secret_algorithms(&mut file)?;
     write_secrets_file(SECRETS_FILE, &file)?;
     let (nonce_b64, hash_b64) = build_encrypted_hash_fields(SECRETS_FILE, dek)?;
     metadata.secrets_hash_nonce_b64 = nonce_b64;
@@ -806,7 +820,11 @@ mod tests {
         let file = load_secrets_file(&secrets_path).expect("load secrets");
         let metadata = load_vault_metadata(&vault_path).expect("load metadata");
 
-        assert_eq!(metadata.version, 3);
+        assert_eq!(metadata.version, 5);
+        assert_eq!(record.alg, None);
+        assert_eq!(file.secrets[0].alg, None);
+        let serialized = fs::read_to_string(&secrets_path).expect("read secrets");
+        assert!(!serialized.contains("alg ="));
         assert!(metadata.wrapped_sdks_under_kek.contains_key(&record.id));
         assert!(
             decryption_process(file.secrets[0].data.clone(), Alg::XChaCha20Poly1305, &dek).is_err()
@@ -859,6 +877,7 @@ mod tests {
         let file = load_secrets_file(&secrets_path).expect("load secrets");
         let metadata = load_vault_metadata(&vault_path).expect("load metadata");
         let record = &file.secrets[0];
+        assert_eq!(record.alg, None);
         assert!(metadata.wrapped_sdks_under_kek.contains_key(&record.id));
         assert!(metadata.recipients[0].wrapped_sdks.contains_key(&record.id));
         assert!(decryption_process(record.data.clone(), Alg::XChaCha20Poly1305, &dek).is_err());
@@ -902,6 +921,7 @@ updated_at = 1
         .expect("record");
 
         assert!(matches!(record.kind, super::SecretKind::Static));
+        assert_eq!(record.alg.as_deref(), Some(super::DEFAULT_SECRET_ALG));
     }
 
     #[test]

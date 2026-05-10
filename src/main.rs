@@ -18,8 +18,10 @@ use crate::{
         model::{Alg, DotLockResult},
     },
     git::{
-        fetch::auto_fetch_if_enabled, install::install_merge_driver_if_in_git_repo,
+        fetch::auto_fetch_if_enabled,
+        install::install_merge_driver_if_in_git_repo,
         merge::run_merge_driver,
+        sync::{SyncStatus, sync_with_remote},
     },
     providers::{attest_provider, describe_provider, list_providers},
     runtime::{run_with_secrets, secret_value_for_runtime},
@@ -37,8 +39,8 @@ use crate::{
             DynamicSecretMetadata, PlainSecretEntry, SecretKind, SecretRecord,
             decrypt_secret_value, find_secret_by_name, list_secrets, load_secrets_file,
             migrate_all_secrets_to_envelope, remove_secret_by_name,
-            rotate_secret_sdks_after_acl_removal, save_secrets_file, upsert_dynamic_secret,
-            upsert_many, upsert_plain_secret,
+            rotate_secret_sdks_after_acl_removal, save_secrets_file, secret_algorithm,
+            upsert_dynamic_secret, upsert_many, upsert_plain_secret,
         },
         shared_access::{
             self, add_recipient_secret_ids, enable_shared_access, grant_recipient,
@@ -54,7 +56,7 @@ use crate::{
             save_vault_metadata, should_auto_ratchet_for_next_write,
         },
     },
-    utils::{normalize_var_name, parse_alg, print_get_result, print_secrets_table, report_error},
+    utils::{normalize_var_name, print_get_result, print_secrets_table, report_error},
 };
 
 mod audit;
@@ -103,6 +105,7 @@ enum Commands {
     #[command(alias = "r")]
     Run(RunArgs),
     /// Drop the cached master password (sudo-style logout)
+    #[command(alias = "k")]
     #[command(alias = "logout")]
     Lock,
     /// Import variables from a .env file
@@ -119,11 +122,13 @@ enum Commands {
     #[command(alias = "shr")]
     Share(ShareArgs),
     /// Rotate project access material
+    #[command(alias = "rot")]
     Rotate(RotateArgs),
     /// Show and verify the local audit log
     #[command(alias = "a")]
     Audit(AuditArgs),
     /// Manage Git integration
+    #[command(alias = "gt")]
     Git(GitArgs),
     /// Manage project configuration
     #[command(alias = "c")]
@@ -131,6 +136,9 @@ enum Commands {
     /// Discover dynamic secret providers
     #[command(alias = "p")]
     Provider(ProviderArgs),
+    /// Synchronize the local vault with the configured Git remote
+    #[command(alias = "sy")]
+    Sync,
     /// Git merge-driver entrypoint
     #[command(name = "_git-merge", hide = true)]
     GitMerge(GitMergeArgs),
@@ -275,8 +283,10 @@ enum AuditCommand {
         strict: bool,
     },
     /// Print the current audit log path
+    #[command(alias = "p")]
     Path,
     /// Rotate the current audit log
+    #[command(alias = "r")]
     Rotate,
 }
 
@@ -289,6 +299,7 @@ struct GitArgs {
 #[derive(Subcommand, Debug)]
 enum GitCommand {
     /// Install the DotLock merge driver in this Git clone
+    #[command(alias = "i")]
     InstallMergeDriver,
 }
 
@@ -307,18 +318,23 @@ struct ProviderArgs {
 #[derive(Subcommand, Debug)]
 enum ProviderCommand {
     /// List dotlock-provider-* binaries on PATH
+    #[command(alias = "l")]
     List,
     /// Show provider describe output
+    #[command(alias = "i")]
     Info { name: String },
 }
 
 #[derive(Subcommand, Debug)]
 enum ConfigCommand {
     /// Show project configuration
+    #[command(alias = "sh")]
     Show,
     /// Set a project configuration value
+    #[command(alias = "s")]
     Set { key: String, value: String },
     /// Reset a project configuration value to its default
+    #[command(alias = "u")]
     Unset { key: String },
 }
 
@@ -332,6 +348,7 @@ struct GitMergeArgs {
 #[derive(Subcommand, Debug)]
 enum RotateCommand {
     /// Rotate only the key wrapping secret data keys
+    #[command(alias = "k")]
     Kek,
     /// Change the master password wrapping the project key
     #[command(alias = "mp")]
@@ -356,6 +373,32 @@ fn main() -> ExitCode {
 fn dispatch(cli: Cli) -> DotLockResult<()> {
     match cli.command {
         Commands::Init => init_project(),
+
+        Commands::Sync => {
+            ensure_project_initialized()?;
+            let summary = sync_with_remote(VAULT_FILE)?;
+            match summary.status {
+                SyncStatus::UpToDate => println!(
+                    "{} vault already synced with {}/{}",
+                    "ok:".green().bold(),
+                    summary.remote,
+                    summary.branch
+                ),
+                SyncStatus::FastForwarded => println!(
+                    "{} vault synced from {}/{}",
+                    "ok:".green().bold(),
+                    summary.remote,
+                    summary.branch
+                ),
+                SyncStatus::LocalAhead => println!(
+                    "{} local branch is ahead of {}/{}; no pull needed",
+                    "info:".cyan().bold(),
+                    summary.remote,
+                    summary.branch
+                ),
+            }
+            Ok(())
+        }
 
         Commands::Git(GitArgs { command }) => match command {
             GitCommand::InstallMergeDriver => {
@@ -933,7 +976,7 @@ fn reencrypt_secret(
     old_dek: &[u8; 32],
     new_dek: &[u8; 32],
 ) -> DotLockResult<()> {
-    let alg = parse_alg(&secret.alg)?;
+    let alg = secret_algorithm(secret)?;
     let value = decryption_process(secret.data.clone(), alg.clone(), old_dek)?;
     let encrypted = encryption_process(secret.name.clone(), value, alg, new_dek)?;
     secret.data =
@@ -1051,4 +1094,91 @@ fn print_recipients_table(recipients: &[crypto::VaultRecipient]) {
         );
     }
     println!();
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use clap::Parser;
+
+    use super::{
+        AuditArgs, AuditCommand, CertArgs, CertCommand, Cli, Commands, ConfigArgs, ConfigCommand,
+        GitArgs, GitCommand, ProviderArgs, ProviderCommand, RotateArgs, RotateCommand, ShareArgs,
+        ShareCommand,
+    };
+
+    #[test]
+    fn parses_top_level_canonical_aliases() {
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "sy"])
+                .expect("sync alias")
+                .command,
+            Commands::Sync
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "k"])
+                .expect("lock alias")
+                .command,
+            Commands::Lock
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "rot", "k"])
+                .expect("rotate alias")
+                .command,
+            Commands::Rotate(RotateArgs {
+                command: RotateCommand::Kek
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_nested_canonical_aliases() {
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "crt", "sh"])
+                .expect("cert alias")
+                .command,
+            Commands::Cert(CertArgs {
+                command: CertCommand::Show
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "shr", "al", "alice", "--list"])
+                .expect("share alias")
+                .command,
+            Commands::Share(ShareArgs {
+                command: ShareCommand::Allow { .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "a", "p"])
+                .expect("audit alias")
+                .command,
+            Commands::Audit(AuditArgs {
+                command: AuditCommand::Path
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "gt", "i"])
+                .expect("git alias")
+                .command,
+            Commands::Git(GitArgs {
+                command: GitCommand::InstallMergeDriver
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "c", "sh"])
+                .expect("config alias")
+                .command,
+            Commands::Config(ConfigArgs {
+                command: ConfigCommand::Show
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "p", "l"])
+                .expect("provider alias")
+                .command,
+            Commands::Provider(ProviderArgs {
+                command: ProviderCommand::List
+            })
+        ));
+    }
 }

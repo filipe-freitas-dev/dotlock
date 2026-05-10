@@ -9,7 +9,9 @@ use crate::{
     storage::{
         cache::read_cached_dek,
         project::{SECRETS_FILE, VAULT_FILE},
-        secrets_lock::{SecretRecord, SecretsFile, load_secrets_file, refresh_vault_hash},
+        secrets_lock::{
+            DEFAULT_SECRET_ALG, SecretRecord, SecretsFile, load_secrets_file, refresh_vault_hash,
+        },
         secure_fs,
         unlock_file::unlock_vault,
         vault_file::load_vault_metadata,
@@ -146,9 +148,13 @@ fn choose_latest<'a>(
 fn same_secret_revision(left: &SecretRecord, right: &SecretRecord) -> bool {
     left.id == right.id
         && left.name == right.name
-        && left.alg == right.alg
+        && effective_alg(left) == effective_alg(right)
         && left.data == right.data
         && left.updated_at == right.updated_at
+}
+
+fn effective_alg(secret: &SecretRecord) -> &str {
+    secret.alg.as_deref().unwrap_or(DEFAULT_SECRET_ALG)
 }
 
 fn merge_vault_metadata(ours: &Path, theirs: &Path, base: &Path) -> DotLockResult<()> {
@@ -229,10 +235,17 @@ mod tests {
         SecretRecord {
             id: name.to_string(),
             name: name.to_string(),
-            alg: "xchacha20-poly1305".to_string(),
+            alg: None,
             data: data.to_string(),
             updated_at,
             kind: SecretKind::Static,
+        }
+    }
+
+    fn legacy_secret(name: &str, data: &str, updated_at: i64) -> SecretRecord {
+        SecretRecord {
+            alg: Some("xchacha20-poly1305".to_string()),
+            ..secret(name, data, updated_at)
         }
     }
 
@@ -285,6 +298,16 @@ mod tests {
         let base = secret("A", "base", 10);
         let merged = merge_secrets(file(Vec::new()), file(vec![base.clone()]), file(vec![base]))
             .expect("merge");
+
+        assert!(merged.secrets.is_empty());
+    }
+
+    #[test]
+    fn missing_default_alg_matches_legacy_default_alg() {
+        let base = secret("A", "base", 10);
+        let theirs = legacy_secret("A", "base", 10);
+        let merged =
+            merge_secrets(file(Vec::new()), file(vec![theirs]), file(vec![base])).expect("merge");
 
         assert!(merged.secrets.is_empty());
     }

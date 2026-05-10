@@ -446,6 +446,21 @@ dl git install-merge-driver
 
 **When:** Use in repositories where multiple branches or teammates may edit the vault.
 
+### Sync from remote
+
+**What:** `dl sync` fetches the configured remote and updates the current branch only when Git can fast-forward safely.
+
+**How:**
+
+```bash
+dl sync
+dl sy
+```
+
+`dl sync` uses `auto_fetch_remote` from project config, defaulting to `origin`. It aborts when `.lock/vault.toml` or `.lock/secrets.lock` has local staged, unstaged, or untracked changes, or when the local and remote branches diverged. It never runs a hard reset and never discards local vault data.
+
+**When:** Use before reading, exporting, or rotating secrets when you want to force a remote refresh without enabling auto-fetch for every `dl run`.
+
 ### Auto-fetch before run
 
 **What:** when enabled, `dl run` tries a short `git pull --ff-only --no-rebase REMOTE BRANCH` before unlocking.
@@ -544,38 +559,41 @@ Aliases: `dl c show`, `dl c set`, `dl c unset`.
 | Command | Aliases | Purpose |
 |---|---|---|
 | `dl init` | `i` | Initialize `.lock/` in the current project |
-| `dl set [--alg xcha] NAME VALUE` | `s`, `add` | Store or update a static secret |
-| `dl set NAME --provider PROVIDER [--config JSON] [--bootstrap A,B]` | `s`, `add` | Store a dynamic secret definition |
+| `dl set [--alg xcha] NAME VALUE` | `s` | Store or update a static secret |
+| `dl set NAME --provider PROVIDER [--config JSON] [--bootstrap A,B]` | `s` | Store a dynamic secret definition |
 | `dl get NAME` | `g` | Print a secret value |
-| `dl unset NAME` | `rm`, `remove`, `u`, `d`, `del`, `delete` | Remove a secret |
+| `dl unset NAME` | `u` | Remove a secret |
 | `dl list` | `l` | List stored secrets without plaintext |
 | `dl run CMD [args...]` | `r` | Run a command with decrypted secrets in its environment |
-| `dl lock` | `logout` | Drop the cached project key |
-| `dl migrate [PATH]` | `m`, `import` | Import variables from `.env` |
+| `dl lock` | `k` | Drop the cached project key |
+| `dl migrate [PATH]` | `m` | Import variables from `.env` |
 | `dl export [PATH]` | `x` | Append missing static secrets to `.env` |
+| `dl sync` | `sy` | Fast-forward from the configured Git remote when safe |
 | `dl cert init [--force] [--plain]` | `crt init`, `crt i` | Create a local RSA identity |
 | `dl cert show` | `crt show`, `crt sh` | Show local identity information |
 | `dl cert export-pub [PATH]` | `crt export-pub`, `crt x` | Print or write the public key |
 | `dl share enable` | `shr enable`, `shr en` | Enable shared mode |
 | `dl share grant --pubkey FILE --label LABEL [--allow A,B]` | `shr grant`, `shr gr` | Grant recipient access |
-| `dl share allow QUERY --list` | none | List recipient ACL |
-| `dl share allow QUERY --add A,B` | none | Add secrets to recipient ACL |
-| `dl share allow QUERY --remove A,B` | none | Remove secrets from recipient ACL and rotate affected SDKs |
+| `dl share allow QUERY --list` | `shr allow`, `shr al` | List recipient ACL |
+| `dl share allow QUERY --add A,B` | `shr allow`, `shr al` | Add secrets to recipient ACL |
+| `dl share allow QUERY --remove A,B` | `shr allow`, `shr al` | Remove secrets from recipient ACL and rotate affected SDKs |
 | `dl share revoke QUERY` | `shr revoke`, `shr rev` | Revoke a recipient |
 | `dl share list` | `shr list`, `shr l` | List recipients |
-| `dl rotate kek` | none | Rotate key wrapping material |
-| `dl rotate master-password` | `rotate mp` | Change master password |
-| `dl rotate project-key` | `rotate pk` | Rotate project key |
+| `dl rotate kek` | `rot kek`, `rot k` | Rotate key wrapping material |
+| `dl rotate master-password` | `rot master-password`, `rot mp` | Change master password |
+| `dl rotate project-key` | `rot project-key`, `rot pk` | Rotate project key |
 | `dl audit show [--verbose] [--since YYYY-MM-DD] [--action ACTION]` | `a show`, `audit s` | Show audit entries |
 | `dl audit verify [--strict]` | `a verify`, `audit v` | Verify audit log |
-| `dl audit path` | `a path` | Print audit log path |
-| `dl audit rotate` | `a rotate` | Rotate and gzip current audit log |
-| `dl git install-merge-driver` | none | Configure Git merge support |
-| `dl config show` | `c show` | Show project config |
-| `dl config set KEY VALUE` | `c set` | Set project config |
-| `dl config unset KEY` | `c unset` | Reset project config |
-| `dl provider list` | `p list` | List provider binaries on `PATH` |
-| `dl provider info NAME` | `p info` | Show provider description |
+| `dl audit path` | `a path`, `audit p` | Print audit log path |
+| `dl audit rotate` | `a rotate`, `audit r` | Rotate and gzip current audit log |
+| `dl git install-merge-driver` | `gt install-merge-driver`, `gt i` | Configure Git merge support |
+| `dl config show` | `c show`, `config sh` | Show project config |
+| `dl config set KEY VALUE` | `c set`, `config s` | Set project config |
+| `dl config unset KEY` | `c unset`, `config u` | Reset project config |
+| `dl provider list` | `p list`, `provider l` | List provider binaries on `PATH` |
+| `dl provider info NAME` | `p info`, `provider i` | Show provider description |
+
+Compatibility aliases such as `add`, `rm`, `remove`, `del`, `delete`, `logout`, and `import` remain available, but the table above is the canonical long/short command set.
 
 ## How It Works
 
@@ -604,6 +622,12 @@ Local user state:
 ```
 
 On Unix, private directories are created with `0700`, secret/private files with `0600`, and public key files with `0644`. Writes use an atomic temp-file-and-rename flow.
+
+### Secret metadata
+
+New `secrets.lock` records store the secret `id`, variable `name`, ciphertext `data`, update timestamp, and kind. They do not store the data encryption algorithm next to the variable name. DotLock uses the storage-version cipher policy, currently XChaCha20-Poly1305, and still reads older records that contain `alg = "xchacha20-poly1305"`.
+
+Keeping the algorithm out of each visible secret record removes a per-secret cryptographic hint from the Git-tracked vault. An attacker who obtains `.lock/` can still see variable names and ciphertexts, but cannot use a name-to-algorithm pairing to classify records, prioritize guesses, or tune offline brute-force workflows per secret. Algorithm agility remains a vault/storage-version concern rather than secret metadata.
 
 ### Key hierarchy
 
@@ -643,6 +667,7 @@ Full-access recipients receive wrapped access to the project key and per-secret 
 - `dl get` prints plaintext. Prefer `dl run` when a command can consume secrets directly.
 - Do not commit plaintext `.env` files after migrating to DotLock.
 - Commit `.lock/vault.toml` and `.lock/secrets.lock` if your team shares the encrypted vault through Git.
+- Use `dl sync` to refresh the vault safely from Git. It aborts on local vault changes or branch divergence instead of discarding data.
 - Keep local identity private keys protected. Use `dl cert init --plain` only for controlled automation or ephemeral environments.
 - Dynamic providers are executable code. Install them from trusted sources and keep provider directories non-world-writable.
 - Audit logs are local by default. They are useful for local accountability and debugging, not a centralized compliance system.
