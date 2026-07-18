@@ -17,6 +17,7 @@ use crate::{
     storage::{
         cache::{invalidate_cache, read_cached_dek, write_cached_dek},
         identity::{load_local_identity, load_local_identity_metadata},
+        pending_merge::ensure_no_pending_merge,
         project::SECRETS_FILE,
         vault_file::load_vault_metadata,
         vault_txn::recover_pending,
@@ -59,13 +60,52 @@ impl UnlockAccess {
     }
 }
 
-/// Resolves any interrupted vault-pair transaction before the vault is read.
+/// Resolves any interrupted vault-pair transaction before the vault is read,
+/// and refuses to proceed while a pending-merge marker exists: merged content
+/// was never signed by a key holder, so every unlock (interactive or CI) must
+/// fail with a clear "run `dl reconcile`" error instead of a false
+/// `TamperedSecretsFile`.
 fn recover_pending_before_access(vault_path: &str) -> DotLockResult<()> {
+    let vault = std::path::Path::new(vault_path);
+    recover_pending(vault, std::path::Path::new(SECRETS_FILE))?;
+    let lock_dir = match vault.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    ensure_no_pending_merge(lock_dir)
+}
+
+/// Unlock used exclusively by `dl reconcile`: obtains the real project key
+/// WITHOUT the integrity check (after a merge the stored hash is stale by
+/// construction). The caller must verify the pending-merge marker against the
+/// files first. Key correctness is still guaranteed: both the identity unwrap
+/// and the password unwrap fail on wrong credentials.
+pub fn unlock_full_for_reconcile(path: &str) -> DotLockResult<Zeroizing<[u8; 32]>> {
     recover_pending(
-        std::path::Path::new(vault_path),
+        std::path::Path::new(path),
         std::path::Path::new(SECRETS_FILE),
     )?;
-    Ok(())
+    let metadata = load_vault_metadata(path)?;
+
+    if metadata.access_mode == AccessMode::Shared
+        && let Ok(identity_meta) = load_local_identity_metadata()
+        && let Some(recipient) = metadata
+            .recipients
+            .iter()
+            .find(|recipient| recipient.public_key_fingerprint == identity_meta.fingerprint)
+        && !recipient.wrapped_dek_b64.is_empty()
+        && let Ok(identity) = load_local_identity()
+    {
+        let dek =
+            unwrap_dek_with_private_key(&recipient.wrapped_dek_b64, &identity.private_key_pem)?;
+        record_unlock_best_effort("identity", &metadata);
+        return Ok(Zeroizing::new(dek));
+    }
+
+    let passphrase = prompt_unlock_password()?;
+    let dek = unwrap_dek_with_passphrase(&metadata, &passphrase)?;
+    record_unlock_best_effort("password", &metadata);
+    Ok(Zeroizing::new(dek))
 }
 
 fn unwrap_dek_with_passphrase(

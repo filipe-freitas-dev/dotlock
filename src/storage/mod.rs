@@ -3,6 +3,7 @@ pub mod config;
 pub mod env_file;
 pub mod identity;
 pub mod init_project;
+pub mod pending_merge;
 pub mod project;
 pub mod secrets_lock;
 pub mod secure_fs;

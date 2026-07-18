@@ -206,7 +206,14 @@ fn upsert_record(
     let existing_index = file.secrets.iter().position(|secret| secret.name == name);
     let (record_id, sdk) = if let Some(index) = existing_index {
         let existing = &file.secrets[index];
-        let sdk = secret_sdk_from_project_key(metadata, existing, dek)?.unwrap_or(*dek);
+        // Reuse the existing SDK when its wrapping is present; otherwise mint
+        // a fresh one. The record is fully re-encrypted here, so a legacy or
+        // orphaned record is upgraded to the envelope model instead of
+        // silently reusing the raw project key as its SDK.
+        let sdk = match secret_sdk_from_project_key(metadata, existing, dek)? {
+            Some(sdk) => sdk,
+            None => sdk::generate_sdk()?,
+        };
         (existing.id.clone(), sdk)
     } else {
         (Uuid::new_v4().to_string(), sdk::generate_sdk()?)
@@ -395,7 +402,7 @@ pub fn rotate_secret_sdks_after_acl_removal(
             continue;
         }
 
-        let old_sdk = secret_sdk_from_project_key(&metadata, secret, dek)?.unwrap_or(*dek);
+        let old_sdk = secret_key_from_project_key_or_legacy(&metadata, secret, dek)?;
         let value = decryption_process(secret.data.clone(), secret_algorithm(secret)?, &old_sdk)?;
         let new_sdk = sdk::generate_sdk()?;
         let encrypted = encryption_process(
@@ -443,7 +450,7 @@ pub fn decrypt_secret_value(secret: &SecretRecord, dek: &[u8; 32]) -> DotLockRes
         match secret_sdk_from_local_identity(&metadata, secret)? {
             Some(sdk) => sdk,
             None if metadata.recipients.is_empty() => {
-                secret_sdk_from_project_key(&metadata, secret, dek)?.unwrap_or(*dek)
+                secret_key_from_project_key_or_legacy(&metadata, secret, dek)?
             }
             None => {
                 return Err(DotLockError::AccessDenied {
@@ -452,7 +459,7 @@ pub fn decrypt_secret_value(secret: &SecretRecord, dek: &[u8; 32]) -> DotLockRes
             }
         }
     } else {
-        secret_sdk_from_project_key(&metadata, secret, dek)?.unwrap_or(*dek)
+        secret_key_from_project_key_or_legacy(&metadata, secret, dek)?
     };
 
     decryption_process(secret.data.clone(), secret_algorithm(secret)?, &key)
@@ -460,6 +467,26 @@ pub fn decrypt_secret_value(secret: &SecretRecord, dek: &[u8; 32]) -> DotLockRes
 
 pub fn secret_algorithm(secret: &SecretRecord) -> DotLockResult<Alg> {
     crate::utils::parse_alg(secret.alg.as_deref().unwrap_or(DEFAULT_SECRET_ALG))
+}
+
+/// Resolves the key that decrypts `secret` from the project key. Vaults at
+/// version 5+ store every secret under a per-secret SDK, so a missing wrapping
+/// there is an orphaned secret and surfaces as an explicit
+/// [`DotLockError::MissingSecretKeyWrapping`] — silently falling back to the
+/// raw DEK is what used to turn merge bugs into undiagnosed permanent data
+/// loss. Pre-v5 vaults keep the legacy DEK-direct behavior.
+fn secret_key_from_project_key_or_legacy(
+    metadata: &crate::crypto::VaultKeyMetadata,
+    secret: &SecretRecord,
+    dek: &[u8; 32],
+) -> DotLockResult<[u8; 32]> {
+    match secret_sdk_from_project_key(metadata, secret, dek)? {
+        Some(sdk) => Ok(sdk),
+        None if metadata.version < 5 => Ok(*dek),
+        None => Err(DotLockError::MissingSecretKeyWrapping {
+            id: secret.id.clone(),
+        }),
+    }
 }
 
 fn secret_sdk_from_project_key(
@@ -919,6 +946,38 @@ mod tests {
 
         let _ = fs::remove_dir_all(dir);
         let _ = fs::remove_dir_all(identity_dir);
+    }
+
+    #[test]
+    fn missing_sdk_wrapping_is_an_explicit_error_for_v5_vaults() {
+        use crate::domain::error::DotLockError;
+
+        let record = SecretRecord {
+            id: "orphan-id".to_string(),
+            name: "FOO".to_string(),
+            alg: None,
+            data: "ciphertext".to_string(),
+            updated_at: 1,
+            kind: super::SecretKind::Static,
+        };
+        let dek = [8u8; 32];
+
+        // v5+ vault: a missing wrapping is an orphaned secret, never a silent
+        // fallback to the raw project key.
+        let mut v5 = metadata();
+        v5.version = 5;
+        let result = super::secret_key_from_project_key_or_legacy(&v5, &record, &dek);
+        assert!(matches!(
+            result,
+            Err(DotLockError::MissingSecretKeyWrapping { ref id }) if id == "orphan-id"
+        ));
+
+        // Pre-v5 vault: legacy DEK-direct records keep working.
+        let legacy = metadata();
+        assert_eq!(legacy.version, 2);
+        let key = super::secret_key_from_project_key_or_legacy(&legacy, &record, &dek)
+            .expect("legacy fallback");
+        assert_eq!(key, dek);
     }
 
     #[test]

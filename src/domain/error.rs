@@ -25,6 +25,12 @@ pub enum DotLockError {
     #[error("`.lock/secrets.lock` was modified outside of DotLock")]
     TamperedSecretsFile,
 
+    #[error("secret `{id}` has no key wrapping in `vault.toml` (`wrapped_sdks_under_kek`)")]
+    MissingSecretKeyWrapping { id: String },
+
+    #[error("vault has an unreconciled merge; run `dl reconcile`")]
+    UnreconciledMerge,
+
     #[error("variable name `{name}` is invalid")]
     InvalidVariableName { name: String },
 
@@ -90,6 +96,12 @@ impl DotLockError {
             DotLockError::SecretNotFound { .. } => Some("list available secrets with `dl list`"),
             DotLockError::TamperedSecretsFile => Some(
                 "someone modified `.lock/secrets.lock` outside DotLock; restore from a trusted backup or start over with `dl init`",
+            ),
+            DotLockError::MissingSecretKeyWrapping { .. } => Some(
+                "the vault metadata and secrets file are out of sync; restore `.lock/` from a trusted git revision (e.g. `git checkout <rev> -- .lock/`) or re-set the secret with `dl set`",
+            ),
+            DotLockError::UnreconciledMerge => Some(
+                "a git merge combined the vault files without re-signing them; run `dl reconcile` interactively to review and approve the merged content",
             ),
             DotLockError::InvalidVariableName { .. } => {
                 Some("use only letters, digits and underscores; the name cannot start with a digit")

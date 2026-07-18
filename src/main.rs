@@ -29,7 +29,11 @@ use crate::{
             private_key_path, public_key_path,
         },
         init_project::init_project,
-        project::{SECRETS_FILE, VAULT_FILE, ensure_project_initialized},
+        pending_merge::{
+            PendingMergeMarker, confirmation_is_yes, load_marker, reconcile_pending_merge,
+            verify_marker_matches_files,
+        },
+        project::{DOTLOCK_DIR, SECRETS_FILE, VAULT_FILE, ensure_project_initialized},
         secrets_lock::{
             DynamicSecretMetadata, PlainSecretEntry, SecretKind, decrypt_secret_value,
             find_secret_by_name, list_secrets, load_secrets_file, migrate_all_secrets_to_envelope,
@@ -42,14 +46,14 @@ use crate::{
             revoke_recipient_and_rotate,
         },
         unlock_file::{
-            UnlockAccess, unlock_vault, unlock_vault_with_master_password,
-            unlock_vault_with_master_password_and_passphrase,
+            UnlockAccess, unlock_full_for_reconcile, unlock_vault,
+            unlock_vault_with_master_password, unlock_vault_with_master_password_and_passphrase,
         },
         vault_file::{
             RatchetSummary, load_vault_metadata, record_vault_write, rotate_kek_wrapping,
             save_vault_metadata, should_auto_ratchet_for_next_write,
         },
-        vault_txn::{VaultPairWrite, commit_vault_pair},
+        vault_txn::{VaultPairWrite, commit_vault_pair, recover_pending},
     },
     utils::{normalize_var_name, print_get_result, print_secrets_table, report_error},
 };
@@ -134,6 +138,9 @@ enum Commands {
     /// Synchronize the local vault with the configured Git remote
     #[command(alias = "sy")]
     Sync,
+    /// Review and re-sign a vault combined by the Git merge driver
+    #[command(alias = "rec")]
+    Reconcile,
     /// Git merge-driver entrypoint
     #[command(name = "_git-merge", hide = true)]
     GitMerge(GitMergeArgs),
@@ -392,6 +399,48 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
                     summary.branch
                 ),
             }
+            Ok(())
+        }
+
+        Commands::Reconcile => {
+            ensure_project_initialized()?;
+            let vault_path = std::path::Path::new(VAULT_FILE);
+            let secrets_path = std::path::Path::new(SECRETS_FILE);
+            let lock_dir = std::path::Path::new(DOTLOCK_DIR);
+            recover_pending(vault_path, secrets_path)?;
+
+            let Some(marker) = load_marker(lock_dir)? else {
+                println!("{} no pending merge to reconcile", "info:".cyan().bold());
+                return Ok(());
+            };
+            // Anti-laundering: refuse before even prompting if the merged
+            // files were edited after the merge driver produced them.
+            verify_marker_matches_files(&marker, vault_path, secrets_path)?;
+
+            print_merge_diff(&marker);
+            print!("re-sign and accept the merged vault? [y/N] ");
+            use std::io::Write as _;
+            std::io::stdout().flush().ok();
+            let mut answer = String::new();
+            std::io::stdin()
+                .read_line(&mut answer)
+                .map_err(DotLockError::from)?;
+            if !confirmation_is_yes(&answer) {
+                println!(
+                    "{} merge left unreconciled; resolve manually with `git checkout --ours -- .lock/` (or `--theirs`) and redo the merge, or run {} again to accept",
+                    "info:".cyan().bold(),
+                    "dl reconcile".bold()
+                );
+                return Err(DotLockError::Aborted);
+            }
+
+            let dek = unlock_full_for_reconcile(VAULT_FILE)?;
+            reconcile_pending_merge(vault_path, secrets_path, lock_dir, &dek)?;
+            storage::cache::write_cached_dek(&dek)?;
+            println!(
+                "{} merged vault reconciled and re-signed",
+                "ok:".green().bold()
+            );
             Ok(())
         }
 
@@ -889,6 +938,27 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
                 Ok(())
             }
         },
+    }
+}
+
+/// Human-readable summary of what a merge changed — secret names only, never
+/// values.
+fn print_merge_diff(marker: &PendingMergeMarker) {
+    println!(
+        "{} a git merge combined the vault files; the integrity hash must be re-signed",
+        "info:".cyan().bold()
+    );
+    if marker.added.is_empty() && marker.changed.is_empty() && marker.removed.is_empty() {
+        println!("     {} vault metadata merged (no secret changes)", "info:".cyan().bold());
+    }
+    for name in &marker.added {
+        println!("     {} {}", "added".green().bold(), name.bold());
+    }
+    for name in &marker.changed {
+        println!("     {} {}", "changed".yellow().bold(), name.bold());
+    }
+    for name in &marker.removed {
+        println!("     {} {}", "removed".red().bold(), name.bold());
     }
 }
 
