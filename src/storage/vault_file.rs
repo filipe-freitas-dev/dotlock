@@ -19,6 +19,10 @@ pub struct RatchetSummary {
     pub new_kek_version: u32,
     pub secrets_rewrapped: usize,
     pub recipients_rewrapped: usize,
+    /// Recipients that did NOT receive the new project key because their
+    /// grant signature failed verification against the vault's authorized
+    /// signers (H3). Always 0 on vaults without authorized signers.
+    pub recipients_skipped: usize,
 }
 
 pub fn save_vault_metadata<P: AsRef<Path>>(
@@ -74,9 +78,27 @@ pub fn rotate_kek_wrapping(
     }
     metadata.wrapped_sdks_under_kek = rewrapped_sdks;
 
+    // H3: once the vault records authorized signers, only recipients whose
+    // grant signature verifies receive the fresh project key. A recipient
+    // injected without a valid grant (e.g. via a manually accepted merge)
+    // keeps only its stale wrapping, which the rotation makes useless.
+    let enforce_grants = !metadata.authorized_signers.is_empty();
+    let project_uuid = metadata.project_uuid.clone();
+    let signers = metadata.authorized_signers.clone();
     let mut recipients_rewrapped = 0usize;
+    let mut recipients_skipped = 0usize;
     for recipient in &mut metadata.recipients {
         if recipient.wrapped_dek_b64.is_empty() {
+            continue;
+        }
+        if enforce_grants
+            && !crate::storage::shared_access::recipient_grant_is_valid(
+                &project_uuid,
+                &signers,
+                recipient,
+            )
+        {
+            recipients_skipped += 1;
             continue;
         }
         recipient.wrapped_dek_b64 =
@@ -99,6 +121,7 @@ pub fn rotate_kek_wrapping(
         new_kek_version: metadata.kek_version,
         secrets_rewrapped,
         recipients_rewrapped,
+        recipients_skipped,
     })
 }
 
@@ -159,6 +182,7 @@ mod tests {
             wrapped_sdks_under_kek: std::collections::HashMap::new(),
             access_mode: AccessMode::MasterPassword,
             recipients: Vec::new(),
+            authorized_signers: Vec::new(),
             config: VaultConfig {
                 auto_ratchet_after_writes: Some(10),
                 ..VaultConfig::default()
@@ -222,6 +246,8 @@ mod tests {
                 .expect("pub b64"),
             wrapped_dek_b64: before.clone(),
             wrapped_sdks: std::collections::HashMap::new(),
+            grant_signature_b64: String::new(),
+            grant_signer_fingerprint: String::new(),
             full_access: true,
         });
 
@@ -262,6 +288,95 @@ mod tests {
         // ...and no longer under the old key.
         assert!(
             crate::crypto::integrity::decrypt_hash(&nonce, &ciphertext, &old_project_key).is_err()
+        );
+    }
+
+    /// H3 sink: once the vault has authorized signers, a rotation never wraps
+    /// the fresh project key for a recipient whose grant signature does not
+    /// verify — its stale wrapping is left behind and becomes useless.
+    #[test]
+    fn rotate_kek_wrapping_skips_recipients_without_valid_grant() {
+        use crate::{
+            crypto::{AuthorizedSigner, VaultRecipient},
+            storage::shared_access::{recipient_grant_payload, recipient_grant_is_valid},
+        };
+
+        let old_project_key = [8u8; 32];
+        let new_project_key = [9u8; 32];
+        let owner = crate::crypto::share::generate_identity(
+            crate::crypto::share::IdentityProtection::Plain,
+        )
+        .expect("identity");
+        let owner_pub_b64 =
+            crate::crypto::share::encode_public_key_b64(&owner.public_key_pem).expect("pub b64");
+
+        let mut metadata = metadata();
+        metadata.authorized_signers = vec![AuthorizedSigner {
+            fingerprint: owner.fingerprint.clone(),
+            public_key_b64: owner_pub_b64.clone(),
+            label: "owner".to_string(),
+        }];
+
+        // A properly signed recipient (real public key, valid grant).
+        let payload = recipient_grant_payload(
+            &metadata.project_uuid,
+            &owner.fingerprint,
+            &owner_pub_b64,
+            &owner.fingerprint,
+        );
+        let signature =
+            crate::crypto::share::sign_recipient_grant(&payload, &owner.private_key_pem)
+                .expect("sign grant");
+        let signed_recipient = VaultRecipient {
+            id: "signed-id".to_string(),
+            label: "signed".to_string(),
+            alg: crate::crypto::share::RECIPIENT_ALG.to_string(),
+            public_key_fingerprint: owner.fingerprint.clone(),
+            public_key_b64: owner_pub_b64.clone(),
+            wrapped_dek_b64: "old-signed-wrap".to_string(),
+            wrapped_sdks: std::collections::HashMap::new(),
+            full_access: true,
+            grant_signature_b64: signature,
+            grant_signer_fingerprint: owner.fingerprint.clone(),
+        };
+        // An injected recipient without a valid grant.
+        let injected_recipient = VaultRecipient {
+            id: "injected-id".to_string(),
+            label: "injected".to_string(),
+            alg: crate::crypto::share::RECIPIENT_ALG.to_string(),
+            public_key_fingerprint: "injected-fp".to_string(),
+            public_key_b64: "aW5qZWN0ZWQ=".to_string(),
+            wrapped_dek_b64: "old-injected-wrap".to_string(),
+            wrapped_sdks: std::collections::HashMap::new(),
+            full_access: true,
+            grant_signature_b64: String::new(),
+            grant_signer_fingerprint: String::new(),
+        };
+        assert!(recipient_grant_is_valid(
+            &metadata.project_uuid,
+            &metadata.authorized_signers,
+            &signed_recipient
+        ));
+        metadata.recipients = vec![signed_recipient, injected_recipient];
+
+        let summary =
+            rotate_kek_wrapping(&mut metadata, &old_project_key, &new_project_key).expect("rotate");
+
+        assert_eq!(summary.recipients_rewrapped, 1);
+        assert_eq!(summary.recipients_skipped, 1);
+        // The valid recipient got the new key (its wrapping changed and
+        // unwraps to the new project key with the owner's private key)...
+        assert_ne!(metadata.recipients[0].wrapped_dek_b64, "old-signed-wrap");
+        let unwrapped = crate::crypto::share::unwrap_dek_with_private_key(
+            &metadata.recipients[0].wrapped_dek_b64,
+            &owner.private_key_pem,
+        )
+        .expect("unwrap new project key");
+        assert_eq!(unwrapped, new_project_key);
+        // ...while the injected one was never wrapped to the new key.
+        assert_eq!(
+            metadata.recipients[1].wrapped_dek_b64,
+            "old-injected-wrap"
         );
     }
 

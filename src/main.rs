@@ -41,7 +41,7 @@ use crate::{
             upsert_many, upsert_plain_secret,
         },
         shared_access::{
-            self, add_recipient_secret_ids, enable_shared_access, grant_recipient,
+            self, add_recipient_secret_ids, enable_shared_access,
             list_recipient_acl, list_recipients, load_public_key_from_file,
             revoke_recipient_and_rotate,
         },
@@ -816,17 +816,19 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
                 migrate_all_secrets_to_envelope(&dek, VAULT_FILE)?;
                 let public_key_pem = load_public_key_from_file(&pubkey)?;
                 let allowed_ids = allow.as_deref().map(resolve_secret_ids_csv).transpose()?;
-                let recipient = if let Some(ids) = allowed_ids.as_ref() {
-                    shared_access::grant_recipient_with_secret_ids(
-                        VAULT_FILE,
-                        &public_key_pem,
-                        &label,
-                        &dek,
-                        Some(ids),
-                    )?
-                } else {
-                    grant_recipient(VAULT_FILE, &public_key_pem, &label, &dek)?
-                };
+                // Grants must be signed by an authorized signer (H3): the
+                // granting user just proved master-password authority, so
+                // their local identity signs the grant (and blesses any
+                // legacy unsigned recipients on pre-signed-grant vaults).
+                let signer = storage::identity::load_local_identity()?;
+                let recipient = shared_access::grant_recipient_with_secret_ids(
+                    VAULT_FILE,
+                    &public_key_pem,
+                    &label,
+                    &dek,
+                    allowed_ids.as_deref(),
+                    Some(&signer),
+                )?;
                 println!(
                     "{} access granted to {} ({})",
                     "ok:".green().bold(),
@@ -972,6 +974,20 @@ fn print_merge_diff(marker: &PendingMergeMarker) {
     for name in &marker.removed {
         println!("     {} {}", "removed".red().bold(), name.bold());
     }
+    for entry in &marker.rejected_recipients {
+        println!(
+            "     {} recipient {} (no valid grant signature; not absorbed)",
+            "rejected".red().bold(),
+            entry.bold()
+        );
+    }
+    for entry in &marker.rejected_signers {
+        println!(
+            "     {} authorized signer {} (unknown to this side; not absorbed)",
+            "rejected".red().bold(),
+            entry.bold()
+        );
+    }
 }
 
 fn prepare_project_key_for_write(access: UnlockAccess) -> DotLockResult<Zeroizing<[u8; 32]>> {
@@ -1045,6 +1061,18 @@ fn print_ratchet_summary(summary: &RatchetSummary) {
             "s"
         }
     );
+    if summary.recipients_skipped > 0 {
+        println!(
+            "{} {} recipient{} skipped: grant signature did not verify against an authorized signer (re-grant with `dl share grant` or revoke)",
+            "warn:".yellow().bold(),
+            summary.recipients_skipped.to_string().bold(),
+            if summary.recipients_skipped == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+    }
 }
 
 fn decrypted_env_entries(dek: &[u8; 32]) -> DotLockResult<Vec<EnvEntry>> {

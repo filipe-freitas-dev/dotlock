@@ -450,6 +450,7 @@ mod tests {
             wrapped_sdks_under_kek: std::collections::HashMap::new(),
             access_mode: AccessMode::MasterPassword,
             recipients: Vec::new(),
+            authorized_signers: Vec::new(),
             config: VaultConfig::default(),
             secrets_hash_nonce_b64: "hash_nonce".to_string(),
             secrets_hash_b64: "hash".to_string(),

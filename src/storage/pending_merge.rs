@@ -63,6 +63,13 @@ pub struct PendingMergeMarker {
     pub changed: Vec<String>,
     #[serde(default)]
     pub removed: Vec<String>,
+    /// Recipients from `theirs` rejected because their grant signature did not
+    /// verify against a known authorized signer (H3) — `label (fingerprint)`.
+    #[serde(default)]
+    pub rejected_recipients: Vec<String>,
+    /// Authorized-signer entries from `theirs` rejected for the same reason.
+    #[serde(default)]
+    pub rejected_signers: Vec<String>,
 }
 
 impl PendingMergeMarker {
@@ -77,6 +84,8 @@ impl PendingMergeMarker {
             added: Vec::new(),
             changed: Vec::new(),
             removed: Vec::new(),
+            rejected_recipients: Vec::new(),
+            rejected_signers: Vec::new(),
         }
     }
 }
@@ -187,7 +196,13 @@ pub fn reconcile_pending_merge(
                 .ok_or_else(|| DotLockError::MissingSecretKeyWrapping {
                     id: secret.id.clone(),
                 })?;
-            sdk::unwrap_sdk_with_project_key(wrapped, dek)?;
+            let secret_key = sdk::unwrap_sdk_with_project_key(wrapped, dek)?;
+            // H2: authenticate the record against its claimed
+            // id/name/updated_at/version before blessing. A replayed old
+            // ciphertext carrying forged ordering metadata (which is how a
+            // rollback wins `choose_latest`) fails its AEAD check here, so
+            // the merge stays unreconciled instead of being silently signed.
+            crate::storage::secrets_lock::decrypt_record_with_key(secret, &secret_key)?;
         }
     }
 

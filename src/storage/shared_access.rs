@@ -5,16 +5,17 @@ use zeroize::Zeroizing;
 
 use crate::{
     crypto::{
-        AccessMode, VaultKeyMetadata, VaultRecipient,
+        AccessMode, AuthorizedSigner, VaultKeyMetadata, VaultRecipient,
         dek::generate_dek,
         share::{
-            RECIPIENT_ALG, encode_public_key_b64, fingerprint_public_key, wrap_dek_for_public_key,
-            wrap_dek_for_public_key_b64,
+            RECIPIENT_ALG, encode_public_key_b64, fingerprint_public_key, sign_recipient_grant,
+            verify_recipient_grant, wrap_dek_for_public_key, wrap_dek_for_public_key_b64,
         },
         update_master_password_metadata,
     },
     domain::{error::DotLockError, model::DotLockResult},
     storage::{
+        identity::LocalIdentity,
         vault_file::{
             RatchetSummary, load_vault_metadata, record_vault_write, rotate_kek_wrapping,
             save_vault_metadata,
@@ -22,6 +23,113 @@ use crate::{
         vault_txn::{VaultPairWrite, commit_vault_pair},
     },
 };
+
+/// Canonical payload signed by an authorized signer to authorize a recipient
+/// grant (H3): binds the recipient's identity to this project and to the
+/// granting authority. Wrapped key material is intentionally excluded — it is
+/// rewrapped on every rotation without changing WHO is authorized.
+/// Length-prefixed encoding, so no field combination is ambiguous.
+pub fn recipient_grant_payload(
+    project_uuid: &str,
+    public_key_fingerprint: &str,
+    public_key_b64: &str,
+    signer_fingerprint: &str,
+) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"dotlock/recipient-grant/v1";
+    let mut payload = Vec::new();
+    for part in [
+        DOMAIN,
+        project_uuid.as_bytes(),
+        public_key_fingerprint.as_bytes(),
+        public_key_b64.as_bytes(),
+        signer_fingerprint.as_bytes(),
+    ] {
+        payload.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        payload.extend_from_slice(part);
+    }
+    payload
+}
+
+/// True when `recipient` carries a grant signature that verifies against one
+/// of the vault's authorized signers. Unsigned recipients (legacy or
+/// injected) never validate.
+pub fn recipient_grant_is_valid(
+    project_uuid: &str,
+    signers: &[AuthorizedSigner],
+    recipient: &VaultRecipient,
+) -> bool {
+    if recipient.grant_signature_b64.is_empty() || recipient.grant_signer_fingerprint.is_empty() {
+        return false;
+    }
+    let Some(signer) = signers
+        .iter()
+        .find(|signer| signer.fingerprint == recipient.grant_signer_fingerprint)
+    else {
+        return false;
+    };
+    let payload = recipient_grant_payload(
+        project_uuid,
+        &recipient.public_key_fingerprint,
+        &recipient.public_key_b64,
+        &signer.fingerprint,
+    );
+    verify_recipient_grant(
+        &payload,
+        &recipient.grant_signature_b64,
+        &signer.public_key_b64,
+    )
+    .is_ok()
+}
+
+/// Registers `signer` as an authorized grant signer. Only reachable from code
+/// paths that already proved master-password/full-project-key authority.
+fn ensure_authorized_signer(
+    metadata: &mut VaultKeyMetadata,
+    signer: &LocalIdentity,
+) -> DotLockResult<()> {
+    if metadata
+        .authorized_signers
+        .iter()
+        .any(|existing| existing.fingerprint == signer.fingerprint)
+    {
+        return Ok(());
+    }
+    metadata.authorized_signers.push(AuthorizedSigner {
+        fingerprint: signer.fingerprint.clone(),
+        public_key_b64: encode_public_key_b64(&signer.public_key_pem)?,
+        label: String::new(),
+    });
+    Ok(())
+}
+
+/// Migration/bless path: re-signs every recipient whose grant does not verify
+/// (vaults that predate signed grants) under `signer`, registering `signer`
+/// as an authorized signer. Callers must have proven master-password/full-key
+/// authority. Returns how many recipients were blessed.
+pub fn bless_recipient_grants(
+    metadata: &mut VaultKeyMetadata,
+    signer: &LocalIdentity,
+) -> DotLockResult<usize> {
+    ensure_authorized_signer(metadata, signer)?;
+    let project_uuid = metadata.project_uuid.clone();
+    let signers = metadata.authorized_signers.clone();
+    let mut blessed = 0usize;
+    for recipient in &mut metadata.recipients {
+        if recipient_grant_is_valid(&project_uuid, &signers, recipient) {
+            continue;
+        }
+        let payload = recipient_grant_payload(
+            &project_uuid,
+            &recipient.public_key_fingerprint,
+            &recipient.public_key_b64,
+            &signer.fingerprint,
+        );
+        recipient.grant_signature_b64 = sign_recipient_grant(&payload, &signer.private_key_pem)?;
+        recipient.grant_signer_fingerprint = signer.fingerprint.clone();
+        blessed += 1;
+    }
+    Ok(blessed)
+}
 
 pub fn enable_shared_access(vault_path: &str) -> DotLockResult<bool> {
     let mut metadata = load_vault_metadata(vault_path)?;
@@ -39,13 +147,17 @@ pub fn list_recipients(vault_path: &str) -> DotLockResult<Vec<VaultRecipient>> {
     Ok(metadata.recipients)
 }
 
+/// Legacy unsigned grant, kept for tests exercising pre-signed-grant vaults;
+/// the CLI always grants through `grant_recipient_with_secret_ids` with a
+/// signing identity (H3).
+#[cfg(test)]
 pub fn grant_recipient(
     vault_path: &str,
     public_key_pem: &str,
     label: &str,
     dek: &[u8; 32],
 ) -> DotLockResult<VaultRecipient> {
-    grant_recipient_with_secret_ids(vault_path, public_key_pem, label, dek, None)
+    grant_recipient_with_secret_ids(vault_path, public_key_pem, label, dek, None, None)
 }
 
 pub fn grant_recipient_with_secret_ids(
@@ -54,6 +166,7 @@ pub fn grant_recipient_with_secret_ids(
     label: &str,
     dek: &[u8; 32],
     allowed_secret_ids: Option<&[String]>,
+    signer: Option<&LocalIdentity>,
 ) -> DotLockResult<VaultRecipient> {
     let mut metadata = load_vault_metadata(vault_path)?;
     metadata.access_mode = AccessMode::Shared;
@@ -68,6 +181,28 @@ pub fn grant_recipient_with_secret_ids(
     };
     let wrapped_sdks = wrap_allowed_sdks(&metadata, public_key_pem, dek, allowed_secret_ids)?;
 
+    // Signed-grant path (H3): the granting identity — which just proved
+    // master-password authority to obtain `dek` — becomes an authorized
+    // signer, signs this grant, and blesses any legacy unsigned recipients so
+    // pre-signed-grant vaults migrate on their first grant.
+    let (grant_signature_b64, grant_signer_fingerprint) = match signer {
+        Some(signer) => {
+            ensure_authorized_signer(&mut metadata, signer)?;
+            metadata.version = metadata.version.max(6);
+            let payload = recipient_grant_payload(
+                &metadata.project_uuid,
+                &fingerprint,
+                &public_key_b64,
+                &signer.fingerprint,
+            );
+            (
+                sign_recipient_grant(&payload, &signer.private_key_pem)?,
+                signer.fingerprint.clone(),
+            )
+        }
+        None => (String::new(), String::new()),
+    };
+
     if let Some(existing) = metadata
         .recipients
         .iter_mut()
@@ -79,7 +214,12 @@ pub fn grant_recipient_with_secret_ids(
         existing.wrapped_sdks = wrapped_sdks;
         existing.full_access = full_access;
         existing.alg = RECIPIENT_ALG.to_string();
+        existing.grant_signature_b64 = grant_signature_b64;
+        existing.grant_signer_fingerprint = grant_signer_fingerprint;
         let recipient = existing.clone();
+        if let Some(signer) = signer {
+            bless_recipient_grants(&mut metadata, signer)?;
+        }
         record_vault_write(&mut metadata);
         save_vault_metadata(vault_path, &metadata)?;
         return Ok(recipient);
@@ -94,8 +234,13 @@ pub fn grant_recipient_with_secret_ids(
         wrapped_dek_b64,
         wrapped_sdks,
         full_access,
+        grant_signature_b64,
+        grant_signer_fingerprint,
     };
     metadata.recipients.push(recipient.clone());
+    if let Some(signer) = signer {
+        bless_recipient_grants(&mut metadata, signer)?;
+    }
     record_vault_write(&mut metadata);
     save_vault_metadata(vault_path, &metadata)?;
 
@@ -304,6 +449,7 @@ mod tests {
             wrapped_sdks_under_kek: std::collections::HashMap::new(),
             access_mode: AccessMode::MasterPassword,
             recipients: Vec::new(),
+            authorized_signers: Vec::new(),
             config: VaultConfig::default(),
             secrets_hash_nonce_b64: "hash_nonce".to_string(),
             secrets_hash_b64: "hash".to_string(),
@@ -359,7 +505,6 @@ mod tests {
                 kdf::{KdfParams, derive_master_key},
                 kek::derive_kek,
                 sdk,
-                secret_cipher::decryption_process,
                 update_master_password_metadata,
             },
             domain::{error::DotLockError, model::Alg},
@@ -443,7 +588,7 @@ mod tests {
         let sdk_a = sdk::unwrap_sdk_with_project_key(wrapped_sdk, &outcome.new_dek)
             .expect("unwrap SDK under new DEK");
         assert_eq!(
-            decryption_process(record_a.data.clone(), Alg::XChaCha20Poly1305, &sdk_a)
+            crate::storage::secrets_lock::decrypt_record_with_key(record_a, &sdk_a)
                 .expect("decrypt A"),
             "1"
         );
@@ -521,12 +666,89 @@ mod tests {
             "alice",
             &[3u8; 32],
             Some(&["foo-id".to_string()]),
+            None,
         )
         .expect("grant");
 
         assert!(!granted.full_access);
         assert!(granted.wrapped_sdks.contains_key("foo-id"));
         assert!(!granted.wrapped_sdks.contains_key("bar-id"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// H3 migration: a vault that predates signed grants (no authorized
+    /// signers, recipients without grant fields) still loads/parses, and the
+    /// first `dl share grant` executed with a signing identity blesses every
+    /// existing recipient and records the signer.
+    #[test]
+    fn grant_with_signer_signs_new_recipient_and_blesses_legacy_ones() {
+        use crate::storage::{
+            identity::LocalIdentity,
+            shared_access::{grant_recipient_with_secret_ids, recipient_grant_is_valid},
+        };
+
+        let path = temp_file("shared-access-bless");
+        let mut legacy = metadata();
+        legacy.access_mode = AccessMode::Shared;
+        legacy.recipients.push(crate::crypto::VaultRecipient {
+            id: "legacy-id".to_string(),
+            label: "legacy".to_string(),
+            alg: "rsa-oaep-sha256".to_string(),
+            public_key_fingerprint: "legacy-fp".to_string(),
+            public_key_b64: "bGVnYWN5".to_string(),
+            wrapped_dek_b64: "wrapped".to_string(),
+            wrapped_sdks: std::collections::HashMap::new(),
+            full_access: true,
+            grant_signature_b64: String::new(),
+            grant_signer_fingerprint: String::new(),
+        });
+        save_vault_metadata(&path, &legacy).expect("save legacy vault");
+
+        // The pre-signed-grant vault still loads (serde defaults).
+        let loaded = load_vault_metadata(path.to_str().expect("path")).expect("legacy loads");
+        assert!(loaded.authorized_signers.is_empty());
+
+        let owner = generate_identity(IdentityProtection::Plain).expect("identity");
+        let signer = LocalIdentity {
+            fingerprint: owner.fingerprint.clone(),
+            private_key_pem: owner.private_key_pem.clone(),
+            public_key_pem: owner.public_key_pem.clone(),
+        };
+        let grantee = generate_identity(IdentityProtection::Plain).expect("grantee identity");
+
+        let granted = grant_recipient_with_secret_ids(
+            path.to_str().expect("path"),
+            &grantee.public_key_pem,
+            "bob",
+            &[3u8; 32],
+            None,
+            Some(&signer),
+        )
+        .expect("signed grant");
+        assert!(!granted.grant_signature_b64.is_empty());
+        assert_eq!(granted.grant_signer_fingerprint, owner.fingerprint);
+
+        let metadata = load_vault_metadata(path.to_str().expect("path")).expect("reload");
+        // The granting identity was recorded as an authorized signer and the
+        // vault format was bumped.
+        assert_eq!(metadata.authorized_signers.len(), 1);
+        assert_eq!(metadata.authorized_signers[0].fingerprint, owner.fingerprint);
+        assert!(metadata.version >= 6);
+        // Every recipient — the new one AND the legacy unsigned one — now
+        // carries a grant that verifies against the authorized signer.
+        assert_eq!(metadata.recipients.len(), 2);
+        for recipient in &metadata.recipients {
+            assert!(
+                recipient_grant_is_valid(
+                    &metadata.project_uuid,
+                    &metadata.authorized_signers,
+                    recipient
+                ),
+                "recipient {} not blessed",
+                recipient.label
+            );
+        }
 
         let _ = fs::remove_file(path);
     }

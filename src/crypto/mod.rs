@@ -53,6 +53,29 @@ pub struct VaultRecipient {
     pub wrapped_sdks: HashMap<String, String>,
     #[serde(default)]
     pub full_access: bool,
+    /// RSA-PSS signature over the grant payload (project_uuid + this
+    /// recipient's pubkey/fingerprint + the granting signer's fingerprint),
+    /// produced by `dl share grant`. Empty on vaults that predate signed
+    /// grants; such recipients are never absorbed from an untrusted merge
+    /// side and are skipped by rotation once the vault has authorized signers.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub grant_signature_b64: String,
+    /// Fingerprint of the authorized signer whose key produced
+    /// `grant_signature_b64`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub grant_signer_fingerprint: String,
+}
+
+/// An identity allowed to authorize recipient grants. Established locally by
+/// operations that already proved master-password/full-key authority (`dl
+/// share grant`); never absorbed from the untrusted side of a merge except as
+/// a one-time bootstrap when the local side predates signed grants entirely.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorizedSigner {
+    pub fingerprint: String,
+    pub public_key_b64: String,
+    #[serde(default)]
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -95,6 +118,11 @@ pub struct VaultKeyMetadata {
     pub access_mode: AccessMode,
     #[serde(default)]
     pub recipients: Vec<VaultRecipient>,
+    /// Identities whose signatures authorize recipient grants (H3). Empty on
+    /// vaults that predate signed grants; populated on the first `dl share
+    /// grant` executed with the new binary.
+    #[serde(default)]
+    pub authorized_signers: Vec<AuthorizedSigner>,
     #[serde(default)]
     pub config: VaultConfig,
 
@@ -242,6 +270,7 @@ pub fn initialize_vault_keys(project: &str, environment: &str) -> DotLockResult<
 
         access_mode: AccessMode::MasterPassword,
         recipients: Vec::new(),
+        authorized_signers: Vec::new(),
         config: VaultConfig::default(),
 
         secrets_hash_nonce_b64: String::new(),
@@ -300,5 +329,8 @@ secrets_hash_b64 = "hash"
         assert_eq!(metadata.config.auto_ratchet_after_writes, None);
         assert_eq!(metadata.config.dynamic_resolve_timeout_secs, None);
         assert_eq!(metadata.kek_writes_since_rotate, 0);
+        // Pre-signed-grant vaults (no authorized_signers, recipients without
+        // grant fields) must keep parsing so they still unlock (H3 migration).
+        assert!(metadata.authorized_signers.is_empty());
     }
 }

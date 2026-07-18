@@ -174,11 +174,22 @@ fn choose_secret<'a>(
     }
 }
 
+/// Picks the conflict winner by the monotonic per-secret `version` counter,
+/// falling back to `updated_at` for legacy records. Both fields are plaintext
+/// here (the driver holds no keys), so the choice is only PROVISIONAL: for
+/// `version >= 1` records these exact fields are bound into the record's AEAD
+/// associated data, and `dl reconcile` refuses to bless any winner whose
+/// ciphertext does not authenticate under its claimed metadata (H2).
 fn choose_latest<'a>(
     name: &str,
     ours: &'a SecretRecord,
     theirs: &'a SecretRecord,
 ) -> DotLockResult<&'a SecretRecord> {
+    match ours.version.cmp(&theirs.version) {
+        std::cmp::Ordering::Greater => return Ok(ours),
+        std::cmp::Ordering::Less => return Ok(theirs),
+        std::cmp::Ordering::Equal => {}
+    }
     if ours.updated_at > theirs.updated_at {
         return Ok(ours);
     }
@@ -187,7 +198,7 @@ fn choose_latest<'a>(
     }
     if ours.data != theirs.data {
         return Err(DotLockError::Io(format!(
-            "manual merge required for secret `{name}`; both sides changed it at the same timestamp"
+            "manual merge required for secret `{name}`; both sides changed it at the same version and timestamp"
         )));
     }
     Ok(ours)
@@ -199,6 +210,7 @@ fn same_secret_revision(left: &SecretRecord, right: &SecretRecord) -> bool {
         && effective_alg(left) == effective_alg(right)
         && left.data == right.data
         && left.updated_at == right.updated_at
+        && left.version == right.version
 }
 
 fn effective_alg(secret: &SecretRecord) -> &str {
@@ -222,7 +234,8 @@ fn merge_vault_metadata(
     let hash_fields_diverge =
         ours_metadata.secrets_hash_sha256_b64 != theirs_metadata.secrets_hash_sha256_b64;
 
-    let mut merged = merge_metadata(ours_metadata, theirs_metadata.clone(), base_metadata)?;
+    let (mut merged, vault_report) =
+        merge_metadata(ours_metadata, theirs_metadata.clone(), base_metadata)?;
     let theirs_won: HashSet<&String> = marker
         .iter()
         .flat_map(|marker| marker.theirs_won.iter())
@@ -248,10 +261,16 @@ fn merge_vault_metadata(
     // Record the vault hash in the marker. When the secrets merge did not run
     // but the two sides disagree about the secrets content (git resolved
     // `secrets.lock` trivially to one side), the locally-signed hash may be
-    // stale, so a marker is created to force a reconcile as well.
-    if marker.is_some() || hash_fields_diverge {
+    // stale, so a marker is created to force a reconcile as well. Rejected
+    // recipient/signer injections also force a marker so `dl reconcile`
+    // surfaces them to the user.
+    let has_rejections = !vault_report.rejected_recipients.is_empty()
+        || !vault_report.rejected_signers.is_empty();
+    if marker.is_some() || hash_fields_diverge || has_rejections {
         let mut marker = marker.unwrap_or_default();
         marker.vault_sha256_b64 = Some(bytes_sha256_b64(content.as_bytes()));
+        marker.rejected_recipients = vault_report.rejected_recipients;
+        marker.rejected_signers = vault_report.rejected_signers;
         save_marker(lock_dir, &marker)?;
     }
     Ok(())
@@ -291,11 +310,20 @@ fn union_sdk_wrappings(
     }
 }
 
+/// Recipient/signer entries from `theirs` that were NOT absorbed because they
+/// carry no grant signature verifiable against a known authorized signer
+/// (H3). Recorded in the pending-merge marker so `dl reconcile` surfaces them.
+#[derive(Debug, Default)]
+pub struct VaultMergeReport {
+    pub rejected_recipients: Vec<String>,
+    pub rejected_signers: Vec<String>,
+}
+
 pub fn merge_metadata(
     mut ours: VaultKeyMetadata,
     theirs: VaultKeyMetadata,
     base: Option<VaultKeyMetadata>,
-) -> DotLockResult<VaultKeyMetadata> {
+) -> DotLockResult<(VaultKeyMetadata, VaultMergeReport)> {
     if ours.project_uuid != theirs.project_uuid {
         return Err(DotLockError::Io(
             "manual merge required for vault.toml; project_uuid differs".to_string(),
@@ -309,14 +337,54 @@ pub fn merge_metadata(
     }
 
     ours.version = ours.version.max(theirs.version).max(2);
-    merge_recipients(&mut ours, theirs, base);
-    Ok(ours)
+    let mut report = VaultMergeReport::default();
+    merge_authorized_signers(&mut ours, &theirs, base.as_ref(), &mut report);
+    merge_recipients(&mut ours, theirs, base, &mut report);
+    Ok((ours, report))
+}
+
+/// Merges the authorized-signer sets. Signer entries are the root of trust
+/// for recipient grants, so the untrusted side can never extend them — with
+/// one exception: when the local side (ours AND base) predates signed grants
+/// entirely, theirs' signer set is adopted as a one-time trust-on-first-merge
+/// bootstrap (there is nothing local to verify against). Any other new signer
+/// in `theirs` is rejected and surfaced at `dl reconcile`.
+fn merge_authorized_signers(
+    ours: &mut VaultKeyMetadata,
+    theirs: &VaultKeyMetadata,
+    base: Option<&VaultKeyMetadata>,
+    report: &mut VaultMergeReport,
+) {
+    let local_predates_signers = ours.authorized_signers.is_empty()
+        && base.is_none_or(|base| base.authorized_signers.is_empty());
+    if local_predates_signers {
+        ours.authorized_signers = theirs.authorized_signers.clone();
+        return;
+    }
+
+    for signer in &theirs.authorized_signers {
+        let known = ours
+            .authorized_signers
+            .iter()
+            .any(|existing| existing.fingerprint == signer.fingerprint);
+        let was_in_base = base.is_some_and(|base| {
+            base.authorized_signers
+                .iter()
+                .any(|existing| existing.fingerprint == signer.fingerprint)
+        });
+        if !known && !was_in_base {
+            report
+                .rejected_signers
+                .push(format!("{} ({})", signer.label, signer.fingerprint));
+        }
+    }
 }
 
 fn merge_recipients(
     ours: &mut VaultKeyMetadata,
     theirs: VaultKeyMetadata,
     base: Option<VaultKeyMetadata>,
+    report: &mut VaultMergeReport,
 ) {
     let base_fingerprints: Vec<String> = base
         .map(|metadata| {
@@ -340,8 +408,25 @@ fn merge_recipients(
         let was_in_base = base_fingerprints
             .iter()
             .any(|fingerprint| fingerprint == &recipient.public_key_fingerprint);
-        if !was_in_base {
+        if was_in_base {
+            continue;
+        }
+
+        // H3: a recipient coming only from the untrusted side must carry a
+        // grant signature that verifies against an authorized signer already
+        // trusted by the merged metadata. Unsigned or invalidly signed
+        // recipients are never absorbed.
+        if crate::storage::shared_access::recipient_grant_is_valid(
+            &ours.project_uuid,
+            &ours.authorized_signers,
+            &recipient,
+        ) {
             ours.recipients.push(recipient);
+        } else {
+            report.rejected_recipients.push(format!(
+                "{} ({})",
+                recipient.label, recipient.public_key_fingerprint
+            ));
         }
     }
 
@@ -371,7 +456,15 @@ mod tests {
             alg: None,
             data: data.to_string(),
             updated_at,
+            version: 0,
             kind: SecretKind::Static,
+        }
+    }
+
+    fn versioned_secret(name: &str, data: &str, updated_at: i64, version: u64) -> SecretRecord {
+        SecretRecord {
+            version,
+            ..secret(name, data, updated_at)
         }
     }
 
@@ -413,6 +506,21 @@ mod tests {
         .expect("merge");
 
         assert_eq!(merged.secrets[0].data, "new");
+    }
+
+    /// H2: the monotonic per-secret version counter outranks the wall-clock
+    /// timestamp (a forged timestamp alone no longer decides the winner; a
+    /// forged version fails AAD authentication at reconcile).
+    #[test]
+    fn higher_version_wins_even_with_older_timestamp() {
+        let merged = merge_secrets(
+            file(vec![versioned_secret("A", "v3", 10, 3)]),
+            file(vec![versioned_secret("A", "v2", 999, 2)]),
+            file(Vec::new()),
+        )
+        .expect("merge");
+
+        assert_eq!(merged.secrets[0].data, "v3");
     }
 
     #[test]
@@ -468,14 +576,19 @@ mod driver_tests {
 
     use crate::{
         crypto::{
-            AccessMode, VaultConfig, VaultKeyMetadata, integrity::verify_secrets_integrity, sdk,
-            secret_cipher::decryption_process,
+            AccessMode, AuthorizedSigner, VaultConfig, VaultKeyMetadata, VaultRecipient,
+            integrity::verify_secrets_integrity, sdk,
+            share::{
+                IdentityProtection, encode_public_key_b64, generate_identity,
+                sign_recipient_grant,
+            },
         },
         domain::{error::DotLockError, model::Alg},
         storage::{
             pending_merge::{ensure_no_pending_merge, load_marker, reconcile_pending_merge},
-            secrets_lock::{load_secrets_file, upsert_plain_secret},
+            secrets_lock::{decrypt_record_with_key, load_secrets_file, upsert_plain_secret},
             secure_fs,
+            shared_access::recipient_grant_payload,
             vault_file::{load_vault_metadata, save_vault_metadata},
         },
     };
@@ -510,6 +623,7 @@ mod driver_tests {
             wrapped_sdks_under_kek: std::collections::HashMap::new(),
             access_mode: AccessMode::MasterPassword,
             recipients: Vec::new(),
+            authorized_signers: Vec::new(),
             config: VaultConfig::default(),
             secrets_hash_nonce_b64: "hash_nonce".to_string(),
             secrets_hash_b64: "hash".to_string(),
@@ -561,7 +675,10 @@ mod driver_tests {
             .expect("upsert");
         }
 
-        fn force_updated_at(&self, name: &str, updated_at: i64) {
+        /// Attacker move: rewrites a record's PLAINTEXT ordering metadata
+        /// without touching its ciphertext — exactly what a replay/rollback
+        /// forgery looks like on disk.
+        fn forge_record_metadata(&self, name: &str, updated_at: i64, version: u64) {
             let mut file = load_secrets_file(&self.secrets).expect("load secrets");
             let secret = file
                 .secrets
@@ -569,6 +686,7 @@ mod driver_tests {
                 .find(|secret| secret.name == name)
                 .expect("secret present");
             secret.updated_at = updated_at;
+            secret.version = version;
             let content = toml::to_string_pretty(&file).expect("serialize");
             secure_fs::write_string_atomic(&self.secrets, &content, 0o700, 0o600)
                 .expect("write secrets");
@@ -603,7 +721,7 @@ mod driver_tests {
             .get(&secret.id)
             .unwrap_or_else(|| panic!("secret {name} lost its SDK wrapping in the merge"));
         let sdk = sdk::unwrap_sdk_with_project_key(wrapped, &DEK).expect("unwrap sdk");
-        decryption_process(secret.data.clone(), Alg::XChaCha20Poly1305, &sdk)
+        decrypt_record_with_key(secret, &sdk)
             .unwrap_or_else(|err| panic!("secret {name} undecryptable after merge: {err}"))
     }
 
@@ -657,22 +775,68 @@ mod driver_tests {
     #[test]
     fn same_id_conflict_keeps_sdk_wrapping_from_winning_side() {
         let base = Vault::init("k2-win-base");
-        base.set("A", "base-val");
+        base.set("A", "base-val"); // record version 1
         let ours = base.copy_to("k2-win-ours");
-        ours.set("A", "ours-val");
-        ours.force_updated_at("A", 100);
+        ours.set("A", "ours-val"); // version 2
         let theirs = base.copy_to("k2-win-theirs");
         // Their side re-keys the secret (fresh SDK, like an ACL rotation).
         let mut theirs_metadata = load_vault_metadata(&theirs.vault).expect("load theirs vault");
         theirs_metadata.wrapped_sdks_under_kek.clear();
         save_vault_metadata(&theirs.vault, &theirs_metadata).expect("save theirs vault");
-        theirs.set("A", "theirs-val");
-        theirs.force_updated_at("A", 200);
+        theirs.set("A", "ignored"); // version 2
+        theirs.set("A", "theirs-val"); // version 3: legitimately newer
 
         run_driver(&ours, &theirs, &base).expect("merge");
 
-        // theirs has the later timestamp, so its record AND its wrapping win.
+        // theirs has the higher authentic version, so its record AND its
+        // wrapping win — and the winner still authenticates under its AAD.
         assert_eq!(decrypt_with_wrapping(&ours, "A"), "theirs-val");
+
+        // The legitimate winner also survives reconcile (its ciphertext
+        // authenticates under the claimed metadata).
+        reconcile_pending_merge(&ours.vault, &ours.secrets, &ours.dir, &DEK).expect("reconcile");
+        assert_eq!(decrypt_with_wrapping(&ours, "A"), "theirs-val");
+
+        base.cleanup();
+        theirs.cleanup();
+        ours.cleanup();
+    }
+
+    /// H2: a replayed old ciphertext whose plaintext ordering metadata was
+    /// inflated (future timestamp + huge version) wins the keyless textual
+    /// merge, but `dl reconcile` must refuse to bless it: the forged
+    /// updated_at/version don't match the AAD the record was encrypted under,
+    /// so authentication fails and the vault stays blocked on the marker.
+    #[test]
+    fn replayed_record_with_forged_metadata_is_rejected_at_reconcile() {
+        let base = Vault::init("h2-replay-base");
+        base.set("A", "old-value"); // version 1, honest AAD
+        let ours = base.copy_to("h2-replay-ours");
+        ours.set("A", "new-value"); // version 2, honest AAD
+        let theirs = base.copy_to("h2-replay-theirs");
+        // Attacker keeps the OLD ciphertext but forges the ordering metadata
+        // so the stale value outranks the honest update.
+        theirs.forge_record_metadata("A", i64::MAX - 1, 99);
+
+        run_driver(&ours, &theirs, &base).expect("textual merge succeeds without keys");
+
+        // The forgery won the provisional choice...
+        let merged = load_secrets_file(&ours.secrets).expect("load merged");
+        assert_eq!(merged.secrets[0].version, 99);
+
+        // ...but it can never be silently blessed.
+        let err = reconcile_pending_merge(&ours.vault, &ours.secrets, &ours.dir, &DEK)
+            .expect_err("reconcile must reject the replayed record");
+        assert!(
+            err.to_string().contains("failed authentication"),
+            "unexpected error: {err}"
+        );
+        // Marker stays: the vault remains blocked until manual resolution.
+        assert!(load_marker(&ours.dir).expect("load marker").is_some());
+        assert!(matches!(
+            ensure_no_pending_merge(&ours.dir),
+            Err(DotLockError::UnreconciledMerge)
+        ));
 
         base.cleanup();
         theirs.cleanup();
@@ -793,6 +957,174 @@ mod driver_tests {
         base.cleanup();
         theirs.cleanup();
         ours.cleanup();
+    }
+
+    fn signer_for(identity: &crate::crypto::share::GeneratedIdentity) -> AuthorizedSigner {
+        AuthorizedSigner {
+            fingerprint: identity.fingerprint.clone(),
+            public_key_b64: encode_public_key_b64(&identity.public_key_pem).expect("pub b64"),
+            label: "owner".to_string(),
+        }
+    }
+
+    fn test_recipient(
+        label: &str,
+        fingerprint: &str,
+        public_key_b64: &str,
+        grant_signature_b64: &str,
+        grant_signer_fingerprint: &str,
+    ) -> VaultRecipient {
+        VaultRecipient {
+            id: format!("{label}-id"),
+            label: label.to_string(),
+            alg: "rsa-oaep-sha256".to_string(),
+            public_key_fingerprint: fingerprint.to_string(),
+            public_key_b64: public_key_b64.to_string(),
+            wrapped_dek_b64: "wrapped".to_string(),
+            wrapped_sdks: std::collections::HashMap::new(),
+            full_access: true,
+            grant_signature_b64: grant_signature_b64.to_string(),
+            grant_signer_fingerprint: grant_signer_fingerprint.to_string(),
+        }
+    }
+
+    /// H3: a recipient present only in untrusted `theirs` and carrying no
+    /// valid grant signature is never absorbed; it is surfaced in the
+    /// pending-merge marker for `dl reconcile` to display. Since the rejected
+    /// entry never reaches the merged vault, no later `dl rotate` can wrap
+    /// the project key for it.
+    #[test]
+    fn merge_rejects_recipient_without_valid_grant_signature() {
+        let owner = generate_identity(IdentityProtection::Plain).expect("identity");
+        let dir = temp_dir("h3-reject");
+        let mut base_metadata = metadata();
+        base_metadata.authorized_signers = vec![signer_for(&owner)];
+        let base_path = dir.join("base-vault.toml");
+        let ours_path = dir.join("vault.toml");
+        let theirs_path = dir.join("theirs-vault.toml");
+        save_vault_metadata(&base_path, &base_metadata).expect("save base");
+        save_vault_metadata(&ours_path, &base_metadata).expect("save ours");
+
+        let mut theirs_metadata = base_metadata.clone();
+        theirs_metadata.recipients.push(test_recipient(
+            "mallory",
+            "mallory-fp",
+            "bWFsbG9yeQ==",
+            "", // no grant signature at all
+            "",
+        ));
+        save_vault_metadata(&theirs_path, &theirs_metadata).expect("save theirs");
+
+        super::merge_vault_metadata(&ours_path, &theirs_path, &base_path, &dir).expect("merge");
+
+        let merged = load_vault_metadata(&ours_path).expect("load merged");
+        assert!(
+            merged.recipients.is_empty(),
+            "injected recipient must not be absorbed"
+        );
+        let marker = load_marker(&dir).expect("marker").expect("present");
+        assert_eq!(marker.rejected_recipients, vec!["mallory (mallory-fp)"]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// H3 (bad signature variant): a grant signed by a key that is NOT an
+    /// authorized signer — e.g. the attacker self-signing — is also rejected.
+    #[test]
+    fn merge_rejects_recipient_with_grant_signed_by_unknown_key() {
+        let owner = generate_identity(IdentityProtection::Plain).expect("identity");
+        let mallory = generate_identity(IdentityProtection::Plain).expect("identity");
+        let dir = temp_dir("h3-selfsign");
+        let mut base_metadata = metadata();
+        base_metadata.authorized_signers = vec![signer_for(&owner)];
+        let base_path = dir.join("base-vault.toml");
+        let ours_path = dir.join("vault.toml");
+        let theirs_path = dir.join("theirs-vault.toml");
+        save_vault_metadata(&base_path, &base_metadata).expect("save base");
+        save_vault_metadata(&ours_path, &base_metadata).expect("save ours");
+
+        // Mallory signs her own grant with her own key and even injects
+        // herself as an authorized signer on `theirs`.
+        let mallory_pub_b64 = encode_public_key_b64(&mallory.public_key_pem).expect("pub b64");
+        let payload = recipient_grant_payload(
+            &base_metadata.project_uuid,
+            &mallory.fingerprint,
+            &mallory_pub_b64,
+            &mallory.fingerprint,
+        );
+        let signature =
+            sign_recipient_grant(&payload, &mallory.private_key_pem).expect("self-sign");
+        let mut theirs_metadata = base_metadata.clone();
+        theirs_metadata.authorized_signers.push(AuthorizedSigner {
+            fingerprint: mallory.fingerprint.clone(),
+            public_key_b64: mallory_pub_b64.clone(),
+            label: "mallory".to_string(),
+        });
+        theirs_metadata.recipients.push(test_recipient(
+            "mallory",
+            &mallory.fingerprint,
+            &mallory_pub_b64,
+            &signature,
+            &mallory.fingerprint,
+        ));
+        save_vault_metadata(&theirs_path, &theirs_metadata).expect("save theirs");
+
+        super::merge_vault_metadata(&ours_path, &theirs_path, &base_path, &dir).expect("merge");
+
+        let merged = load_vault_metadata(&ours_path).expect("load merged");
+        assert!(merged.recipients.is_empty(), "self-signed grant absorbed");
+        assert_eq!(
+            merged.authorized_signers,
+            vec![signer_for(&owner)],
+            "injected signer absorbed"
+        );
+        let marker = load_marker(&dir).expect("marker").expect("present");
+        assert_eq!(marker.rejected_recipients.len(), 1);
+        assert_eq!(marker.rejected_signers.len(), 1);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// H3: a recipient granted through `dl share grant` (signed by an
+    /// authorized signer known to our side) IS absorbed by the merge.
+    #[test]
+    fn merge_accepts_recipient_with_valid_grant_signature() {
+        let owner = generate_identity(IdentityProtection::Plain).expect("identity");
+        let dir = temp_dir("h3-accept");
+        let mut base_metadata = metadata();
+        base_metadata.authorized_signers = vec![signer_for(&owner)];
+        let base_path = dir.join("base-vault.toml");
+        let ours_path = dir.join("vault.toml");
+        let theirs_path = dir.join("theirs-vault.toml");
+        save_vault_metadata(&base_path, &base_metadata).expect("save base");
+        save_vault_metadata(&ours_path, &base_metadata).expect("save ours");
+
+        let payload = recipient_grant_payload(
+            &base_metadata.project_uuid,
+            "carol-fp",
+            "Y2Fyb2w=",
+            &owner.fingerprint,
+        );
+        let signature = sign_recipient_grant(&payload, &owner.private_key_pem).expect("sign");
+        let mut theirs_metadata = base_metadata.clone();
+        theirs_metadata.recipients.push(test_recipient(
+            "carol",
+            "carol-fp",
+            "Y2Fyb2w=",
+            &signature,
+            &owner.fingerprint,
+        ));
+        save_vault_metadata(&theirs_path, &theirs_metadata).expect("save theirs");
+
+        super::merge_vault_metadata(&ours_path, &theirs_path, &base_path, &dir).expect("merge");
+
+        let merged = load_vault_metadata(&ours_path).expect("load merged");
+        assert_eq!(merged.recipients.len(), 1);
+        assert_eq!(merged.recipients[0].label, "carol");
+        // A verified grant is not a conflict: no marker is forced.
+        assert!(load_marker(&dir).expect("marker").is_none());
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// `run_merge_driver` resolves interrupted vault-pair transactions before

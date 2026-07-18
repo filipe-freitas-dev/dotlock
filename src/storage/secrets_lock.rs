@@ -15,7 +15,7 @@ use crate::{
             file_sha256_b64,
         },
         sdk,
-        secret_cipher::{decryption_process, encryption_process},
+        secret_cipher::{decryption_process, decryption_process_with_aad, encryption_process_with_aad},
         share::{unwrap_dek_with_private_key, wrap_dek_for_public_key_b64},
     },
     domain::{
@@ -49,6 +49,14 @@ pub struct SecretRecord {
     pub data: String,
     #[serde(default)]
     pub updated_at: i64,
+    /// Monotonic per-secret write counter (H2). `0` marks a legacy record
+    /// encrypted without AAD; every write through `upsert_record` (or a
+    /// re-encryption) sets `version >= 1` and binds
+    /// `id`/`name`/`updated_at`/`version` into the ciphertext's AEAD
+    /// associated data, so plaintext ordering metadata can no longer be forged
+    /// without failing authentication.
+    #[serde(default)]
+    pub version: u64,
     #[serde(default)]
     pub kind: SecretKind,
 }
@@ -117,10 +125,57 @@ pub fn current_unix_timestamp() -> i64 {
 fn migrate_legacy_secret_timestamps(file: &mut SecretsFile) {
     let now = current_unix_timestamp();
     for secret in &mut file.secrets {
-        if secret.updated_at == 0 {
+        // Only legacy (pre-AAD) records may have their timestamp rewritten:
+        // for `version >= 1` records the timestamp is bound into the AEAD
+        // associated data and must never be mutated outside a re-encryption.
+        if secret.updated_at == 0 && secret.version == 0 {
             secret.updated_at = now;
         }
     }
+}
+
+/// Canonical AEAD associated data for a secret record (H2 + M4): binds the
+/// record's identity (`id`, `name`) and ordering metadata (`updated_at`,
+/// monotonic `version`) into the ciphertext's authentication tag.
+/// Length-prefixed encoding, so no field combination is ambiguous.
+pub fn secret_record_aad(id: &str, name: &str, updated_at: i64, version: u64) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"dotlock/secret-record-aad/v1";
+    let mut aad = Vec::with_capacity(DOMAIN.len() + id.len() + name.len() + 40);
+    for part in [DOMAIN, id.as_bytes(), name.as_bytes()] {
+        aad.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        aad.extend_from_slice(part);
+    }
+    aad.extend_from_slice(&updated_at.to_le_bytes());
+    aad.extend_from_slice(&version.to_le_bytes());
+    aad
+}
+
+fn record_aad(secret: &SecretRecord) -> Vec<u8> {
+    secret_record_aad(&secret.id, &secret.name, secret.updated_at, secret.version)
+}
+
+/// Decrypts a record's value with the record-appropriate authentication:
+/// `version >= 1` records must authenticate against their claimed
+/// `id`/`name`/`updated_at`/`version` (a record whose plaintext ordering
+/// metadata was forged — e.g. a replayed ciphertext with an inflated
+/// timestamp — fails here); `version == 0` records are legacy pre-AAD data.
+pub fn decrypt_record_with_key(secret: &SecretRecord, key: &[u8; 32]) -> DotLockResult<String> {
+    if secret.version == 0 {
+        return decryption_process(secret.data.clone(), secret_algorithm(secret)?, key);
+    }
+    decryption_process_with_aad(
+        secret.data.clone(),
+        secret_algorithm(secret)?,
+        key,
+        &record_aad(secret),
+    )
+    .map_err(|_| {
+        DotLockError::Crypto(format!(
+            "secret `{}` failed authentication: its ciphertext does not match the claimed \
+             id/name/updated_at/version (possible replay or forged metadata)",
+            secret.name
+        ))
+    })
 }
 
 fn migrate_legacy_secret_algorithms(file: &mut SecretsFile) -> DotLockResult<()> {
@@ -204,7 +259,7 @@ fn upsert_record(
 ) -> DotLockResult<(SecretRecord, bool)> {
     let now = current_unix_timestamp();
     let existing_index = file.secrets.iter().position(|secret| secret.name == name);
-    let (record_id, sdk) = if let Some(index) = existing_index {
+    let (record_id, sdk, next_version) = if let Some(index) = existing_index {
         let existing = &file.secrets[index];
         // Reuse the existing SDK when its wrapping is present; otherwise mint
         // a fresh one. The record is fully re-encrypted here, so a legacy or
@@ -214,12 +269,19 @@ fn upsert_record(
             Some(sdk) => sdk,
             None => sdk::generate_sdk()?,
         };
-        (existing.id.clone(), sdk)
+        (
+            existing.id.clone(),
+            sdk,
+            existing.version.saturating_add(1).max(1),
+        )
     } else {
-        (Uuid::new_v4().to_string(), sdk::generate_sdk()?)
+        (Uuid::new_v4().to_string(), sdk::generate_sdk()?, 1)
     };
 
-    let encrypted = encryption_process(name, plaintext, alg, &sdk)?;
+    // Bind identity + ordering metadata into the AEAD tag (H2/M4): the fields
+    // authenticated here are exactly the ones written to the record below.
+    let aad = secret_record_aad(&record_id, &name, now, next_version);
+    let encrypted = encryption_process_with_aad(name, plaintext, alg, &sdk, &aad)?;
     let data =
         String::from_utf8(encrypted.data).map_err(|err| DotLockError::Crypto(err.to_string()))?;
 
@@ -228,6 +290,7 @@ fn upsert_record(
         existing.alg = None;
         existing.data = data;
         existing.updated_at = now;
+        existing.version = next_version;
         existing.kind = kind;
         (existing.clone(), false)
     } else {
@@ -237,6 +300,7 @@ fn upsert_record(
             alg: None,
             data,
             updated_at: now,
+            version: next_version,
             kind,
         };
         file.secrets.push(record.clone());
@@ -246,16 +310,42 @@ fn upsert_record(
     metadata
         .wrapped_sdks_under_kek
         .insert(record.id.clone(), sdk::wrap_sdk_for_project_key(&sdk, dek)?);
-    for recipient in &mut metadata.recipients {
-        if recipient.full_access {
-            recipient.wrapped_sdks.insert(
-                record.id.clone(),
-                wrap_dek_for_public_key_b64(&sdk, &recipient.public_key_b64)?,
-            );
-        }
-    }
+    wrap_sdk_for_authorized_full_access_recipients(metadata, &record.id, &sdk)?;
 
     Ok((record, created))
+}
+
+/// Wraps a per-secret SDK for every full-access recipient whose grant is
+/// authorized (H3). Once a vault records authorized signers, recipients
+/// lacking a valid grant signature (e.g. injected via a manually accepted
+/// merge) never receive fresh key material.
+fn wrap_sdk_for_authorized_full_access_recipients(
+    metadata: &mut crate::crypto::VaultKeyMetadata,
+    record_id: &str,
+    sdk: &[u8; 32],
+) -> DotLockResult<()> {
+    let enforce_grants = !metadata.authorized_signers.is_empty();
+    let project_uuid = metadata.project_uuid.clone();
+    let signers = metadata.authorized_signers.clone();
+    for recipient in &mut metadata.recipients {
+        if !recipient.full_access {
+            continue;
+        }
+        if enforce_grants
+            && !crate::storage::shared_access::recipient_grant_is_valid(
+                &project_uuid,
+                &signers,
+                recipient,
+            )
+        {
+            continue;
+        }
+        recipient.wrapped_sdks.insert(
+            record_id.to_string(),
+            wrap_dek_for_public_key_b64(sdk, &recipient.public_key_b64)?,
+        );
+    }
+    Ok(())
 }
 
 pub fn upsert_plain_secret<P: AsRef<Path>>(
@@ -330,25 +420,28 @@ pub fn migrate_all_secrets_to_envelope(dek: &[u8; 32], vault_path: &str) -> DotL
         if metadata.wrapped_sdks_under_kek.contains_key(&secret.id) {
             continue;
         }
-        let value = decryption_process(secret.data.clone(), secret_algorithm(secret)?, dek)?;
+        let value = decrypt_record_with_key(secret, dek)?;
         let sdk = sdk::generate_sdk()?;
-        let encrypted =
-            encryption_process(secret.name.clone(), value, secret_algorithm(secret)?, &sdk)?;
+        let now = current_unix_timestamp();
+        let next_version = secret.version.saturating_add(1).max(1);
+        let aad = secret_record_aad(&secret.id, &secret.name, now, next_version);
+        let encrypted = encryption_process_with_aad(
+            secret.name.clone(),
+            value,
+            secret_algorithm(secret)?,
+            &sdk,
+            &aad,
+        )?;
         secret.data = String::from_utf8(encrypted.data)
             .map_err(|err| DotLockError::Crypto(err.to_string()))?;
         secret.alg = None;
-        secret.updated_at = current_unix_timestamp();
+        secret.updated_at = now;
+        secret.version = next_version;
+        let secret_id = secret.id.clone();
         metadata
             .wrapped_sdks_under_kek
-            .insert(secret.id.clone(), sdk::wrap_sdk_for_project_key(&sdk, dek)?);
-        for recipient in &mut metadata.recipients {
-            if recipient.full_access {
-                recipient.wrapped_sdks.insert(
-                    secret.id.clone(),
-                    wrap_dek_for_public_key_b64(&sdk, &recipient.public_key_b64)?,
-                );
-            }
-        }
+            .insert(secret_id.clone(), sdk::wrap_sdk_for_project_key(&sdk, dek)?);
+        wrap_sdk_for_authorized_full_access_recipients(&mut metadata, &secret_id, &sdk)?;
         changed = true;
     }
 
@@ -403,27 +496,44 @@ pub fn rotate_secret_sdks_after_acl_removal(
         }
 
         let old_sdk = secret_key_from_project_key_or_legacy(&metadata, secret, dek)?;
-        let value = decryption_process(secret.data.clone(), secret_algorithm(secret)?, &old_sdk)?;
+        let value = decrypt_record_with_key(secret, &old_sdk)?;
         let new_sdk = sdk::generate_sdk()?;
-        let encrypted = encryption_process(
+        let now = current_unix_timestamp();
+        let next_version = secret.version.saturating_add(1).max(1);
+        let aad = secret_record_aad(&secret.id, &secret.name, now, next_version);
+        let encrypted = encryption_process_with_aad(
             secret.name.clone(),
             value,
             secret_algorithm(secret)?,
             &new_sdk,
+            &aad,
         )?;
         secret.data = String::from_utf8(encrypted.data)
             .map_err(|err| DotLockError::Crypto(err.to_string()))?;
         secret.alg = None;
-        secret.updated_at = current_unix_timestamp();
+        secret.updated_at = now;
+        secret.version = next_version;
         metadata.wrapped_sdks_under_kek.insert(
             secret.id.clone(),
             sdk::wrap_sdk_for_project_key(&new_sdk, dek)?,
         );
 
+        let enforce_grants = !metadata.authorized_signers.is_empty();
+        let project_uuid = metadata.project_uuid.clone();
+        let signers = metadata.authorized_signers.clone();
         for (index, recipient) in metadata.recipients.iter_mut().enumerate() {
             if index == removed_index {
                 recipient.wrapped_sdks.remove(secret_id);
                 recipient.full_access = false;
+                continue;
+            }
+            if enforce_grants
+                && !crate::storage::shared_access::recipient_grant_is_valid(
+                    &project_uuid,
+                    &signers,
+                    recipient,
+                )
+            {
                 continue;
             }
             if recipient.full_access || recipient.wrapped_sdks.contains_key(secret_id) {
@@ -462,7 +572,7 @@ pub fn decrypt_secret_value(secret: &SecretRecord, dek: &[u8; 32]) -> DotLockRes
         secret_key_from_project_key_or_legacy(&metadata, secret, dek)?
     };
 
-    decryption_process(secret.data.clone(), secret_algorithm(secret)?, &key)
+    decrypt_record_with_key(secret, &key)
 }
 
 pub fn secret_algorithm(secret: &SecretRecord) -> DotLockResult<Alg> {
@@ -740,6 +850,7 @@ mod tests {
             wrapped_sdks_under_kek: std::collections::HashMap::new(),
             access_mode: AccessMode::MasterPassword,
             recipients: Vec::new(),
+            authorized_signers: Vec::new(),
             config: VaultConfig::default(),
             secrets_hash_nonce_b64: "hash_nonce".to_string(),
             secrets_hash_b64: "hash".to_string(),
@@ -805,6 +916,8 @@ mod tests {
             )
             .expect("wrap project key"),
             wrapped_sdks: std::collections::HashMap::new(),
+            grant_signature_b64: String::new(),
+            grant_signer_fingerprint: String::new(),
             full_access: true,
         });
         save_vault_metadata(&vault_path, &metadata).expect("save vault");
@@ -844,6 +957,8 @@ mod tests {
             public_key_b64: "public".to_string(),
             wrapped_dek_b64: String::new(),
             wrapped_sdks: std::collections::HashMap::new(),
+            grant_signature_b64: String::new(),
+            grant_signer_fingerprint: String::new(),
             full_access: false,
         });
         let result = super::reject_limited_identity_write_for_fingerprint(&metadata, "alice-fp");
@@ -908,6 +1023,8 @@ mod tests {
                 "some-id".to_string(),
                 "wrapped".to_string(),
             )]),
+            grant_signature_b64: String::new(),
+            grant_signer_fingerprint: String::new(),
             full_access: false,
         });
         save_vault_metadata(&vault_path, &shared).expect("save shared vault");
@@ -958,6 +1075,7 @@ mod tests {
             alg: None,
             data: "ciphertext".to_string(),
             updated_at: 1,
+            version: 0,
             kind: super::SecretKind::Static,
         };
         let dek = [8u8; 32];
@@ -1031,8 +1149,8 @@ updated_at = 1
             .expect("wrapped sdk");
         let sdk =
             crate::crypto::sdk::unwrap_sdk_with_project_key(wrapped_sdk, &dek).expect("unwrap sdk");
-        let plaintext = decryption_process(record.data.clone(), Alg::XChaCha20Poly1305, &sdk)
-            .expect("decrypt data");
+        let plaintext =
+            super::decrypt_record_with_key(&record, &sdk).expect("decrypt data");
         let metadata =
             serde_json::from_str::<super::DynamicSecretMetadata>(&plaintext).expect("metadata");
         assert_eq!(metadata.provider, "echo");
@@ -1106,7 +1224,7 @@ updated_at = 1
                     .expect("every secret must keep its SDK wrapping");
                 let sdk = crate::crypto::sdk::unwrap_sdk_with_project_key(wrapped, &dek)
                     .expect("unwrap sdk");
-                decryption_process(secret.data.clone(), Alg::XChaCha20Poly1305, &sdk)
+                super::decrypt_record_with_key(secret, &sdk)
                     .expect("secret must decrypt after crash+recovery");
             }
 

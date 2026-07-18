@@ -159,6 +159,37 @@ pub fn verify_audit_entry_hash_signature(
         .map_err(|_| DotLockError::Crypto("audit signature invalid".to_string()))
 }
 
+/// Signs a recipient-grant payload (see
+/// `storage::shared_access::recipient_grant_payload`) with the granting
+/// signer's private key (RSA-PSS, blinded — same construction as audit
+/// signatures).
+pub fn sign_recipient_grant(payload: &[u8], private_key_pem: &str) -> DotLockResult<String> {
+    let private_key = parse_private_key(private_key_pem)?;
+    let signing_key = BlindedSigningKey::<Sha256>::new(private_key);
+    let mut rng = OsRng;
+    let signature = signing_key.sign_with_rng(&mut rng, payload);
+    Ok(general_purpose::STANDARD.encode(signature.to_bytes()))
+}
+
+/// Verifies a recipient-grant signature against an authorized signer's public
+/// key (base64 DER, as stored in `authorized_signers`).
+pub fn verify_recipient_grant(
+    payload: &[u8],
+    signature_b64: &str,
+    public_key_b64: &str,
+) -> DotLockResult<()> {
+    let public_key = decode_public_key_b64(public_key_b64)?;
+    let verifying_key = VerifyingKey::<Sha256>::new(public_key);
+    let signature = general_purpose::STANDARD
+        .decode(signature_b64)
+        .map_err(|e| DotLockError::Crypto(format!("failed to decode grant signature: {e}")))?;
+    let signature = RsaPssSignature::try_from(signature.as_slice())
+        .map_err(|e| DotLockError::Crypto(format!("failed to parse grant signature: {e}")))?;
+    verifying_key
+        .verify(payload, &signature)
+        .map_err(|_| DotLockError::Crypto("recipient grant signature invalid".to_string()))
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
