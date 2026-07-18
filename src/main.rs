@@ -3,16 +3,11 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use colored::Colorize;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::{
     audit::{audit_log_path, record_ratchet, rotate_current_log, show_entries, verify_log},
-    crypto::{
-        ask_master_password,
-        dek::generate_dek,
-        secret_cipher::{decryption_process, encryption_process},
-        update_master_password_metadata,
-    },
+    crypto::{ask_master_password, dek::generate_dek, update_master_password_metadata},
     domain::{
         error::DotLockError,
         model::{Alg, DotLockResult},
@@ -36,19 +31,18 @@ use crate::{
         init_project::init_project,
         project::{SECRETS_FILE, VAULT_FILE, ensure_project_initialized},
         secrets_lock::{
-            DynamicSecretMetadata, PlainSecretEntry, SecretKind, SecretRecord,
-            decrypt_secret_value, find_secret_by_name, list_secrets, load_secrets_file,
-            migrate_all_secrets_to_envelope, remove_secret_by_name,
-            rotate_secret_sdks_after_acl_removal, save_secrets_file, secret_algorithm,
-            upsert_dynamic_secret, upsert_many, upsert_plain_secret,
+            DynamicSecretMetadata, PlainSecretEntry, SecretKind, decrypt_secret_value,
+            find_secret_by_name, list_secrets, load_secrets_file, migrate_all_secrets_to_envelope,
+            remove_secret_by_name, rotate_secret_sdks_after_acl_removal, upsert_dynamic_secret,
+            upsert_many, upsert_plain_secret,
         },
         shared_access::{
             self, add_recipient_secret_ids, enable_shared_access, grant_recipient,
             list_recipient_acl, list_recipients, load_public_key_from_file,
-            revoke_recipient_in_memory, rewrap_recipients,
+            revoke_recipient_and_rotate,
         },
         unlock_file::{
-            unlock_vault, unlock_vault_with_master_password,
+            UnlockAccess, unlock_vault, unlock_vault_with_master_password,
             unlock_vault_with_master_password_and_passphrase,
         },
         vault_file::{
@@ -538,7 +532,7 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
         Commands::Get(GetArgs { name }) => {
             let name = normalize_var_name(&name)?;
             ensure_project_initialized()?;
-            let dek = unlock_vault(VAULT_FILE)?;
+            let dek = unlock_vault(VAULT_FILE)?.into_read_key();
 
             let secret = find_secret_by_name(&name)?;
             let all_secrets = load_secrets_file(SECRETS_FILE)?.secrets;
@@ -555,8 +549,9 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
 
         Commands::List => {
             ensure_project_initialized()?;
-            let mut dek = unlock_vault(VAULT_FILE)?;
-            dek.zeroize();
+            // Unlock (full or limited) is only an access gate for listing;
+            // the key material is dropped (and zeroized) immediately.
+            let _ = unlock_vault(VAULT_FILE)?;
 
             let mut entries = list_secrets()?;
             entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -579,7 +574,7 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
         Commands::Run(RunArgs { command }) => {
             ensure_project_initialized()?;
             auto_fetch_if_enabled(VAULT_FILE)?;
-            let dek = unlock_vault(VAULT_FILE)?;
+            let dek = unlock_vault(VAULT_FILE)?.into_read_key();
             run_with_secrets(command, &dek)
         }
 
@@ -634,7 +629,7 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
 
         Commands::Export(ExportArgs { path }) => {
             ensure_project_initialized()?;
-            let dek = unlock_vault(VAULT_FILE)?;
+            let dek = unlock_vault(VAULT_FILE)?.into_read_key();
             let mut entries = decrypted_env_entries(&dek)?;
             entries.sort_by(|a, b| a.key.cmp(&b.key));
 
@@ -786,25 +781,25 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
                 ensure_project_initialized()?;
                 let (dek, passphrase) =
                     unlock_vault_with_master_password_and_passphrase(VAULT_FILE)?;
-                let mut metadata = load_vault_metadata(VAULT_FILE)?;
-                let mut secrets_file = load_secrets_file(SECRETS_FILE)?;
-                let removed = revoke_recipient_in_memory(&mut metadata, &query)?;
-                let new_dek = generate_dek().map_err(|e| DotLockError::Crypto(e.to_string()))?;
-
-                for secret in &mut secrets_file.secrets {
-                    reencrypt_secret(secret, &dek, &new_dek)?;
-                }
-
-                update_master_password_metadata(&mut metadata, &new_dek, &passphrase)?;
-                rewrap_recipients(&mut metadata, &new_dek)?;
-                save_vault_metadata(VAULT_FILE, &metadata)?;
-                save_secrets_file(SECRETS_FILE, &secrets_file, &new_dek, VAULT_FILE)?;
+                let outcome = revoke_recipient_and_rotate(
+                    VAULT_FILE,
+                    SECRETS_FILE,
+                    &query,
+                    &dek,
+                    &passphrase,
+                )?;
                 invalidate_cache()?;
                 println!(
                     "{} access revoked for {} ({}); project key rotated",
                     "ok:".green().bold(),
-                    removed.label.bold(),
-                    removed.public_key_fingerprint.yellow()
+                    outcome.removed.label.bold(),
+                    outcome.removed.public_key_fingerprint.yellow()
+                );
+                print_ratchet_summary(&outcome.summary);
+                println!(
+                    "     {} the revoked identity may still hold previously fetched ciphertexts (e.g. from git history); rotate sensitive values with {}",
+                    "info:".cyan().bold(),
+                    "dl set".bold()
                 );
                 Ok(())
             }
@@ -897,9 +892,8 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
     }
 }
 
-fn prepare_project_key_for_write(
-    current_dek: Zeroizing<[u8; 32]>,
-) -> DotLockResult<Zeroizing<[u8; 32]>> {
+fn prepare_project_key_for_write(access: UnlockAccess) -> DotLockResult<Zeroizing<[u8; 32]>> {
+    let current_dek = access.require_full()?;
     let metadata = load_vault_metadata(VAULT_FILE)?;
     if !should_auto_ratchet_for_next_write(&metadata) {
         return Ok(current_dek);
@@ -969,19 +963,6 @@ fn print_ratchet_summary(summary: &RatchetSummary) {
             "s"
         }
     );
-}
-
-fn reencrypt_secret(
-    secret: &mut SecretRecord,
-    old_dek: &[u8; 32],
-    new_dek: &[u8; 32],
-) -> DotLockResult<()> {
-    let alg = secret_algorithm(secret)?;
-    let value = decryption_process(secret.data.clone(), alg.clone(), old_dek)?;
-    let encrypted = encryption_process(secret.name.clone(), value, alg, new_dek)?;
-    secret.data =
-        String::from_utf8(encrypted.data).map_err(|e| DotLockError::Crypto(e.to_string()))?;
-    Ok(())
 }
 
 fn decrypted_env_entries(dek: &[u8; 32]) -> DotLockResult<Vec<EnvEntry>> {

@@ -23,6 +23,42 @@ use crate::{
     },
 };
 
+/// Result of unlocking the vault. Write paths must call [`UnlockAccess::require_full`]
+/// so a limited (read-only) identity can never hand "a DEK" to a mutator; the
+/// legacy all-zero placeholder survives only inside [`UnlockAccess::into_read_key`]
+/// and is additionally rejected by every integrity-hash writer.
+pub enum UnlockAccess {
+    /// Full access: the real project key (DEK) was recovered.
+    Full(Zeroizing<[u8; 32]>),
+    /// Limited recipient: only per-secret SDKs from the recipient's
+    /// `wrapped_sdks` are available; no project key exists for this identity.
+    Limited,
+}
+
+impl UnlockAccess {
+    /// Returns the project key, or a permission error for limited identities.
+    /// Every mutating path must obtain its key through here.
+    pub fn require_full(self) -> DotLockResult<Zeroizing<[u8; 32]>> {
+        match self {
+            UnlockAccess::Full(dek) => Ok(dek),
+            UnlockAccess::Limited => Err(DotLockError::AccessDenied {
+                secret: "write requires full-access recipient or master password".to_string(),
+            }),
+        }
+    }
+
+    /// Key handed to read-only decryption paths. Limited identities get an
+    /// all-zero placeholder that can never act as a project key: their
+    /// per-secret SDKs are resolved from the recipient's `wrapped_sdks`, and
+    /// every write/integrity path rejects the all-zero key.
+    pub fn into_read_key(self) -> Zeroizing<[u8; 32]> {
+        match self {
+            UnlockAccess::Full(dek) => dek,
+            UnlockAccess::Limited => Zeroizing::new([0u8; 32]),
+        }
+    }
+}
+
 /// Resolves any interrupted vault-pair transaction before the vault is read.
 fn recover_pending_before_access(vault_path: &str) -> DotLockResult<()> {
     recover_pending(
@@ -116,7 +152,7 @@ pub fn unlock_vault_with_master_password_and_passphrase(
 
 fn try_unlock_vault_with_local_identity(
     metadata: &crate::crypto::VaultKeyMetadata,
-) -> DotLockResult<Zeroizing<[u8; 32]>> {
+) -> DotLockResult<UnlockAccess> {
     let identity_meta = load_local_identity_metadata()?;
     let recipient = metadata
         .recipients
@@ -129,12 +165,12 @@ fn try_unlock_vault_with_local_identity(
     if recipient.wrapped_dek_b64.is_empty() && !recipient.wrapped_sdks.is_empty() {
         verify_public_secrets_hash(SECRETS_FILE, metadata)?;
         record_unlock_best_effort("identity", metadata);
-        return Ok(Zeroizing::new([0u8; 32]));
+        return Ok(UnlockAccess::Limited);
     }
     let dek = unwrap_dek_with_private_key(&recipient.wrapped_dek_b64, &identity.private_key_pem)?;
     let dek = unlock_vault_with_dek(metadata, dek)?;
     record_unlock_best_effort("identity", metadata);
-    Ok(dek)
+    Ok(UnlockAccess::Full(dek))
 }
 
 fn print_shared_recipients(metadata: &crate::crypto::VaultKeyMetadata) {
@@ -189,7 +225,7 @@ fn print_shared_recipients(metadata: &crate::crypto::VaultKeyMetadata) {
     println!();
 }
 
-pub fn unlock_vault(path: &str) -> DotLockResult<Zeroizing<[u8; 32]>> {
+pub fn unlock_vault(path: &str) -> DotLockResult<UnlockAccess> {
     recover_pending_before_access(path)?;
     let metadata = load_vault_metadata(path)?;
 
@@ -198,7 +234,7 @@ pub fn unlock_vault(path: &str) -> DotLockResult<Zeroizing<[u8; 32]>> {
             Ok(()) => {
                 write_cached_dek(&dek)?;
                 record_unlock_best_effort("cache", &metadata);
-                return Ok(dek);
+                return Ok(UnlockAccess::Full(dek));
             }
             Err(DotLockError::TamperedSecretsFile) => {
                 let _ = invalidate_cache();
@@ -212,7 +248,7 @@ pub fn unlock_vault(path: &str) -> DotLockResult<Zeroizing<[u8; 32]>> {
 
     if metadata.access_mode == AccessMode::Shared {
         match try_unlock_vault_with_local_identity(&metadata) {
-            Ok(dek) => return Ok(dek),
+            Ok(access) => return Ok(access),
             Err(DotLockError::TamperedSecretsFile) => {
                 return Err(DotLockError::TamperedSecretsFile);
             }
@@ -222,7 +258,7 @@ pub fn unlock_vault(path: &str) -> DotLockResult<Zeroizing<[u8; 32]>> {
         print_shared_recipients(&metadata);
     }
 
-    unlock_vault_with_master_password(path)
+    unlock_vault_with_master_password(path).map(UnlockAccess::Full)
 }
 
 fn record_unlock_best_effort(method: &str, metadata: &crate::crypto::VaultKeyMetadata) {
@@ -236,5 +272,31 @@ fn record_unlock_best_effort(method: &str, metadata: &crate::crypto::VaultKeyMet
             "warn:".yellow().bold(),
             err
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UnlockAccess;
+    use crate::domain::error::DotLockError;
+    use zeroize::Zeroizing;
+
+    #[test]
+    fn limited_access_never_yields_a_project_key_for_writes() {
+        let result = UnlockAccess::Limited.require_full();
+        assert!(matches!(result, Err(DotLockError::AccessDenied { .. })));
+    }
+
+    #[test]
+    fn full_access_yields_the_project_key() {
+        let dek = UnlockAccess::Full(Zeroizing::new([8u8; 32]))
+            .require_full()
+            .expect("full access");
+        assert_eq!(*dek, [8u8; 32]);
+    }
+
+    #[test]
+    fn limited_read_key_is_the_all_zero_placeholder() {
+        assert_eq!(*UnlockAccess::Limited.into_read_key(), [0u8; 32]);
     }
 }

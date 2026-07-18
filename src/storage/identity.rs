@@ -168,22 +168,27 @@ pub fn load_local_identity() -> DotLockResult<LocalIdentity> {
     })
 }
 
+/// Serializes tests that mutate `DOTLOCK_IDENTITY_DIR`, across all modules.
+#[cfg(test)]
+pub(crate) fn test_identity_env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         LocalIdentityMetadata, initialize_local_identity_with_options, load_local_identity,
-        load_local_identity_metadata,
+        load_local_identity_metadata, test_identity_env_lock,
     };
     use crate::storage::secure_fs;
     use std::{
         fs,
-        sync::{Mutex, OnceLock},
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        test_identity_env_lock()
     }
 
     fn temp_dir() -> std::path::PathBuf {

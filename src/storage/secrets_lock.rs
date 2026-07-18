@@ -169,18 +169,6 @@ fn commit_secrets_and_metadata(
     )
 }
 
-pub fn save_secrets_file<P: AsRef<Path>>(
-    path: P,
-    file: &SecretsFile,
-    dek: &[u8; 32],
-    vault_path: &str,
-) -> DotLockResult<()> {
-    let mut file = file.clone();
-    migrate_legacy_secret_timestamps(&mut file);
-    let mut metadata = load_vault_metadata(vault_path)?;
-    commit_secrets_and_metadata(path.as_ref(), &mut file, &mut metadata, dek, vault_path)
-}
-
 pub fn refresh_vault_hash(
     secrets_path: &Path,
     dek: &[u8; 32],
@@ -328,6 +316,7 @@ fn reject_limited_identity_write_for_fingerprint(
 pub fn migrate_all_secrets_to_envelope(dek: &[u8; 32], vault_path: &str) -> DotLockResult<()> {
     let mut file = load_secrets_file(SECRETS_FILE)?;
     let mut metadata = load_vault_metadata(vault_path)?;
+    reject_limited_identity_write(&metadata)?;
     let mut changed = false;
 
     for secret in &mut file.secrets {
@@ -378,6 +367,7 @@ pub fn rotate_secret_sdks_after_acl_removal(
 ) -> DotLockResult<()> {
     let mut file = load_secrets_file(SECRETS_FILE)?;
     let mut metadata = load_vault_metadata(vault_path)?;
+    reject_limited_identity_write(&metadata)?;
     let removed_index = metadata
         .recipients
         .iter()
@@ -639,6 +629,9 @@ pub fn decrypt_dynamic_metadata(
 }
 
 pub fn remove_secret_by_name(name: &str, dek: &[u8; 32], vault_path: &str) -> DotLockResult<()> {
+    let mut metadata = load_vault_metadata(vault_path)?;
+    reject_limited_identity_write(&metadata)?;
+
     let mut file = load_secrets_file(SECRETS_FILE)?;
     let removed_ids = file
         .secrets
@@ -655,7 +648,6 @@ pub fn remove_secret_by_name(name: &str, dek: &[u8; 32], vault_path: &str) -> Do
         });
     }
 
-    let mut metadata = load_vault_metadata(vault_path)?;
     for id in &removed_ids {
         metadata.wrapped_sdks_under_kek.remove(id);
         for recipient in &mut metadata.recipients {
@@ -833,6 +825,100 @@ mod tests {
             result,
             Err(crate::domain::error::DotLockError::AccessDenied { .. })
         ));
+    }
+
+    #[test]
+    fn limited_identity_cannot_remove_secrets_or_touch_the_vault_pair() {
+        use crate::{
+            crypto::integrity::verify_secrets_integrity, domain::error::DotLockError,
+            storage::secrets_lock::remove_secret_by_name,
+        };
+
+        let dir = temp_dir("limited-unset");
+        let secrets_path = dir.join("secrets.lock");
+        let vault_path = dir.join("vault.toml");
+        let vault_str = vault_path.to_str().expect("vault path");
+        let dek = [8u8; 32];
+        save_vault_metadata(&vault_path, &metadata()).expect("save vault");
+
+        // Owner creates a secret through the normal envelope path.
+        upsert_plain_secret(
+            &secrets_path,
+            "FOO".to_string(),
+            "bar".to_string(),
+            Alg::XChaCha20Poly1305,
+            &dek,
+            vault_str,
+        )
+        .expect("owner upsert");
+
+        // The vault is shared with a limited (read-only) recipient, and the
+        // local identity IS that limited recipient.
+        let identity_dir = temp_dir("limited-unset-identity");
+        let identity_meta = crate::storage::identity::LocalIdentityMetadata {
+            fingerprint: "limited-fp".to_string(),
+            encrypted: false,
+        };
+        let meta_content = toml::to_string_pretty(&identity_meta).expect("identity meta");
+        crate::storage::secure_fs::write_string_atomic(
+            &identity_dir.join("identity.toml"),
+            &meta_content,
+            0o700,
+            0o600,
+        )
+        .expect("write identity meta");
+
+        let mut shared = load_vault_metadata(&vault_path).expect("load vault");
+        shared.access_mode = AccessMode::Shared;
+        shared.recipients.push(VaultRecipient {
+            id: "limited-id".to_string(),
+            label: "limited".to_string(),
+            alg: "rsa-oaep-sha256".to_string(),
+            public_key_fingerprint: "limited-fp".to_string(),
+            public_key_b64: "public".to_string(),
+            wrapped_dek_b64: String::new(),
+            wrapped_sdks: std::collections::HashMap::from([(
+                "some-id".to_string(),
+                "wrapped".to_string(),
+            )]),
+            full_access: false,
+        });
+        save_vault_metadata(&vault_path, &shared).expect("save shared vault");
+
+        let vault_before = fs::read(&vault_path).expect("vault bytes");
+        let secrets_before = fs::read(&secrets_path).expect("secrets bytes");
+
+        // As the limited identity, unset must fail with a permission error.
+        // (The dummy all-zero key is what the limited unlock used to return.)
+        let result = {
+            let _guard = crate::storage::identity::test_identity_env_lock()
+                .lock()
+                .expect("env lock");
+            unsafe {
+                std::env::set_var("DOTLOCK_IDENTITY_DIR", &identity_dir);
+            }
+            let result = remove_secret_by_name("FOO", &[0u8; 32], vault_str);
+            unsafe {
+                std::env::remove_var("DOTLOCK_IDENTITY_DIR");
+            }
+            result
+        };
+        assert!(matches!(result, Err(DotLockError::AccessDenied { .. })));
+
+        // Both files are byte-identical: nothing was corrupted.
+        assert_eq!(fs::read(&vault_path).expect("vault bytes"), vault_before);
+        assert_eq!(
+            fs::read(&secrets_path).expect("secrets bytes"),
+            secrets_before
+        );
+
+        // The owner's full-access view still verifies integrity.
+        let metadata = load_vault_metadata(&vault_path).expect("load vault");
+        verify_secrets_integrity(&secrets_path, &metadata, &dek)
+            .expect("owner integrity check passes");
+
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(identity_dir);
     }
 
     #[test]

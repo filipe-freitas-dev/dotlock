@@ -48,7 +48,11 @@ fn merge_secrets_lock(ours: &Path, theirs: &Path, base: &Path) -> DotLockResult<
         toml::to_string_pretty(&merged).map_err(|err| DotLockError::Crypto(err.to_string()))?;
     secure_fs::write_string_atomic(ours, &content, 0o700, 0o600)?;
 
-    let dek = read_cached_dek().or_else(|| unlock_vault(VAULT_FILE).ok());
+    let dek = read_cached_dek().or_else(|| {
+        unlock_vault(VAULT_FILE)
+            .ok()
+            .and_then(|access| access.require_full().ok())
+    });
     if let Some(dek) = dek {
         refresh_vault_hash(Path::new(SECRETS_FILE), &dek, VAULT_FILE)?;
     }
