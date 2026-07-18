@@ -2,13 +2,12 @@ use colored::Colorize;
 
 use crate::{
     cli::args::SetArgs,
-    commands::context::prepare_project_key_for_write,
+    commands::context::VaultContext,
     domain::{error::DotLockError, model::DotLockResult},
     providers::{attest_provider, describe_provider},
     storage::{
-        project::{SECRETS_FILE, VAULT_FILE, ensure_project_initialized},
+        project::{SECRETS_FILE, VAULT_FILE},
         secrets_lock::{DynamicSecretMetadata, upsert_dynamic_secret, upsert_plain_secret},
-        unlock_file::unlock_vault,
     },
     utils::normalize_var_name,
 };
@@ -23,8 +22,7 @@ pub fn run(args: SetArgs) -> DotLockResult<()> {
         bootstrap,
     } = args;
     let name = normalize_var_name(&name)?;
-    ensure_project_initialized()?;
-    let dek = prepare_project_key_for_write(unlock_vault(VAULT_FILE)?)?;
+    let (mut metadata, dek) = VaultContext::unlock()?.into_write()?;
 
     let secret = if let Some(provider) = provider {
         let _ = describe_provider(&provider, None)?;
@@ -48,12 +46,13 @@ pub fn run(args: SetArgs) -> DotLockResult<()> {
             },
             &dek,
             VAULT_FILE,
+            &mut metadata,
         )?
     } else {
         let value = value.ok_or_else(|| {
             DotLockError::Io("static secrets require a VALUE argument".to_string())
         })?;
-        upsert_plain_secret(SECRETS_FILE, name, value, alg, &dek, VAULT_FILE)?
+        upsert_plain_secret(SECRETS_FILE, name, value, alg, &dek, VAULT_FILE, &mut metadata)?
     };
 
     println!(

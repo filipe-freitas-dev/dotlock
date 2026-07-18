@@ -277,16 +277,16 @@ pub fn upsert_plain_secret<P: AsRef<Path>>(
     alg: Alg,
     dek: &ProjectKey,
     vault_path: &str,
+    metadata: &mut crate::crypto::VaultKeyMetadata,
 ) -> DotLockResult<SecretRecord> {
     let path = path.as_ref();
     let mut file = load_secrets_file(path)?;
-    let mut metadata = load_vault_metadata(vault_path)?;
     metadata.version = metadata.version.max(5);
-    reject_limited_identity_write(&metadata)?;
+    reject_limited_identity_write(metadata)?;
 
     let (record, _) = upsert_record(
         &mut file,
-        &mut metadata,
+        metadata,
         name,
         value,
         alg,
@@ -295,7 +295,7 @@ pub fn upsert_plain_secret<P: AsRef<Path>>(
     )?;
 
     migrate_legacy_secret_timestamps(&mut file);
-    commit_secrets_and_metadata(path, &mut file, &mut metadata, dek, vault_path)?;
+    commit_secrets_and_metadata(path, &mut file, metadata, dek, vault_path)?;
 
     Ok(record)
 }
@@ -313,10 +313,13 @@ fn reject_limited_identity_write(metadata: &crate::crypto::VaultKeyMetadata) -> 
     metadata.reject_limited_identity_write_for_fingerprint(&identity_meta.fingerprint)
 }
 
-pub fn migrate_all_secrets_to_envelope(dek: &ProjectKey, vault_path: &str) -> DotLockResult<()> {
+pub fn migrate_all_secrets_to_envelope(
+    dek: &ProjectKey,
+    vault_path: &str,
+    metadata: &mut crate::crypto::VaultKeyMetadata,
+) -> DotLockResult<()> {
     let mut file = load_secrets_file(SECRETS_FILE)?;
-    let mut metadata = load_vault_metadata(vault_path)?;
-    reject_limited_identity_write(&metadata)?;
+    reject_limited_identity_write(metadata)?;
     let mut changed = false;
 
     for secret in &mut file.secrets {
@@ -346,7 +349,7 @@ pub fn migrate_all_secrets_to_envelope(dek: &ProjectKey, vault_path: &str) -> Do
         metadata
             .wrapped_sdks_under_dek
             .insert(secret_id.clone(), sdk::wrap_sdk_for_project_key(&sdk, dek)?);
-        wrap_sdk_for_authorized_full_access_recipients(&mut metadata, &secret_id, &sdk)?;
+        wrap_sdk_for_authorized_full_access_recipients(metadata, &secret_id, &sdk)?;
         changed = true;
     }
 
@@ -355,13 +358,7 @@ pub fn migrate_all_secrets_to_envelope(dek: &ProjectKey, vault_path: &str) -> Do
     }
 
     metadata.version = metadata.version.max(5);
-    commit_secrets_and_metadata(
-        Path::new(SECRETS_FILE),
-        &mut file,
-        &mut metadata,
-        dek,
-        vault_path,
-    )
+    commit_secrets_and_metadata(Path::new(SECRETS_FILE), &mut file, metadata, dek, vault_path)
 }
 
 pub fn rotate_secret_sdks_after_acl_removal(
@@ -369,10 +366,10 @@ pub fn rotate_secret_sdks_after_acl_removal(
     removed_recipient_query: &str,
     dek: &ProjectKey,
     vault_path: &str,
+    metadata: &mut crate::crypto::VaultKeyMetadata,
 ) -> DotLockResult<()> {
     let mut file = load_secrets_file(SECRETS_FILE)?;
-    let mut metadata = load_vault_metadata(vault_path)?;
-    reject_limited_identity_write(&metadata)?;
+    reject_limited_identity_write(metadata)?;
     let removed_index = metadata
         .recipients
         .iter()
@@ -400,7 +397,7 @@ pub fn rotate_secret_sdks_after_acl_removal(
             continue;
         }
 
-        let old_sdk = secret_key_from_project_key_or_legacy(&metadata, secret, dek)?;
+        let old_sdk = secret_key_from_project_key_or_legacy(metadata, secret, dek)?;
         let value = decrypt_record_with_key(secret, &old_sdk)?;
         let new_sdk = sdk::generate_sdk()?;
         let now = current_unix_timestamp();
@@ -450,22 +447,19 @@ pub fn rotate_secret_sdks_after_acl_removal(
         }
     }
 
-    commit_secrets_and_metadata(
-        Path::new(SECRETS_FILE),
-        &mut file,
-        &mut metadata,
-        dek,
-        vault_path,
-    )
+    commit_secrets_and_metadata(Path::new(SECRETS_FILE), &mut file, metadata, dek, vault_path)
 }
 
-pub fn decrypt_secret_value(secret: &SecretRecord, dek: &ProjectKey) -> DotLockResult<String> {
-    let metadata = load_vault_metadata(crate::storage::project::VAULT_FILE)?;
+pub fn decrypt_secret_value(
+    secret: &SecretRecord,
+    dek: &ProjectKey,
+    metadata: &crate::crypto::VaultKeyMetadata,
+) -> DotLockResult<String> {
     let key = if metadata.access_mode == AccessMode::Shared {
-        match secret_sdk_from_local_identity(&metadata, secret)? {
+        match secret_sdk_from_local_identity(metadata, secret)? {
             Some(sdk) => sdk,
             None if metadata.recipients.is_empty() => {
-                secret_key_from_project_key_or_legacy(&metadata, secret, dek)?
+                secret_key_from_project_key_or_legacy(metadata, secret, dek)?
             }
             None => {
                 return Err(DotLockError::AccessDenied {
@@ -474,7 +468,7 @@ pub fn decrypt_secret_value(secret: &SecretRecord, dek: &ProjectKey) -> DotLockR
             }
         }
     } else {
-        secret_key_from_project_key_or_legacy(&metadata, secret, dek)?
+        secret_key_from_project_key_or_legacy(metadata, secret, dek)?
     };
 
     decrypt_record_with_key(secret, &key)
@@ -569,12 +563,12 @@ pub fn upsert_many<P: AsRef<Path>>(
     entries: Vec<PlainSecretEntry>,
     dek: &ProjectKey,
     vault_path: &str,
+    metadata: &mut crate::crypto::VaultKeyMetadata,
 ) -> DotLockResult<UpsertSummary> {
     let path = path.as_ref();
     let mut file = load_secrets_file(path)?;
-    let mut metadata = load_vault_metadata(vault_path)?;
     metadata.version = metadata.version.max(5);
-    reject_limited_identity_write(&metadata)?;
+    reject_limited_identity_write(metadata)?;
     let mut summary = UpsertSummary {
         created: 0,
         updated: 0,
@@ -583,7 +577,7 @@ pub fn upsert_many<P: AsRef<Path>>(
     for entry in entries {
         let (_, created) = upsert_record(
             &mut file,
-            &mut metadata,
+            metadata,
             entry.name,
             entry.value,
             entry.alg,
@@ -598,7 +592,7 @@ pub fn upsert_many<P: AsRef<Path>>(
     }
 
     migrate_legacy_secret_timestamps(&mut file);
-    commit_secrets_and_metadata(path, &mut file, &mut metadata, dek, vault_path)?;
+    commit_secrets_and_metadata(path, &mut file, metadata, dek, vault_path)?;
 
     Ok(summary)
 }
@@ -609,12 +603,12 @@ pub fn upsert_dynamic_secret<P: AsRef<Path>>(
     dynamic: DynamicSecretMetadata,
     dek: &ProjectKey,
     vault_path: &str,
+    metadata: &mut crate::crypto::VaultKeyMetadata,
 ) -> DotLockResult<SecretRecord> {
     let path = path.as_ref();
     let mut file = load_secrets_file(path)?;
-    let mut metadata = load_vault_metadata(vault_path)?;
     metadata.version = metadata.version.max(5);
-    reject_limited_identity_write(&metadata)?;
+    reject_limited_identity_write(metadata)?;
 
     let dynamic_json =
         serde_json::to_string(&dynamic).map_err(|err| DotLockError::Crypto(err.to_string()))?;
@@ -625,7 +619,7 @@ pub fn upsert_dynamic_secret<P: AsRef<Path>>(
     };
     let (record, _) = upsert_record(
         &mut file,
-        &mut metadata,
+        metadata,
         name,
         dynamic_json,
         Alg::XChaCha20Poly1305,
@@ -634,7 +628,7 @@ pub fn upsert_dynamic_secret<P: AsRef<Path>>(
     )?;
 
     migrate_legacy_secret_timestamps(&mut file);
-    commit_secrets_and_metadata(path, &mut file, &mut metadata, dek, vault_path)?;
+    commit_secrets_and_metadata(path, &mut file, metadata, dek, vault_path)?;
 
     Ok(record)
 }
@@ -642,8 +636,9 @@ pub fn upsert_dynamic_secret<P: AsRef<Path>>(
 pub fn decrypt_dynamic_metadata(
     secret: &SecretRecord,
     dek: &ProjectKey,
+    metadata: &crate::crypto::VaultKeyMetadata,
 ) -> DotLockResult<DynamicSecretMetadata> {
-    let plaintext = decrypt_secret_value(secret, dek)?;
+    let plaintext = decrypt_secret_value(secret, dek, metadata)?;
     if !plaintext.trim().is_empty() {
         return serde_json::from_str::<DynamicSecretMetadata>(&plaintext).map_err(|err| {
             DotLockError::Crypto(format!("invalid dynamic secret metadata: {err}"))
@@ -671,9 +666,13 @@ pub fn decrypt_dynamic_metadata(
     }
 }
 
-pub fn remove_secret_by_name(name: &str, dek: &ProjectKey, vault_path: &str) -> DotLockResult<()> {
-    let mut metadata = load_vault_metadata(vault_path)?;
-    reject_limited_identity_write(&metadata)?;
+pub fn remove_secret_by_name(
+    name: &str,
+    dek: &ProjectKey,
+    vault_path: &str,
+    metadata: &mut crate::crypto::VaultKeyMetadata,
+) -> DotLockResult<()> {
+    reject_limited_identity_write(metadata)?;
 
     let mut file = load_secrets_file(SECRETS_FILE)?;
     let removed_ids = file
@@ -698,13 +697,7 @@ pub fn remove_secret_by_name(name: &str, dek: &ProjectKey, vault_path: &str) -> 
         }
     }
 
-    commit_secrets_and_metadata(
-        Path::new(SECRETS_FILE),
-        &mut file,
-        &mut metadata,
-        dek,
-        vault_path,
-    )
+    commit_secrets_and_metadata(Path::new(SECRETS_FILE), &mut file, metadata, dek, vault_path)
 }
 
 #[cfg(test)]
@@ -782,6 +775,7 @@ mod tests {
             Alg::XChaCha20Poly1305,
             &dek,
             vault_path.to_str().expect("vault path"),
+            &mut load_vault_metadata(&vault_path).expect("load vault metadata"),
         )
         .expect("upsert");
         let file = load_secrets_file(&secrets_path).expect("load secrets");
@@ -847,6 +841,7 @@ mod tests {
             }],
             &dek,
             vault_path.to_str().expect("vault path"),
+            &mut load_vault_metadata(&vault_path).expect("load vault metadata"),
         )
         .expect("upsert many");
 
@@ -890,6 +885,7 @@ mod tests {
             Alg::XChaCha20Poly1305,
             &dek,
             vault_str,
+            &mut load_vault_metadata(&vault_path).expect("load vault metadata"),
         )
         .expect("owner upsert");
 
@@ -940,8 +936,12 @@ mod tests {
             unsafe {
                 std::env::set_var("DOTLOCK_IDENTITY_DIR", &identity_dir);
             }
-            let result =
-                remove_secret_by_name("FOO", &ProjectKey::read_only_placeholder(), vault_str);
+            let result = remove_secret_by_name(
+                "FOO",
+                &ProjectKey::read_only_placeholder(),
+                vault_str,
+                &mut load_vault_metadata(&vault_path).expect("load vault metadata"),
+            );
             unsafe {
                 std::env::remove_var("DOTLOCK_IDENTITY_DIR");
             }
@@ -1059,6 +1059,7 @@ mod tests {
             },
             &dek,
             vault_path.to_str().expect("vault path"),
+            &mut load_vault_metadata(&vault_path).expect("load vault metadata"),
         )
         .expect("upsert dynamic");
 
@@ -1110,6 +1111,7 @@ mod tests {
                 Alg::XChaCha20Poly1305,
                 &dek,
                 vault_path_str,
+                &mut load_vault_metadata(&vault_path).expect("load vault metadata"),
             )
             .expect("first upsert");
 
@@ -1122,6 +1124,7 @@ mod tests {
                 Alg::XChaCha20Poly1305,
                 &dek,
                 vault_path_str,
+                &mut load_vault_metadata(&vault_path).expect("load vault metadata"),
             );
             test_hooks::set_crash_after(None);
             assert!(result.is_err(), "crash at {point:?} must surface an error");

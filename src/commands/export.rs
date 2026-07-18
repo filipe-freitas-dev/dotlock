@@ -2,21 +2,21 @@ use colored::Colorize;
 
 use crate::{
     cli::args::ExportArgs,
+    commands::context::VaultContext,
+    crypto::VaultKeyMetadata,
     domain::{keys::ProjectKey, model::DotLockResult},
     storage::{
         self,
         env_file::{EnvEntry, merge_exported_env_content, write_env_file},
-        project::{SECRETS_FILE, VAULT_FILE, ensure_project_initialized},
+        project::SECRETS_FILE,
         secrets_lock::{SecretKind, decrypt_secret_value, load_secrets_file},
-        unlock_file::unlock_vault,
     },
 };
 
 pub fn run(args: ExportArgs) -> DotLockResult<()> {
     let path = args.path;
-    ensure_project_initialized()?;
-    let dek = unlock_vault(VAULT_FILE)?.into_read_key();
-    let mut entries = decrypted_env_entries(&dek)?;
+    let (metadata, dek) = VaultContext::unlock()?.into_read();
+    let mut entries = decrypted_env_entries(&dek, &metadata)?;
     entries.sort_by(|a, b| a.key.cmp(&b.key));
 
     let existing_content = if path.exists() {
@@ -55,7 +55,10 @@ pub fn run(args: ExportArgs) -> DotLockResult<()> {
     Ok(())
 }
 
-fn decrypted_env_entries(dek: &ProjectKey) -> DotLockResult<Vec<EnvEntry>> {
+fn decrypted_env_entries(
+    dek: &ProjectKey,
+    metadata: &VaultKeyMetadata,
+) -> DotLockResult<Vec<EnvEntry>> {
     let mut secrets = load_secrets_file(SECRETS_FILE)?.secrets;
     secrets.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -64,7 +67,7 @@ fn decrypted_env_entries(dek: &ProjectKey) -> DotLockResult<Vec<EnvEntry>> {
         if !matches!(secret.kind, SecretKind::Static) {
             continue;
         }
-        let value = decrypt_secret_value(&secret, dek)?;
+        let value = decrypt_secret_value(&secret, dek, metadata)?;
         entries.push(EnvEntry {
             key: secret.name,
             value,

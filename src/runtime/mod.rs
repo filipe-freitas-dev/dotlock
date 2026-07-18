@@ -2,16 +2,20 @@ use std::{process::Command, time::Instant};
 
 use crate::{
     audit::{record_dynamic_resolve, record_run},
+    crypto::VaultKeyMetadata,
     domain::{error::DotLockError, keys::ProjectKey, model::DotLockResult},
     providers::resolve_provider,
     storage::{
         project::SECRETS_FILE,
         secrets_lock::{SecretKind, decrypt_secret_value, load_secrets_file},
-        vault_file::load_vault_metadata,
     },
 };
 
-pub fn run_with_secrets(command: Vec<String>, dek: &ProjectKey) -> DotLockResult<()> {
+pub fn run_with_secrets(
+    command: Vec<String>,
+    dek: &ProjectKey,
+    metadata: &VaultKeyMetadata,
+) -> DotLockResult<()> {
     if command.is_empty() {
         return Err(DotLockError::MissingCommand);
     }
@@ -21,7 +25,7 @@ pub fn run_with_secrets(command: Vec<String>, dek: &ProjectKey) -> DotLockResult
     let mut envs = Vec::new();
 
     for secret in &file.secrets {
-        let value = match secret_value_for_runtime(secret, dek, &file.secrets) {
+        let value = match secret_value_for_runtime(secret, dek, &file.secrets, metadata) {
             Ok(Some(value)) => value,
             Ok(None) => continue,
             Err(err) => return Err(err),
@@ -59,9 +63,10 @@ pub fn secret_value_for_runtime(
     secret: &crate::storage::secrets_lock::SecretRecord,
     dek: &ProjectKey,
     all_secrets: &[crate::storage::secrets_lock::SecretRecord],
+    metadata: &VaultKeyMetadata,
 ) -> DotLockResult<Option<String>> {
     match &secret.kind {
-        SecretKind::Static => match decrypt_secret_value(secret, dek) {
+        SecretKind::Static => match decrypt_secret_value(secret, dek, metadata) {
             Ok(value) => Ok(Some(value)),
             Err(DotLockError::AccessDenied { .. }) => Ok(None),
             Err(err) => Err(err),
@@ -71,8 +76,9 @@ pub fn secret_value_for_runtime(
             config: _,
             bootstrap: _,
         } => {
-            let dynamic = crate::storage::secrets_lock::decrypt_dynamic_metadata(secret, dek)?;
-            let value = resolve_dynamic_secret(&secret.name, &dynamic, dek, all_secrets)?;
+            let dynamic =
+                crate::storage::secrets_lock::decrypt_dynamic_metadata(secret, dek, metadata)?;
+            let value = resolve_dynamic_secret(&secret.name, &dynamic, dek, all_secrets, metadata)?;
             Ok(Some(value))
         }
     }
@@ -83,6 +89,7 @@ pub fn resolve_dynamic_secret(
     dynamic: &crate::storage::secrets_lock::DynamicSecretMetadata,
     dek: &ProjectKey,
     all_secrets: &[crate::storage::secrets_lock::SecretRecord],
+    metadata: &VaultKeyMetadata,
 ) -> DotLockResult<String> {
     let mut bootstrap_values = serde_json::Map::new();
     for bootstrap_name in &dynamic.bootstrap {
@@ -99,13 +106,11 @@ pub fn resolve_dynamic_secret(
         }
         bootstrap_values.insert(
             bootstrap_name.clone(),
-            serde_json::Value::String(decrypt_secret_value(bootstrap_secret, dek)?),
+            serde_json::Value::String(decrypt_secret_value(bootstrap_secret, dek, metadata)?),
         );
     }
 
-    let timeout = load_vault_metadata(crate::storage::project::VAULT_FILE)
-        .map(|metadata| metadata.config.dynamic_resolve_timeout_secs.unwrap_or(10))
-        .unwrap_or(10);
+    let timeout = metadata.config.dynamic_resolve_timeout_secs.unwrap_or(10);
     let started = Instant::now();
     let provider_dir = dynamic
         .provider_path

@@ -61,12 +61,19 @@ fn shared_cache_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Test-only convenience: resolves the cache path from the on-disk vault the
+/// way the legacy single-shot callers did.
+#[cfg(test)]
 pub fn cache_path() -> DotLockResult<PathBuf> {
-    Ok(cache_dir()?.join(CACHE_FILE_NAME))
+    cache_path_for_session(&session_name(load_metadata_best_effort().as_ref()))
 }
 
-fn legacy_cache_path() -> DotLockResult<PathBuf> {
-    Ok(cache_dir()?.join(LEGACY_CACHE_FILE_NAME))
+fn cache_path_for_session(session: &str) -> DotLockResult<PathBuf> {
+    Ok(cache_dir(session)?.join(CACHE_FILE_NAME))
+}
+
+fn legacy_cache_path_for_session(session: &str) -> DotLockResult<PathBuf> {
+    Ok(cache_dir(session)?.join(LEGACY_CACHE_FILE_NAME))
 }
 
 /// Cache root resolution hard-fails when no home/config directory resolves:
@@ -81,30 +88,32 @@ fn cache_root() -> DotLockResult<PathBuf> {
     dotlock_data_root()
 }
 
-fn cache_dir() -> DotLockResult<PathBuf> {
+fn cache_dir(session: &str) -> DotLockResult<PathBuf> {
     Ok(cache_root()?
         .join(CACHE_DIR_NAME)
         .join(CACHE_SCOPE_DIR)
-        .join(project_cache_dir_name()))
+        .join(session))
 }
 
 fn wrap_key_path() -> DotLockResult<PathBuf> {
     Ok(cache_root()?.join(CACHE_DIR_NAME).join(WRAP_KEY_FILE))
 }
 
-fn project_cache_dir_name() -> String {
-    read_project_uuid()
-        .map(|uuid| short_uuid(&uuid))
-        .unwrap_or_else(|_| "unknown".to_string())
+/// Legacy entry point for callers without an already-loaded vault: resolves
+/// the metadata best-effort ONCE (an unreadable vault keeps the historical
+/// "unknown" session / non-shared defaults).
+fn load_metadata_best_effort() -> Option<VaultKeyMetadata> {
+    load_vault_metadata(VAULT_FILE).ok()
 }
 
-fn read_project_uuid() -> DotLockResult<String> {
-    let metadata: VaultKeyMetadata = load_vault_metadata(VAULT_FILE)?;
-    Ok(metadata.project_uuid)
+fn session_name(metadata: Option<&VaultKeyMetadata>) -> String {
+    metadata
+        .map(|metadata| short_uuid(&metadata.project_uuid))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn shared_mode_active() -> bool {
-    load_vault_metadata(VAULT_FILE)
+fn shared_mode_active(metadata: Option<&VaultKeyMetadata>) -> bool {
+    metadata
         .map(|metadata| metadata.access_mode == AccessMode::Shared)
         .unwrap_or(false)
 }
@@ -182,14 +191,28 @@ fn cache_aad(session: &str, expires_at: u64) -> String {
     format!("dotlock:v1:session-cache:session={session}:expires_at={expires_at}")
 }
 
+/// Test-only legacy entry point; production callers hold the metadata and use
+/// [`read_cached_dek_for`].
+#[cfg(test)]
 pub fn read_cached_dek() -> Option<ProjectKey> {
-    if shared_mode_active() && !shared_cache_enabled() {
-        let _ = invalidate_cache();
+    read_cached_dek_inner(load_metadata_best_effort().as_ref())
+}
+
+/// Cache read for callers that already hold the vault metadata (A6): avoids
+/// re-reading `vault.toml` for the shared-mode check and the session name.
+pub fn read_cached_dek_for(metadata: &VaultKeyMetadata) -> Option<ProjectKey> {
+    read_cached_dek_inner(Some(metadata))
+}
+
+fn read_cached_dek_inner(metadata: Option<&VaultKeyMetadata>) -> Option<ProjectKey> {
+    if shared_mode_active(metadata) && !shared_cache_enabled() {
+        let _ = invalidate_cache_inner(metadata);
         return None;
     }
 
-    let path = cache_path().ok()?;
-    let legacy_path = legacy_cache_path().ok()?;
+    let session = session_name(metadata);
+    let path = cache_path_for_session(&session).ok()?;
+    let legacy_path = legacy_cache_path_for_session(&session).ok()?;
     // Legacy plaintext caches are shredded on sight instead of honored.
     if legacy_path.exists() {
         shred_and_remove(&legacy_path);
@@ -210,7 +233,6 @@ pub fn read_cached_dek() -> Option<ProjectKey> {
         return None;
     }
 
-    let session = project_cache_dir_name();
     let wrap_key = load_or_create_wrap_key().ok()?;
     let key = derive_session_key(&wrap_key, &session).ok()?;
     let nonce = general_purpose::STANDARD.decode(&cache.nonce_b64).ok()?;
@@ -240,13 +262,22 @@ pub fn read_cached_dek() -> Option<ProjectKey> {
 }
 
 pub fn write_cached_dek(dek: &ProjectKey) -> DotLockResult<()> {
-    if shared_mode_active() && !shared_cache_enabled() {
-        let _ = invalidate_cache();
+    write_cached_dek_inner(load_metadata_best_effort().as_ref(), dek)
+}
+
+/// Cache write for callers that already hold the vault metadata (A6).
+pub fn write_cached_dek_for(metadata: &VaultKeyMetadata, dek: &ProjectKey) -> DotLockResult<()> {
+    write_cached_dek_inner(Some(metadata), dek)
+}
+
+fn write_cached_dek_inner(metadata: Option<&VaultKeyMetadata>, dek: &ProjectKey) -> DotLockResult<()> {
+    if shared_mode_active(metadata) && !shared_cache_enabled() {
+        let _ = invalidate_cache_inner(metadata);
         return Ok(());
     }
 
-    let path = cache_path()?;
-    let session = project_cache_dir_name();
+    let session = session_name(metadata);
+    let path = cache_path_for_session(&session)?;
     let expires_at = now_secs().saturating_add(ttl_secs());
 
     let wrap_key = load_or_create_wrap_key()?;
@@ -276,7 +307,7 @@ pub fn write_cached_dek(dek: &ProjectKey) -> DotLockResult<()> {
     let content = toml::to_string(&cache).map_err(|e| DotLockError::Crypto(e.to_string()))?;
     secure_fs::write_string_atomic(&path, &content, 0o700, 0o600)?;
 
-    let legacy_path = legacy_cache_path()?;
+    let legacy_path = legacy_cache_path_for_session(&session)?;
     if legacy_path != path {
         shred_and_remove(&legacy_path);
     }
@@ -285,7 +316,15 @@ pub fn write_cached_dek(dek: &ProjectKey) -> DotLockResult<()> {
 }
 
 pub fn invalidate_cache() -> DotLockResult<bool> {
-    let paths = match (cache_path(), legacy_cache_path()) {
+    invalidate_cache_inner(load_metadata_best_effort().as_ref())
+}
+
+fn invalidate_cache_inner(metadata: Option<&VaultKeyMetadata>) -> DotLockResult<bool> {
+    let session = session_name(metadata);
+    let paths = match (
+        cache_path_for_session(&session),
+        legacy_cache_path_for_session(&session),
+    ) {
         (Ok(current), Ok(legacy)) => [current, legacy],
         // No resolvable cache directory means nothing was ever cached.
         _ => return Ok(false),

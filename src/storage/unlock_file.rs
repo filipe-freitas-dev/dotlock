@@ -15,7 +15,7 @@ use crate::{
     },
     domain::{error::DotLockError, keys::ProjectKey, model::DotLockResult},
     storage::{
-        cache::{invalidate_cache, read_cached_dek, write_cached_dek},
+        cache::{invalidate_cache, read_cached_dek_for, write_cached_dek_for},
         identity::{load_local_identity, load_local_identity_metadata},
         pending_merge::ensure_no_pending_merge,
         project::SECRETS_FILE,
@@ -74,6 +74,15 @@ fn recover_pending_before_access(vault_path: &str) -> DotLockResult<()> {
         _ => std::path::Path::new("."),
     };
     ensure_no_pending_merge(lock_dir)
+}
+
+/// Runs the pending-transaction recovery + reconcile gate, then loads the
+/// vault metadata exactly once (A6). Every unlock in a command flows from this
+/// single read; the `*_prepared` unlock variants below never touch the file
+/// again.
+pub fn prepare_vault_access(path: &str) -> DotLockResult<crate::crypto::VaultKeyMetadata> {
+    recover_pending_before_access(path)?;
+    load_vault_metadata(path)
 }
 
 /// Unlock used exclusively by `dl reconcile`: obtains the real project key
@@ -165,29 +174,20 @@ fn unlock_vault_with_dek(
     dek: ProjectKey,
 ) -> DotLockResult<ProjectKey> {
     verify_secrets_integrity(SECRETS_FILE, metadata, &dek)?;
-    write_cached_dek(&dek)?;
+    write_cached_dek_for(metadata, &dek)?;
     Ok(dek)
 }
 
-pub fn unlock_vault_with_master_password(path: &str) -> DotLockResult<ProjectKey> {
-    recover_pending_before_access(path)?;
-    let metadata = load_vault_metadata(path)?;
-    let passphrase = prompt_unlock_password()?;
-    let dek = unwrap_dek_with_passphrase(&metadata, &passphrase)?;
-    let dek = unlock_vault_with_dek(&metadata, dek)?;
-    record_unlock_best_effort("password", &metadata);
-    Ok(dek)
-}
-
-pub fn unlock_vault_with_master_password_and_passphrase(
-    path: &str,
+/// Master-password unlock against already-loaded metadata: prompts, unwraps
+/// the DEK, verifies integrity, refreshes the session cache, and records the
+/// audit entry — without re-reading `vault.toml`.
+pub fn unlock_vault_with_master_password_prepared(
+    metadata: &crate::crypto::VaultKeyMetadata,
 ) -> DotLockResult<(ProjectKey, String)> {
-    recover_pending_before_access(path)?;
-    let metadata = load_vault_metadata(path)?;
     let passphrase = prompt_unlock_password()?;
-    let dek = unwrap_dek_with_passphrase(&metadata, &passphrase)?;
-    let dek = unlock_vault_with_dek(&metadata, dek)?;
-    record_unlock_best_effort("password", &metadata);
+    let dek = unwrap_dek_with_passphrase(metadata, &passphrase)?;
+    let dek = unlock_vault_with_dek(metadata, dek)?;
+    record_unlock_best_effort("password", metadata);
     Ok((dek, passphrase))
 }
 
@@ -250,15 +250,26 @@ fn print_shared_recipients(metadata: &crate::crypto::VaultKeyMetadata) {
     println!();
 }
 
+/// Test-only convenience wrapper; command code goes through
+/// [`prepare_vault_access`] + [`unlock_vault_prepared`] so the metadata read
+/// happens exactly once per command (A6).
+#[cfg(test)]
 pub fn unlock_vault(path: &str) -> DotLockResult<UnlockAccess> {
-    recover_pending_before_access(path)?;
-    let metadata = load_vault_metadata(path)?;
+    let metadata = prepare_vault_access(path)?;
+    unlock_vault_prepared(&metadata)
+}
 
-    if let Some(dek) = read_cached_dek() {
-        match verify_secrets_integrity(SECRETS_FILE, &metadata, &dek) {
+/// Full unlock flow (cache -> shared identity -> master password) against
+/// already-loaded metadata. Callers must have gone through
+/// [`prepare_vault_access`] first so the reconcile gate has run.
+pub fn unlock_vault_prepared(
+    metadata: &crate::crypto::VaultKeyMetadata,
+) -> DotLockResult<UnlockAccess> {
+    if let Some(dek) = read_cached_dek_for(metadata) {
+        match verify_secrets_integrity(SECRETS_FILE, metadata, &dek) {
             Ok(()) => {
-                write_cached_dek(&dek)?;
-                record_unlock_best_effort("cache", &metadata);
+                write_cached_dek_for(metadata, &dek)?;
+                record_unlock_best_effort("cache", metadata);
                 return Ok(UnlockAccess::Full(dek));
             }
             Err(DotLockError::TamperedSecretsFile) => {
@@ -272,7 +283,7 @@ pub fn unlock_vault(path: &str) -> DotLockResult<UnlockAccess> {
     }
 
     if metadata.access_mode == AccessMode::Shared {
-        match try_unlock_vault_with_local_identity(&metadata) {
+        match try_unlock_vault_with_local_identity(metadata) {
             Ok(access) => return Ok(access),
             Err(DotLockError::TamperedSecretsFile) => {
                 return Err(DotLockError::TamperedSecretsFile);
@@ -280,10 +291,10 @@ pub fn unlock_vault(path: &str) -> DotLockResult<UnlockAccess> {
             Err(_) => {}
         }
 
-        print_shared_recipients(&metadata);
+        print_shared_recipients(metadata);
     }
 
-    unlock_vault_with_master_password(path).map(UnlockAccess::Full)
+    unlock_vault_with_master_password_prepared(metadata).map(|(dek, _)| UnlockAccess::Full(dek))
 }
 
 fn record_unlock_best_effort(method: &str, metadata: &crate::crypto::VaultKeyMetadata) {

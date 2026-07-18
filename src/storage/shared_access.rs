@@ -156,18 +156,27 @@ pub fn grant_recipient(
     label: &str,
     dek: &ProjectKey,
 ) -> DotLockResult<VaultRecipient> {
-    grant_recipient_with_secret_ids(vault_path, public_key_pem, label, dek, None, None)
+    let mut metadata = load_vault_metadata(vault_path)?;
+    grant_recipient_with_secret_ids(
+        vault_path,
+        &mut metadata,
+        public_key_pem,
+        label,
+        dek,
+        None,
+        None,
+    )
 }
 
 pub fn grant_recipient_with_secret_ids(
     vault_path: &str,
+    metadata: &mut VaultKeyMetadata,
     public_key_pem: &str,
     label: &str,
     dek: &ProjectKey,
     allowed_secret_ids: Option<&[String]>,
     signer: Option<&LocalIdentity>,
 ) -> DotLockResult<VaultRecipient> {
-    let mut metadata = load_vault_metadata(vault_path)?;
     metadata.access_mode = AccessMode::Shared;
 
     let fingerprint = fingerprint_public_key(public_key_pem)?;
@@ -178,7 +187,7 @@ pub fn grant_recipient_with_secret_ids(
     } else {
         String::new()
     };
-    let wrapped_sdks = wrap_allowed_sdks(&metadata, public_key_pem, dek, allowed_secret_ids)?;
+    let wrapped_sdks = wrap_allowed_sdks(metadata, public_key_pem, dek, allowed_secret_ids)?;
 
     // Signed-grant path (H3): the granting identity — which just proved
     // master-password authority to obtain `dek` — becomes an authorized
@@ -186,7 +195,7 @@ pub fn grant_recipient_with_secret_ids(
     // pre-signed-grant vaults migrate on their first grant.
     let (grant_signature_b64, grant_signer_fingerprint) = match signer {
         Some(signer) => {
-            ensure_authorized_signer(&mut metadata, signer)?;
+            ensure_authorized_signer(metadata, signer)?;
             metadata.version = metadata.version.max(6);
             let payload = recipient_grant_payload(
                 &metadata.project_uuid,
@@ -217,10 +226,10 @@ pub fn grant_recipient_with_secret_ids(
         existing.grant_signer_fingerprint = grant_signer_fingerprint;
         let recipient = existing.clone();
         if let Some(signer) = signer {
-            bless_recipient_grants(&mut metadata, signer)?;
+            bless_recipient_grants(metadata, signer)?;
         }
-        record_vault_write(&mut metadata);
-        save_vault_metadata(vault_path, &metadata)?;
+        record_vault_write(metadata);
+        save_vault_metadata(vault_path, metadata)?;
         return Ok(recipient);
     }
 
@@ -238,10 +247,10 @@ pub fn grant_recipient_with_secret_ids(
     };
     metadata.recipients.push(recipient.clone());
     if let Some(signer) = signer {
-        bless_recipient_grants(&mut metadata, signer)?;
+        bless_recipient_grants(metadata, signer)?;
     }
-    record_vault_write(&mut metadata);
-    save_vault_metadata(vault_path, &metadata)?;
+    record_vault_write(metadata);
+    save_vault_metadata(vault_path, metadata)?;
 
     Ok(recipient)
 }
@@ -313,25 +322,25 @@ pub struct RevokeOutcome {
 pub fn revoke_recipient_and_rotate(
     vault_path: &str,
     secrets_path: &str,
+    metadata: &mut VaultKeyMetadata,
     query: &str,
     current_dek: &ProjectKey,
     passphrase: &str,
 ) -> DotLockResult<RevokeOutcome> {
-    let mut metadata = load_vault_metadata(vault_path)?;
-    let removed = revoke_recipient_in_memory(&mut metadata, query)?;
+    let removed = revoke_recipient_in_memory(metadata, query)?;
 
     let new_dek = generate_dek()?;
     // Rewraps every per-secret SDK and every remaining recipient's DEK under
     // the new project key, and re-encrypts `secrets_hash_*` under it, in the
     // same metadata object.
-    let summary = rotate_project_key_wrapping(&mut metadata, current_dek, &new_dek)?;
-    update_master_password_metadata(&mut metadata, &new_dek, passphrase)?;
+    let summary = rotate_project_key_wrapping(metadata, current_dek, &new_dek)?;
+    update_master_password_metadata(metadata, &new_dek, passphrase)?;
 
     commit_vault_pair(
         Path::new(vault_path),
         Path::new(secrets_path),
         VaultPairWrite {
-            metadata: &metadata,
+            metadata,
             secrets_lock_bytes: None,
         },
     )?;
@@ -363,11 +372,11 @@ pub fn list_recipient_acl(vault_path: &str, query: &str) -> DotLockResult<Vec<St
 
 pub fn add_recipient_secret_ids(
     vault_path: &str,
+    metadata: &mut VaultKeyMetadata,
     query: &str,
     secret_ids: &[String],
     dek: &ProjectKey,
 ) -> DotLockResult<usize> {
-    let mut metadata = load_vault_metadata(vault_path)?;
     let recipient = metadata
         .recipients
         .iter_mut()
@@ -396,8 +405,8 @@ pub fn add_recipient_secret_ids(
         added += 1;
     }
     recipient.full_access = false;
-    record_vault_write(&mut metadata);
-    save_vault_metadata(vault_path, &metadata)?;
+    record_vault_write(metadata);
+    save_vault_metadata(vault_path, metadata)?;
     Ok(added)
 }
 
@@ -538,6 +547,7 @@ mod tests {
             Alg::XChaCha20Poly1305,
             &old_dek,
             vault_str,
+            &mut load_vault_metadata(&vault_path).expect("load vault metadata"),
         )
         .expect("set A");
         upsert_plain_secret(
@@ -547,6 +557,7 @@ mod tests {
             Alg::XChaCha20Poly1305,
             &old_dek,
             vault_str,
+            &mut load_vault_metadata(&vault_path).expect("load vault metadata"),
         )
         .expect("set B");
 
@@ -560,9 +571,15 @@ mod tests {
         assert!(!granted.wrapped_dek_b64.is_empty());
 
         // (1) revoke succeeds (the old flow aborted with an AEAD error here).
-        let outcome =
-            revoke_recipient_and_rotate(vault_str, secrets_str, "bob", &old_dek, passphrase)
-                .expect("revoke succeeds for envelope vaults");
+        let outcome = revoke_recipient_and_rotate(
+            vault_str,
+            secrets_str,
+            &mut load_vault_metadata(&vault_path).expect("load vault metadata"),
+            "bob",
+            &old_dek,
+            passphrase,
+        )
+        .expect("revoke succeeds for envelope vaults");
         assert_eq!(
             outcome.removed.public_key_fingerprint,
             granted.public_key_fingerprint
@@ -672,6 +689,7 @@ mod tests {
 
         let granted = grant_recipient_with_secret_ids(
             path.to_str().expect("path"),
+            &mut load_vault_metadata(&path).expect("load vault metadata"),
             &identity.public_key_pem,
             "alice",
             &ProjectKey::new([3u8; 32]),
@@ -729,6 +747,7 @@ mod tests {
 
         let granted = grant_recipient_with_secret_ids(
             path.to_str().expect("path"),
+            &mut load_vault_metadata(&path).expect("load vault metadata"),
             &grantee.public_key_pem,
             "bob",
             &ProjectKey::new([3u8; 32]),

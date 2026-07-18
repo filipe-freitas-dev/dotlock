@@ -2,6 +2,7 @@ use colored::Colorize;
 
 use crate::{
     cli::{args::ShareCommand, present::print_ratchet_summary},
+    commands::context::VaultContext,
     domain::{error::DotLockError, model::DotLockResult},
     storage::{
         self,
@@ -13,9 +14,6 @@ use crate::{
         shared_access::{
             self, add_recipient_secret_ids, enable_shared_access, list_recipient_acl,
             list_recipients, load_public_key_from_file, revoke_recipient_and_rotate,
-        },
-        unlock_file::{
-            unlock_vault_with_master_password, unlock_vault_with_master_password_and_passphrase,
         },
     },
 };
@@ -37,9 +35,13 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
             label,
             allow,
         } => {
-            ensure_project_initialized()?;
-            let dek = unlock_vault_with_master_password(VAULT_FILE)?;
-            migrate_all_secrets_to_envelope(&dek, VAULT_FILE)?;
+            let (ctx, _passphrase) = VaultContext::unlock_with_master_password()?;
+            let VaultContext {
+                mut metadata,
+                access,
+            } = ctx;
+            let dek = access.require_full()?;
+            migrate_all_secrets_to_envelope(&dek, VAULT_FILE, &mut metadata)?;
             let public_key_pem = load_public_key_from_file(&pubkey)?;
             let allowed_ids = allow.as_deref().map(resolve_secret_ids_csv).transpose()?;
             // Grants must be signed by an authorized signer (H3): the
@@ -49,6 +51,7 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
             let signer = storage::identity::load_local_identity()?;
             let recipient = shared_access::grant_recipient_with_secret_ids(
                 VAULT_FILE,
+                &mut metadata,
                 &public_key_pem,
                 &label,
                 &dek,
@@ -64,10 +67,20 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
             Ok(())
         }
         ShareCommand::Revoke { query } => {
-            ensure_project_initialized()?;
-            let (dek, passphrase) = unlock_vault_with_master_password_and_passphrase(VAULT_FILE)?;
-            let outcome =
-                revoke_recipient_and_rotate(VAULT_FILE, SECRETS_FILE, &query, &dek, &passphrase)?;
+            let (ctx, passphrase) = VaultContext::unlock_with_master_password()?;
+            let VaultContext {
+                mut metadata,
+                access,
+            } = ctx;
+            let dek = access.require_full()?;
+            let outcome = revoke_recipient_and_rotate(
+                VAULT_FILE,
+                SECRETS_FILE,
+                &mut metadata,
+                &query,
+                &dek,
+                &passphrase,
+            )?;
             invalidate_cache()?;
             println!(
                 "{} access revoked for {} ({}); project key rotated",
@@ -98,12 +111,17 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
                 return Ok(());
             }
 
-            let dek = unlock_vault_with_master_password(VAULT_FILE)?;
-            migrate_all_secrets_to_envelope(&dek, VAULT_FILE)?;
+            let (ctx, _passphrase) = VaultContext::unlock_with_master_password()?;
+            let VaultContext {
+                mut metadata,
+                access,
+            } = ctx;
+            let dek = access.require_full()?;
+            migrate_all_secrets_to_envelope(&dek, VAULT_FILE, &mut metadata)?;
 
             if let Some(add) = add {
                 let ids = resolve_secret_ids_csv(&add)?;
-                let added = add_recipient_secret_ids(VAULT_FILE, &query, &ids, &dek)?;
+                let added = add_recipient_secret_ids(VAULT_FILE, &mut metadata, &query, &ids, &dek)?;
                 println!(
                     "{} added {} secret{} to {}",
                     "ok:".green().bold(),
@@ -116,7 +134,7 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
 
             if let Some(remove) = remove {
                 let ids = resolve_secret_ids_csv(&remove)?;
-                rotate_secret_sdks_after_acl_removal(&ids, &query, &dek, VAULT_FILE)?;
+                rotate_secret_sdks_after_acl_removal(&ids, &query, &dek, VAULT_FILE, &mut metadata)?;
                 println!(
                     "{} removed {} secret{} from {}",
                     "ok:".green().bold(),

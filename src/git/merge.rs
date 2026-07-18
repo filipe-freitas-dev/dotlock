@@ -673,6 +673,8 @@ mod driver_tests {
                 Alg::XChaCha20Poly1305,
                 &dek(),
                 self.vault.to_str().expect("vault path"),
+                &mut crate::storage::vault_file::load_vault_metadata(&self.vault)
+                    .expect("load vault metadata"),
             )
             .expect("upsert");
         }

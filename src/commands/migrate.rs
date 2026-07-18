@@ -2,16 +2,15 @@ use colored::Colorize;
 
 use crate::{
     cli::args::MigrateArgs,
-    commands::context::prepare_project_key_for_write,
+    commands::context::VaultContext,
     domain::{
         error::DotLockError,
         model::{Alg, DotLockResult},
     },
     storage::{
         env_file::parse_env_file,
-        project::{SECRETS_FILE, VAULT_FILE, ensure_project_initialized},
+        project::{SECRETS_FILE, VAULT_FILE},
         secrets_lock::{PlainSecretEntry, upsert_many},
-        unlock_file::unlock_vault,
     },
     utils::normalize_var_name,
 };
@@ -35,8 +34,7 @@ pub fn run(args: MigrateArgs) -> DotLockResult<()> {
         return Ok(());
     }
 
-    ensure_project_initialized()?;
-    let dek = prepare_project_key_for_write(unlock_vault(VAULT_FILE)?)?;
+    let (mut metadata, dek) = VaultContext::unlock()?.into_write()?;
 
     let mut prepared = Vec::with_capacity(raw_entries.len());
     for entry in raw_entries {
@@ -49,7 +47,7 @@ pub fn run(args: MigrateArgs) -> DotLockResult<()> {
     }
 
     let total = prepared.len();
-    let summary = upsert_many(SECRETS_FILE, prepared, &dek, VAULT_FILE)?;
+    let summary = upsert_many(SECRETS_FILE, prepared, &dek, VAULT_FILE, &mut metadata)?;
 
     println!(
         "{} imported {} from {}",
