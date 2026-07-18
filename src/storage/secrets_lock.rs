@@ -1115,6 +1115,47 @@ updated_at = 1
         assert_eq!(record.alg.as_deref(), Some(super::DEFAULT_SECRET_ALG));
     }
 
+    /// Backward compat (H2): a legacy `version == 0` record — encrypted
+    /// before AAD binding existed — must keep decrypting through
+    /// `decrypt_record_with_key`, while any `version >= 1` record must
+    /// authenticate against its claimed metadata.
+    #[test]
+    fn legacy_version_zero_records_decrypt_without_aad() {
+        let key = [9u8; 32];
+        // Legacy ciphertext: no AAD (empty AAD is bit-compatible with the
+        // pre-AAD format).
+        let encrypted = crate::crypto::secret_cipher::encryption_process_with_aad(
+            "FOO".to_string(),
+            "legacy-value".to_string(),
+            crate::domain::model::Alg::XChaCha20Poly1305,
+            &key,
+            &[],
+        )
+        .expect("encrypt legacy");
+        let record = SecretRecord {
+            id: "legacy-id".to_string(),
+            name: "FOO".to_string(),
+            alg: None,
+            data: String::from_utf8(encrypted.data).expect("utf8"),
+            updated_at: 42,
+            version: 0,
+            kind: super::SecretKind::Static,
+        };
+
+        assert_eq!(
+            super::decrypt_record_with_key(&record, &key).expect("legacy decrypt"),
+            "legacy-value"
+        );
+
+        // The same no-AAD ciphertext claiming `version >= 1` must FAIL: it
+        // cannot authenticate against the id/name/updated_at/version AAD.
+        let mut forged = record;
+        forged.version = 1;
+        let err = super::decrypt_record_with_key(&forged, &key)
+            .expect_err("forged version must fail authentication");
+        assert!(err.to_string().contains("failed authentication"));
+    }
+
     #[test]
     fn upsert_dynamic_secret_encrypts_provider_metadata_in_data() {
         let dir = temp_dir("dynamic-envelope");
