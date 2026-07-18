@@ -318,7 +318,7 @@ pub fn revoke_recipient_and_rotate(
     let mut metadata = load_vault_metadata(vault_path)?;
     let removed = revoke_recipient_in_memory(&mut metadata, query)?;
 
-    let new_dek = Zeroizing::new(generate_dek().map_err(|e| DotLockError::Crypto(e.to_string()))?);
+    let new_dek = Zeroizing::new(generate_dek()?);
     // Rewraps every per-secret SDK and every remaining recipient's DEK under
     // the new project key, and re-encrypts `secrets_hash_*` under it, in the
     // same metadata object.
@@ -504,8 +504,7 @@ mod tests {
                 integrity::verify_secrets_integrity,
                 kdf::{KdfParams, derive_master_key},
                 kek::derive_kek,
-                sdk,
-                update_master_password_metadata,
+                sdk, update_master_password_metadata,
             },
             domain::{error::DotLockError, model::Alg},
             storage::secrets_lock::{load_secrets_file, upsert_plain_secret},
@@ -733,7 +732,10 @@ mod tests {
         // The granting identity was recorded as an authorized signer and the
         // vault format was bumped.
         assert_eq!(metadata.authorized_signers.len(), 1);
-        assert_eq!(metadata.authorized_signers[0].fingerprint, owner.fingerprint);
+        assert_eq!(
+            metadata.authorized_signers[0].fingerprint,
+            owner.fingerprint
+        );
         assert!(metadata.version >= 6);
         // Every recipient — the new one AND the legacy unsigned one — now
         // carries a grant that verifies against the authorized signer.

@@ -15,7 +15,9 @@ use crate::{
             file_sha256_b64,
         },
         sdk,
-        secret_cipher::{decryption_process, decryption_process_with_aad, encryption_process_with_aad},
+        secret_cipher::{
+            decryption_process, decryption_process_with_aad, encryption_process_with_aad,
+        },
         share::{unwrap_dek_with_private_key, wrap_dek_for_public_key_b64},
     },
     domain::{
@@ -1190,8 +1192,7 @@ updated_at = 1
             .expect("wrapped sdk");
         let sdk =
             crate::crypto::sdk::unwrap_sdk_with_project_key(wrapped_sdk, &dek).expect("unwrap sdk");
-        let plaintext =
-            super::decrypt_record_with_key(&record, &sdk).expect("decrypt data");
+        let plaintext = super::decrypt_record_with_key(&record, &sdk).expect("decrypt data");
         let metadata =
             serde_json::from_str::<super::DynamicSecretMetadata>(&plaintext).expect("metadata");
         assert_eq!(metadata.provider, "echo");

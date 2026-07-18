@@ -1,5 +1,6 @@
-use anyhow::Result;
 use argon2::{Algorithm, Argon2, Params, Version};
+
+use crate::domain::{error::DotLockError, model::DotLockResult};
 
 const MASTER_KEY_LEN: usize = 32;
 const SALT_LEN: usize = 16;
@@ -21,9 +22,10 @@ impl Default for KdfParams {
     }
 }
 
-pub fn generate_salt() -> Result<[u8; SALT_LEN]> {
+pub fn generate_salt() -> DotLockResult<[u8; SALT_LEN]> {
     let mut salt = [0u8; SALT_LEN];
-    getrandom::fill(&mut salt)?;
+    getrandom::fill(&mut salt)
+        .map_err(|e| DotLockError::Crypto(format!("failed to generate salt: {e}")))?;
     Ok(salt)
 }
 
@@ -31,14 +33,14 @@ pub fn derive_master_key(
     passphrase: &str,
     salt: &[u8],
     params: KdfParams,
-) -> Result<[u8; MASTER_KEY_LEN]> {
+) -> DotLockResult<[u8; MASTER_KEY_LEN]> {
     let argon_params = Params::new(
         params.memory_kib,
         params.iterations,
         params.parallelism,
         Some(MASTER_KEY_LEN),
     )
-    .map_err(|e| anyhow::anyhow!("invalid Argon2 params: {e}"))?;
+    .map_err(|e| DotLockError::Crypto(format!("invalid Argon2 params: {e}")))?;
 
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params);
 
@@ -46,7 +48,9 @@ pub fn derive_master_key(
 
     argon2
         .hash_password_into(passphrase.as_bytes(), salt, &mut master_key)
-        .map_err(|e| anyhow::anyhow!("failed to derive master key with Argon2id: {e}"))?;
+        .map_err(|e| {
+            DotLockError::Crypto(format!("failed to derive master key with Argon2id: {e}"))
+        })?;
 
     Ok(master_key)
 }

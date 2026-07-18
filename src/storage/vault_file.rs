@@ -298,7 +298,7 @@ mod tests {
     fn rotate_kek_wrapping_skips_recipients_without_valid_grant() {
         use crate::{
             crypto::{AuthorizedSigner, VaultRecipient},
-            storage::shared_access::{recipient_grant_payload, recipient_grant_is_valid},
+            storage::shared_access::{recipient_grant_is_valid, recipient_grant_payload},
         };
 
         let old_project_key = [8u8; 32];
@@ -374,10 +374,7 @@ mod tests {
         .expect("unwrap new project key");
         assert_eq!(unwrapped, new_project_key);
         // ...while the injected one was never wrapped to the new key.
-        assert_eq!(
-            metadata.recipients[1].wrapped_dek_b64,
-            "old-injected-wrap"
-        );
+        assert_eq!(metadata.recipients[1].wrapped_dek_b64, "old-injected-wrap");
     }
 
     #[test]

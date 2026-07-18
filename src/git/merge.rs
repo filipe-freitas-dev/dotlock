@@ -264,8 +264,8 @@ fn merge_vault_metadata(
     // stale, so a marker is created to force a reconcile as well. Rejected
     // recipient/signer injections also force a marker so `dl reconcile`
     // surfaces them to the user.
-    let has_rejections = !vault_report.rejected_recipients.is_empty()
-        || !vault_report.rejected_signers.is_empty();
+    let has_rejections =
+        !vault_report.rejected_recipients.is_empty() || !vault_report.rejected_signers.is_empty();
     if marker.is_some() || hash_fields_diverge || has_rejections {
         let mut marker = marker.unwrap_or_default();
         marker.vault_sha256_b64 = Some(bytes_sha256_b64(content.as_bytes()));
@@ -577,10 +577,10 @@ mod driver_tests {
     use crate::{
         crypto::{
             AccessMode, AuthorizedSigner, VaultConfig, VaultKeyMetadata, VaultRecipient,
-            integrity::verify_secrets_integrity, sdk,
+            integrity::verify_secrets_integrity,
+            sdk,
             share::{
-                IdentityProtection, encode_public_key_b64, generate_identity,
-                sign_recipient_grant,
+                IdentityProtection, encode_public_key_b64, generate_identity, sign_recipient_grant,
             },
         },
         domain::{error::DotLockError, model::Alg},

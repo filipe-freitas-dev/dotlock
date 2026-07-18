@@ -124,22 +124,25 @@ pub fn print_get_result(name: &str, id: &str, value: &str) {
     println!();
 }
 
-pub fn print_secrets_table(entries: &[SecretRecord]) {
-    if entries.is_empty() {
-        println!("{} no secrets stored", "info:".cyan().bold());
-        return;
-    }
+/// Per-column cell style applied after padding, so alignment is computed on
+/// the visible text rather than on ANSI escape sequences.
+pub type CellStyle = fn(&str) -> colored::ColoredString;
 
-    let id_header = "ID";
-    let name_header = "NAME";
-
-    let id_w = id_header.len().max(8);
-    let name_w = entries
+/// Renders an aligned two-space-indented table: dimmed bold headers, a dimmed
+/// `─` rule per column, then one styled row per entry. Column widths are the
+/// max of the header and every cell in that column (in visible characters).
+pub fn render_table(headers: &[&str], rows: &[Vec<String>], styles: &[CellStyle]) {
+    let widths: Vec<usize> = headers
         .iter()
-        .map(|e| e.name.chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(name_header.len());
+        .enumerate()
+        .map(|(col, header)| {
+            rows.iter()
+                .map(|row| row.get(col).map_or(0, |cell| cell.chars().count()))
+                .max()
+                .unwrap_or(0)
+                .max(header.chars().count())
+        })
+        .collect();
 
     let pad = |s: &str, w: usize| {
         let len = s.chars().count();
@@ -150,25 +153,52 @@ pub fn print_secrets_table(entries: &[SecretRecord]) {
         }
     };
 
-    println!();
-    println!(
-        "  {}  {}",
-        pad(id_header, id_w).dimmed().bold(),
-        pad(name_header, name_w).dimmed().bold()
-    );
-    println!(
-        "  {}  {}",
-        "─".repeat(id_w).dimmed(),
-        "─".repeat(name_w).dimmed()
-    );
-    for entry in entries {
-        let short = short_uuid(&entry.id);
-        println!(
-            "  {}  {}",
-            pad(&short, id_w).yellow(),
-            pad(&entry.name, name_w).bold()
-        );
+    let header_line = headers
+        .iter()
+        .zip(&widths)
+        .map(|(header, &w)| pad(header, w).dimmed().bold().to_string())
+        .collect::<Vec<_>>()
+        .join("  ");
+    println!("  {header_line}");
+
+    let rule = widths
+        .iter()
+        .map(|&w| "─".repeat(w).dimmed().to_string())
+        .collect::<Vec<_>>()
+        .join("  ");
+    println!("  {rule}");
+
+    for row in rows {
+        let line = row
+            .iter()
+            .zip(&widths)
+            .enumerate()
+            .map(|(col, (cell, &w))| {
+                let padded = pad(cell, w);
+                match styles.get(col) {
+                    Some(style) => style(&padded).to_string(),
+                    None => padded,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
+        println!("  {line}");
     }
+}
+
+pub fn print_secrets_table(entries: &[SecretRecord]) {
+    if entries.is_empty() {
+        println!("{} no secrets stored", "info:".cyan().bold());
+        return;
+    }
+
+    let rows: Vec<Vec<String>> = entries
+        .iter()
+        .map(|entry| vec![short_uuid(&entry.id), entry.name.clone()])
+        .collect();
+
+    println!();
+    render_table(&["ID", "NAME"], &rows, &[|s| s.yellow(), |s| s.bold()]);
     println!();
     println!(
         "  {} {}",

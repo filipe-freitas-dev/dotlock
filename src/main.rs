@@ -41,9 +41,8 @@ use crate::{
             upsert_many, upsert_plain_secret,
         },
         shared_access::{
-            self, add_recipient_secret_ids, enable_shared_access,
-            list_recipient_acl, list_recipients, load_public_key_from_file,
-            revoke_recipient_and_rotate,
+            self, add_recipient_secret_ids, enable_shared_access, list_recipient_acl,
+            list_recipients, load_public_key_from_file, revoke_recipient_and_rotate,
         },
         unlock_file::{
             UnlockAccess, unlock_full_for_reconcile, unlock_vault,
@@ -55,7 +54,9 @@ use crate::{
         },
         vault_txn::{VaultPairWrite, commit_vault_pair, recover_pending},
     },
-    utils::{normalize_var_name, print_get_result, print_secrets_table, report_error},
+    utils::{
+        normalize_var_name, print_get_result, print_secrets_table, render_table, report_error,
+    },
 };
 
 mod audit;
@@ -1008,7 +1009,7 @@ fn rotate_project_key_wrapping(
     passphrase: &str,
 ) -> DotLockResult<(Zeroizing<[u8; 32]>, RatchetSummary)> {
     let mut metadata = load_vault_metadata(VAULT_FILE)?;
-    let new_dek = Zeroizing::new(generate_dek().map_err(|e| DotLockError::Crypto(e.to_string()))?);
+    let new_dek = Zeroizing::new(generate_dek()?);
     // rotate_kek_wrapping rewraps the DEK/SDKs AND re-encrypts `secrets_hash_*`
     // under the new DEK in the same metadata object; one transactional commit
     // makes the whole rotation atomic (secrets.lock is unchanged by rotation).
@@ -1142,48 +1143,28 @@ fn print_recipients_table(recipients: &[crypto::VaultRecipient]) {
         return;
     }
 
-    let label_w = recipients
+    let rows: Vec<Vec<String>> = recipients
         .iter()
-        .map(|entry| entry.label.len())
-        .max()
-        .unwrap_or(5)
-        .max(5);
-    let fp_w = recipients
-        .iter()
-        .map(|entry| entry.public_key_fingerprint.len())
-        .max()
-        .unwrap_or(11)
-        .max(11);
+        .map(|recipient| {
+            let access = if recipient.full_access {
+                "*".to_string()
+            } else {
+                recipient.wrapped_sdks.len().to_string()
+            };
+            vec![
+                recipient.label.clone(),
+                recipient.public_key_fingerprint.clone(),
+                access,
+            ]
+        })
+        .collect();
 
     println!();
-    println!(
-        "  {:label_w$}  {:fp_w$}  ACCESS",
-        "LABEL".dimmed().bold(),
-        "FINGERPRINT".dimmed().bold(),
-        label_w = label_w,
-        fp_w = fp_w
+    render_table(
+        &["LABEL", "FINGERPRINT", "ACCESS"],
+        &rows,
+        &[|s| s.bold(), |s| s.yellow()],
     );
-    println!(
-        "  {}  {}  {}",
-        "─".repeat(label_w).dimmed(),
-        "─".repeat(fp_w).dimmed(),
-        "─".repeat(6).dimmed()
-    );
-    for recipient in recipients {
-        let access = if recipient.full_access {
-            "*".to_string()
-        } else {
-            recipient.wrapped_sdks.len().to_string()
-        };
-        println!(
-            "  {:label_w$}  {:fp_w$}  {}",
-            recipient.label.as_str().bold(),
-            recipient.public_key_fingerprint.as_str().yellow(),
-            access,
-            label_w = label_w,
-            fp_w = fp_w
-        );
-    }
     println!();
 }
 

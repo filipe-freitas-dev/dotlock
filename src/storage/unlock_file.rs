@@ -22,6 +22,7 @@ use crate::{
         vault_file::load_vault_metadata,
         vault_txn::recover_pending,
     },
+    utils::render_table,
 };
 
 /// Result of unlocking the vault. Write paths must call [`UnlockAccess::require_full`]
@@ -122,16 +123,14 @@ fn unwrap_dek_with_passphrase(
         parallelism: metadata.parallelism,
     };
 
-    let mut master_key = derive_master_key(passphrase, &salt, params)
-        .map_err(|e| DotLockError::Crypto(e.to_string()))?;
+    let mut master_key = derive_master_key(passphrase, &salt, params)?;
 
     let mut kek = derive_kek(
         &master_key,
         &metadata.project,
         &metadata.environment,
         metadata.kek_version,
-    )
-    .map_err(|e| DotLockError::Crypto(e.to_string()))?;
+    )?;
 
     master_key.zeroize();
 
@@ -221,18 +220,15 @@ fn print_shared_recipients(metadata: &crate::crypto::VaultKeyMetadata) {
     let mut recipients = metadata.recipients.clone();
     recipients.sort_by(|a, b| a.label.cmp(&b.label));
 
-    let label_w = recipients
+    let rows: Vec<Vec<String>> = recipients
         .iter()
-        .map(|entry| entry.label.len())
-        .max()
-        .unwrap_or(5)
-        .max(5);
-    let fp_w = recipients
-        .iter()
-        .map(|entry| entry.public_key_fingerprint.len())
-        .max()
-        .unwrap_or(11)
-        .max(11);
+        .map(|recipient| {
+            vec![
+                recipient.label.clone(),
+                recipient.public_key_fingerprint.clone(),
+            ]
+        })
+        .collect();
 
     println!();
     println!(
@@ -241,27 +237,11 @@ fn print_shared_recipients(metadata: &crate::crypto::VaultKeyMetadata) {
             .cyan()
             .bold()
     );
-    println!(
-        "  {:label_w$}  {:fp_w$}",
-        "LABEL".dimmed().bold(),
-        "FINGERPRINT".dimmed().bold(),
-        label_w = label_w,
-        fp_w = fp_w
+    render_table(
+        &["LABEL", "FINGERPRINT"],
+        &rows,
+        &[|s| s.bold(), |s| s.yellow()],
     );
-    println!(
-        "  {}  {}",
-        "─".repeat(label_w).dimmed(),
-        "─".repeat(fp_w).dimmed()
-    );
-    for recipient in recipients {
-        println!(
-            "  {:label_w$}  {:fp_w$}",
-            recipient.label.as_str().bold(),
-            recipient.public_key_fingerprint.as_str().yellow(),
-            label_w = label_w,
-            fp_w = fp_w
-        );
-    }
     println!();
 }
 

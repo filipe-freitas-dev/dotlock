@@ -143,22 +143,19 @@ pub fn update_master_password_metadata(
     passphrase: &str,
 ) -> DotLockResult<()> {
     let params = KdfParams::default();
-    let salt = generate_salt().map_err(|e| DotLockError::Crypto(e.to_string()))?;
+    let salt = generate_salt()?;
 
-    let mut master_key = derive_master_key(passphrase, &salt, params)
-        .map_err(|e| DotLockError::Crypto(e.to_string()))?;
+    let mut master_key = derive_master_key(passphrase, &salt, params)?;
     let mut kek = derive_kek(
         &master_key,
         &metadata.project,
         &metadata.environment,
         metadata.kek_version,
-    )
-    .map_err(|e| DotLockError::Crypto(e.to_string()))?;
+    )?;
 
     master_key.zeroize();
 
-    let wrapped = wrap_dek(&kek, dek, &metadata.project, &metadata.environment)
-        .map_err(|e| DotLockError::Crypto(e.to_string()))?;
+    let wrapped = wrap_dek(&kek, dek, &metadata.project, &metadata.environment)?;
 
     kek.zeroize();
 
@@ -247,7 +244,7 @@ pub fn ask_master_password() -> DotLockResult<String> {
 pub fn initialize_vault_keys(project: &str, environment: &str) -> DotLockResult<InitializedVault> {
     let passphrase = ask_master_password()?;
 
-    let dek = generate_dek().map_err(|e| DotLockError::Crypto(e.to_string()))?;
+    let dek = generate_dek()?;
 
     let mut metadata = VaultKeyMetadata {
         version: 2,
