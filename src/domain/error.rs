@@ -65,6 +65,9 @@ pub enum DotLockError {
     #[error("invalid identity passphrase")]
     InvalidIdentityPassphrase,
 
+    #[error("cannot resolve the home/config directory; set HOME or DOTLOCK_HOME")]
+    HomeDirUnavailable,
+
     #[error("crypto failure: {0}")]
     Crypto(String),
 
@@ -130,6 +133,9 @@ impl DotLockError {
             DotLockError::InvalidIdentityPassphrase => {
                 Some("enter the passphrase used when `dl cert init` created this local identity")
             }
+            DotLockError::HomeDirUnavailable => Some(
+                "DotLock refuses to write identities, key caches or audit logs into the current directory; export HOME (or DOTLOCK_HOME) pointing at a per-user directory",
+            ),
             DotLockError::Aborted => None,
             DotLockError::CommandFailed { .. } => None,
             DotLockError::Crypto(_) | DotLockError::Io(_) => None,

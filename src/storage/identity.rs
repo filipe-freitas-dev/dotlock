@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::PathBuf,
+    sync::{Mutex, OnceLock},
+};
 
 use inquire::{Password, PasswordDisplayMode};
 use serde::{Deserialize, Serialize};
@@ -8,10 +11,9 @@ use crate::{
         GeneratedIdentity, IdentityProtection, decrypt_private_key_pem, generate_identity,
     },
     domain::{error::DotLockError, model::DotLockResult},
-    storage::secure_fs,
+    storage::{paths::dotlock_data_root, secure_fs},
 };
 
-const APP_DIR: &str = ".lock";
 const IDENTITY_DIR: &str = "identity";
 const PRIVATE_KEY_FILE: &str = "identity.pem";
 const PUBLIC_KEY_FILE: &str = "identity.pub.pem";
@@ -31,38 +33,57 @@ pub struct LocalIdentity {
     pub public_key_pem: String,
 }
 
-pub fn identity_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("DOTLOCK_IDENTITY_DIR") {
-        return PathBuf::from(dir);
-    }
-
-    #[cfg(not(windows))]
+/// Directory holding the local identity key pair. Hard-fails with
+/// [`DotLockError::HomeDirUnavailable`] when no home/config directory
+/// resolves: the private key must never be written into a committable CWD.
+pub fn identity_dir() -> DotLockResult<PathBuf> {
+    if let Ok(dir) = std::env::var("DOTLOCK_IDENTITY_DIR")
+        && !dir.trim().is_empty()
     {
-        if let Ok(home) = std::env::var("HOME") {
-            return Path::new(&home).join(APP_DIR).join(IDENTITY_DIR);
-        }
+        return Ok(PathBuf::from(dir));
     }
+    Ok(dotlock_data_root()?.join(IDENTITY_DIR))
+}
 
-    #[cfg(windows)]
-    {
-        if let Ok(dir) = std::env::var("LOCALAPPDATA") {
-            return Path::new(&dir).join("dotlock").join(IDENTITY_DIR);
-        }
+pub fn private_key_path() -> DotLockResult<PathBuf> {
+    Ok(identity_dir()?.join(PRIVATE_KEY_FILE))
+}
+
+pub fn public_key_path() -> DotLockResult<PathBuf> {
+    Ok(identity_dir()?.join(PUBLIC_KEY_FILE))
+}
+
+fn metadata_path() -> DotLockResult<PathBuf> {
+    Ok(identity_dir()?.join(META_FILE))
+}
+
+/// Process-wide signer registered whenever a local identity is successfully
+/// loaded (and, for passphrase-encrypted identities, decrypted). Lets audit
+/// entries written later in the same command be signed without re-prompting,
+/// so encrypted identities no longer fall back to anonymous entries.
+fn session_signer_slot() -> &'static Mutex<Option<LocalIdentity>> {
+    static SLOT: OnceLock<Mutex<Option<LocalIdentity>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+pub fn register_session_signer(identity: &LocalIdentity) {
+    if let Ok(mut slot) = session_signer_slot().lock() {
+        *slot = Some(identity.clone());
     }
-
-    PathBuf::from(".").join(APP_DIR).join(IDENTITY_DIR)
 }
 
-pub fn private_key_path() -> PathBuf {
-    identity_dir().join(PRIVATE_KEY_FILE)
+pub fn session_signer() -> Option<LocalIdentity> {
+    session_signer_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
 }
 
-pub fn public_key_path() -> PathBuf {
-    identity_dir().join(PUBLIC_KEY_FILE)
-}
-
-fn metadata_path() -> PathBuf {
-    identity_dir().join(META_FILE)
+#[cfg(test)]
+pub(crate) fn clear_session_signer() {
+    if let Ok(mut slot) = session_signer_slot().lock() {
+        *slot = None;
+    }
 }
 
 fn prompt_identity_passphrase() -> DotLockResult<String> {
@@ -100,9 +121,9 @@ pub fn initialize_local_identity_with_options(
     force: bool,
     plain: bool,
 ) -> DotLockResult<LocalIdentityMetadata> {
-    let private_path = private_key_path();
-    let public_path = public_key_path();
-    let meta_path = metadata_path();
+    let private_path = private_key_path()?;
+    let public_path = public_key_path()?;
+    let meta_path = metadata_path()?;
 
     if !force && (private_path.exists() || public_path.exists() || meta_path.exists()) {
         return Err(DotLockError::LocalIdentityAlreadyInitialized);
@@ -132,7 +153,7 @@ pub fn initialize_local_identity_with_options(
 }
 
 pub fn load_local_identity_metadata() -> DotLockResult<LocalIdentityMetadata> {
-    let meta_path = metadata_path();
+    let meta_path = metadata_path()?;
 
     if !meta_path.exists() {
         return Err(DotLockError::LocalIdentityNotInitialized);
@@ -144,8 +165,8 @@ pub fn load_local_identity_metadata() -> DotLockResult<LocalIdentityMetadata> {
 }
 
 pub fn load_local_identity() -> DotLockResult<LocalIdentity> {
-    let private_path = private_key_path();
-    let public_path = public_key_path();
+    let private_path = private_key_path()?;
+    let public_path = public_key_path()?;
 
     if !private_path.exists() || !public_path.exists() {
         return Err(DotLockError::LocalIdentityNotInitialized);
@@ -161,11 +182,16 @@ pub fn load_local_identity() -> DotLockResult<LocalIdentity> {
         encrypted_private_key_pem
     };
 
-    Ok(LocalIdentity {
+    let identity = LocalIdentity {
         fingerprint: metadata.fingerprint,
         private_key_pem,
         public_key_pem: secure_fs::read_to_string(&public_path)?,
-    })
+    };
+    // Keep the (already decrypted) signing key available for audit writes
+    // made later in this command, so passphrase-encrypted identities still
+    // produce signed audit entries instead of anonymous ones.
+    register_session_signer(&identity);
+    Ok(identity)
 }
 
 /// Serializes tests that mutate `DOTLOCK_IDENTITY_DIR`, across all modules.
@@ -215,12 +241,27 @@ mod tests {
         let private = "-----BEGIN PRIVATE KEY-----\nvalue\n-----END PRIVATE KEY-----\n";
         let public = "-----BEGIN PUBLIC KEY-----\nvalue\n-----END PUBLIC KEY-----\n";
         let content = toml::to_string_pretty(&meta).expect("meta");
-        secure_fs::write_string_atomic(&super::metadata_path(), &content, 0o700, 0o600)
-            .expect("write meta");
-        secure_fs::write_string_atomic(&super::private_key_path(), private, 0o700, 0o600)
-            .expect("write private");
-        secure_fs::write_string_atomic(&super::public_key_path(), public, 0o700, 0o644)
-            .expect("write public");
+        secure_fs::write_string_atomic(
+            &super::metadata_path().expect("meta path"),
+            &content,
+            0o700,
+            0o600,
+        )
+        .expect("write meta");
+        secure_fs::write_string_atomic(
+            &super::private_key_path().expect("private path"),
+            private,
+            0o700,
+            0o600,
+        )
+        .expect("write private");
+        secure_fs::write_string_atomic(
+            &super::public_key_path().expect("public path"),
+            public,
+            0o700,
+            0o644,
+        )
+        .expect("write public");
 
         let loaded = load_local_identity().expect("load identity");
         let loaded_meta = load_local_identity_metadata().expect("load identity metadata");
@@ -246,6 +287,7 @@ mod tests {
         }
 
         let meta = initialize_local_identity_with_options(false, true).expect("init identity");
+        super::clear_session_signer();
         let loaded = load_local_identity().expect("load identity");
 
         assert!(!meta.encrypted);
@@ -253,9 +295,50 @@ mod tests {
         assert!(loaded.private_key_pem.contains("BEGIN PRIVATE KEY"));
         assert!(!loaded.private_key_pem.contains("ENCRYPTED PRIVATE KEY"));
 
+        // Loading an identity must register the in-memory session signer so
+        // later audit writes in the same command are signed (H4).
+        let signer = super::session_signer().expect("session signer registered");
+        assert_eq!(signer.fingerprint, meta.fingerprint);
+        super::clear_session_signer();
+
         let _ = fs::remove_dir_all(&dir);
         unsafe {
             std::env::remove_var("DOTLOCK_IDENTITY_DIR");
         }
+    }
+
+    #[test]
+    fn identity_paths_hard_fail_without_home_or_overrides() {
+        let _guard = env_lock().lock().expect("lock");
+        let vars = [
+            "HOME",
+            "LOCALAPPDATA",
+            "DOTLOCK_IDENTITY_DIR",
+            "DOTLOCK_HOME",
+        ];
+        let saved: Vec<(&str, Option<String>)> = vars
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect();
+        unsafe {
+            for name in vars {
+                std::env::remove_var(name);
+            }
+        }
+
+        let result = super::identity_dir();
+
+        unsafe {
+            for (name, value) in saved {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                }
+            }
+        }
+
+        assert!(matches!(
+            result,
+            Err(crate::domain::error::DotLockError::HomeDirUnavailable)
+        ));
     }
 }

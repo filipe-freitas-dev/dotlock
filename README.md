@@ -508,12 +508,12 @@ Aliases: `dl audit s`, `dl a show`.
 
 ```bash
 dl audit verify
-dl audit verify --strict
+dl audit verify --lax
 dl audit path
 dl audit rotate
 ```
 
-`--strict` rejects anonymous entries. Logs rotate automatically when they reach 10 MiB or are older than 90 days.
+Verification is strict by default: anonymous (unsigned) entries and an unsigned high-water mark fail with a non-zero exit code. `--lax` downgrades those to warnings. Each audit write also records a signed high-water mark (entry count plus head hash) next to the log, so deleting the last N entries is detected even though each remaining line still chains correctly. Logs rotate automatically when they reach 10 MiB or are older than 90 days.
 
 **When:** Use `verify` before trusting audit history. Use `rotate` for manual cleanup or archival.
 
@@ -547,10 +547,11 @@ Aliases: `dl c show`, `dl c set`, `dl c unset`.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `DOTLOCK_CACHE_TTL` | `30` | Cached project key lifetime in seconds, capped at 3600 |
+| `DOTLOCK_CACHE_TTL` | `15` | Cached project key lifetime in seconds, capped at 300 |
 | `DOTLOCK_CACHE_DIR` | `$HOME/.lock` on Unix, `%LOCALAPPDATA%\dotlock` on Windows | Overrides the session cache root |
 | `DOTLOCK_SHARED_CACHE` | off | Set to `1`, `true`, `TRUE`, `yes` or `YES` to enable caching in shared mode |
 | `DOTLOCK_IDENTITY_DIR` | `$HOME/.lock/identity` | Overrides local identity storage |
+| `DOTLOCK_HOME` | unset | Overrides the per-user state root (`$HOME/.lock` / `%LOCALAPPDATA%\dotlock`); required in environments without `HOME` |
 | `DOTLOCK_AUDIT_DIR` | `$HOME/.lock/audit` on Unix, `%LOCALAPPDATA%\dotlock\audit` on Windows | Overrides audit log storage |
 | `DOTLOCK_AUTO_FETCH` | unset | Set to `0`, `false`, `no` or `off` to disable auto-fetch for one command |
 
@@ -583,7 +584,7 @@ Aliases: `dl c show`, `dl c set`, `dl c unset`.
 | `dl rotate master-password` | `rot master-password`, `rot mp` | Change master password |
 | `dl rotate project-key` | `rot project-key`, `rot pk` | Rotate project key |
 | `dl audit show [--verbose] [--since YYYY-MM-DD] [--action ACTION]` | `a show`, `audit s` | Show audit entries |
-| `dl audit verify [--strict]` | `a verify`, `audit v` | Verify audit log |
+| `dl audit verify [--lax]` | `a verify`, `audit v` | Verify audit log (strict by default) |
 | `dl audit path` | `a path`, `audit p` | Print audit log path |
 | `dl audit rotate` | `a rotate`, `audit r` | Rotate and gzip current audit log |
 | `dl git install-merge-driver` | `gt install-merge-driver`, `gt i` | Configure Git merge support |
@@ -615,11 +616,16 @@ Local user state:
 │   ├── identity.pem
 │   ├── identity.pub.pem
 │   └── identity.toml
-├── run/sessions/<project>/
-│   └── sessions.toml
+├── run/
+│   ├── session.key
+│   └── sessions/<project>/
+│       └── sessions.toml
 └── audit/<project-uuid>/
-    └── audit.log
+    ├── audit.log
+    └── hwm.toml
 ```
+
+DotLock refuses to fall back to the current directory for any of this state. When neither `HOME` (or `%LOCALAPPDATA%` on Windows) nor `DOTLOCK_HOME` resolves — cron jobs, containers, systemd units without a login environment — commands that would write identities, cached keys or audit logs fail with a clear error instead of dropping key material into a committable `./.lock`.
 
 On Unix, private directories are created with `0700`, secret/private files with `0600`, and public key files with `0644`. Writes use an atomic temp-file-and-rename flow.
 
@@ -656,7 +662,11 @@ Every write to `secrets.lock` updates an authenticated hash in `vault.toml`. On 
 
 ### Session cache
 
-After successful unlock, DotLock may cache the project key for a short time. The default TTL is 30 seconds. Shared mode disables caching unless `DOTLOCK_SHARED_CACHE` is enabled.
+After successful unlock, DotLock may cache the project key for a short time so consecutive commands do not re-prompt. The default TTL is 15 seconds (`DOTLOCK_CACHE_TTL`, capped at 300). Shared mode disables caching unless `DOTLOCK_SHARED_CACHE` is enabled.
+
+The cached key is never stored raw: it is encrypted (XChaCha20-Poly1305) under a key derived from a separate per-user random key file (`~/.lock/run/session.key`, mode `0600`), with the expiry timestamp bound as authenticated data. Expired or tampered entries are overwritten with zeros and deleted as soon as they are seen, and `dl lock` shreds them on demand.
+
+**Residual threat model:** both the wrapped session file and the wrapping key file live on the same filesystem with `0600` permissions. A process running as the same user (or root) within the TTL window can read both files and recover the project key; the wrapping defeats casual single-file exposure (backups or snapshots of `sessions.toml` alone, log shippers), not a same-uid attacker. Filesystem snapshots, swap and copy-on-write storage may also defeat the best-effort shredding. Moving the cache into the OS keyring or a memory-only agent is a planned follow-up; until then, set `DOTLOCK_CACHE_TTL=0` or run `dl lock` after sensitive sessions on multi-tenant machines.
 
 ### Shared mode and ACLs
 

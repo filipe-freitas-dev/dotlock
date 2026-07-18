@@ -10,6 +10,7 @@ use colored::Colorize;
 use crate::{
     crypto::VaultConfig,
     domain::{error::DotLockError, model::DotLockResult},
+    git::validate_git_ref_component,
     storage::vault_file::load_vault_metadata,
 };
 
@@ -37,22 +38,21 @@ pub fn auto_fetch_if_enabled(vault_path: &str) -> DotLockResult<()> {
         return Ok(());
     }
 
-    let remote = metadata
-        .config
-        .auto_fetch_remote
-        .as_deref()
-        .unwrap_or(DEFAULT_REMOTE);
+    let remote = resolve_remote(&metadata.config)?;
+    validate_git_ref_component("branch", branch)?;
     let timeout = Duration::from_secs(timeout_secs(&metadata.config));
 
+    // `--` ends option parsing so a hostile remote/branch value can never be
+    // interpreted by git as an option such as `--upload-pack=<cmd>` (H1).
     let pulled = run_git_with_timeout(
-        &["pull", "--ff-only", "--no-rebase", remote, branch],
+        &["pull", "--ff-only", "--no-rebase", "--", &remote, branch],
         timeout,
     )?;
     if pulled {
         return Ok(());
     }
 
-    let _ = run_git_with_timeout(&["fetch", remote, branch], timeout);
+    let _ = run_git_with_timeout(&["fetch", "--", &remote, branch], timeout);
     eprintln!(
         "{} auto-fetch failed; using local vault",
         "info:".cyan().bold()
@@ -65,6 +65,19 @@ pub fn auto_fetch_enabled(config: &VaultConfig, env_override: Option<&str>) -> b
         return false;
     }
     config.auto_fetch_on_run
+}
+
+/// Resolves and validates the configured auto-fetch remote. The value comes
+/// from the committed `vault.toml` (attacker-controlled by anyone with write
+/// access to the repo), so option-shaped values are rejected here even if a
+/// tampered vault bypassed the `dl config set` validation (H1).
+pub fn resolve_remote(config: &VaultConfig) -> DotLockResult<String> {
+    let remote = config
+        .auto_fetch_remote
+        .as_deref()
+        .unwrap_or(DEFAULT_REMOTE);
+    validate_git_ref_component("auto_fetch_remote", remote)?;
+    Ok(remote.to_string())
 }
 
 pub fn timeout_secs(config: &VaultConfig) -> u64 {
@@ -127,7 +140,7 @@ fn run_git_with_timeout(args: &[&str], timeout: Duration) -> DotLockResult<bool>
 mod tests {
     use crate::{
         crypto::VaultConfig,
-        git::fetch::{auto_fetch_enabled, timeout_secs},
+        git::fetch::{auto_fetch_enabled, resolve_remote, timeout_secs},
     };
 
     #[test]
@@ -144,6 +157,27 @@ mod tests {
         assert!(!auto_fetch_enabled(&config, Some("0")));
         assert!(!auto_fetch_enabled(&config, Some("false")));
         assert!(!auto_fetch_enabled(&VaultConfig::default(), None));
+    }
+
+    #[test]
+    fn option_shaped_remote_is_neutralized_before_any_git_invocation() {
+        let config = VaultConfig {
+            auto_fetch_remote: Some("--upload-pack=/tmp/evil".to_string()),
+            ..VaultConfig::default()
+        };
+
+        assert!(resolve_remote(&config).is_err());
+        assert!(
+            resolve_remote(&VaultConfig {
+                auto_fetch_remote: Some("-r".to_string()),
+                ..VaultConfig::default()
+            })
+            .is_err()
+        );
+        assert_eq!(
+            resolve_remote(&VaultConfig::default()).expect("default remote"),
+            "origin"
+        );
     }
 
     #[test]

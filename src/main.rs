@@ -278,10 +278,15 @@ enum AuditCommand {
         #[arg(long)]
         action: Option<String>,
     },
-    /// Verify audit hash-chain and signatures
+    /// Verify audit hash-chain and signatures (strict by default: anonymous
+    /// entries and an unsigned high-water mark fail verification)
     #[command(alias = "v")]
     Verify {
+        /// Accept anonymous/unsigned entries and an unsigned high-water mark
         #[arg(long)]
+        lax: bool,
+        /// Deprecated: strict verification is now the default
+        #[arg(long, hide = true)]
         strict: bool,
     },
     /// Print the current audit log path
@@ -501,7 +506,7 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
                 since,
                 action,
             } => show_entries(verbose, since.as_deref(), action.as_deref()),
-            AuditCommand::Verify { strict } => verify_log(strict),
+            AuditCommand::Verify { lax, strict: _ } => verify_log(!lax),
             AuditCommand::Path => {
                 println!("{}", audit_log_path()?.display());
                 Ok(())
@@ -741,9 +746,13 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
                 println!(
                     "     {} {}",
                     "private".dimmed(),
-                    private_key_path().display()
+                    private_key_path()?.display()
                 );
-                println!("     {} {}", "public".dimmed(), public_key_path().display());
+                println!(
+                    "     {} {}",
+                    "public".dimmed(),
+                    public_key_path()?.display()
+                );
                 Ok(())
             }
             CertCommand::Show => {
@@ -756,12 +765,12 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
                 println!(
                     "{} {}",
                     "private:".cyan().bold(),
-                    private_key_path().display()
+                    private_key_path()?.display()
                 );
                 println!(
                     "{} {}",
                     "public:".cyan().bold(),
-                    public_key_path().display()
+                    public_key_path()?.display()
                 );
                 Ok(())
             }
@@ -949,7 +958,10 @@ fn print_merge_diff(marker: &PendingMergeMarker) {
         "info:".cyan().bold()
     );
     if marker.added.is_empty() && marker.changed.is_empty() && marker.removed.is_empty() {
-        println!("     {} vault metadata merged (no secret changes)", "info:".cyan().bold());
+        println!(
+            "     {} vault metadata merged (no secret changes)",
+            "info:".cyan().bold()
+        );
     }
     for name in &marker.added {
         println!("     {} {}", "added".green().bold(), name.bold());

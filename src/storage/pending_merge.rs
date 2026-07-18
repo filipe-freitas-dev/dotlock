@@ -14,10 +14,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    crypto::{
-        integrity::file_sha256_b64,
-        sdk,
-    },
+    crypto::{integrity::file_sha256_b64, sdk},
     domain::{error::DotLockError, model::DotLockResult},
     storage::{
         secrets_lock::{current_unix_timestamp, load_secrets_file, refresh_vault_hash},
@@ -173,9 +170,8 @@ pub fn reconcile_pending_merge(
     lock_dir: &Path,
     dek: &[u8; 32],
 ) -> DotLockResult<()> {
-    let marker = load_marker(lock_dir)?.ok_or_else(|| {
-        DotLockError::Io("no pending merge to reconcile".to_string())
-    })?;
+    let marker = load_marker(lock_dir)?
+        .ok_or_else(|| DotLockError::Io("no pending merge to reconcile".to_string()))?;
     verify_marker_matches_files(&marker, vault_path, secrets_path)?;
 
     let metadata = load_vault_metadata(vault_path)?;
@@ -195,9 +191,9 @@ pub fn reconcile_pending_merge(
         }
     }
 
-    let vault_path_str = vault_path.to_str().ok_or_else(|| {
-        DotLockError::Io("vault path is not valid UTF-8".to_string())
-    })?;
+    let vault_path_str = vault_path
+        .to_str()
+        .ok_or_else(|| DotLockError::Io("vault path is not valid UTF-8".to_string()))?;
     refresh_vault_hash(secrets_path, dek, vault_path_str)?;
     remove_marker(lock_dir)
 }

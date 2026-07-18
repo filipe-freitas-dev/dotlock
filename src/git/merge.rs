@@ -529,7 +529,11 @@ mod driver_tests {
             let vault = dir.join("vault.toml");
             let secrets = dir.join("secrets.lock");
             save_vault_metadata(&vault, &metadata()).expect("save vault");
-            Self { dir, vault, secrets }
+            Self {
+                dir,
+                vault,
+                secrets,
+            }
         }
 
         fn copy_to(&self, name: &str) -> Self {
@@ -538,7 +542,11 @@ mod driver_tests {
             let secrets = dir.join("secrets.lock");
             fs::copy(&self.vault, &vault).expect("copy vault");
             fs::copy(&self.secrets, &secrets).expect("copy secrets");
-            Self { dir, vault, secrets }
+            Self {
+                dir,
+                vault,
+                secrets,
+            }
         }
 
         fn set(&self, name: &str, value: &str) {
@@ -573,7 +581,11 @@ mod driver_tests {
 
     /// Runs both file merges the way git drives them: `secrets.lock` first
     /// (index order), then `vault.toml`, with `ours` seeded as the result file.
-    fn run_driver(ours: &Vault, theirs: &Vault, base: &Vault) -> crate::domain::model::DotLockResult<()> {
+    fn run_driver(
+        ours: &Vault,
+        theirs: &Vault,
+        base: &Vault,
+    ) -> crate::domain::model::DotLockResult<()> {
         super::merge_secrets_lock(&ours.secrets, &theirs.secrets, &base.secrets, &ours.dir)?;
         super::merge_vault_metadata(&ours.vault, &theirs.vault, &base.vault, &ours.dir)
     }
@@ -718,8 +730,7 @@ mod driver_tests {
         let metadata = load_vault_metadata(&ours.vault).expect("load merged vault");
         assert!(verify_secrets_integrity(&ours.secrets, &metadata, &DEK).is_err());
 
-        reconcile_pending_merge(&ours.vault, &ours.secrets, &ours.dir, &DEK)
-            .expect("reconcile");
+        reconcile_pending_merge(&ours.vault, &ours.secrets, &ours.dir, &DEK).expect("reconcile");
 
         assert!(load_marker(&ours.dir).expect("load marker").is_none());
         ensure_no_pending_merge(&ours.dir).expect("marker removed");

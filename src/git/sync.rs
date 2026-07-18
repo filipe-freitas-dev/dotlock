@@ -6,6 +6,7 @@ use std::{
 use crate::{
     crypto::VaultConfig,
     domain::{error::DotLockError, model::DotLockResult},
+    git::validate_git_ref_component,
     storage::vault_file::load_vault_metadata,
 };
 
@@ -36,13 +37,16 @@ pub enum RefState {
 
 pub fn sync_with_remote(vault_path: &str) -> DotLockResult<SyncSummary> {
     let metadata = load_vault_metadata(vault_path)?;
-    let remote = sync_remote(&metadata.config).to_string();
+    let remote = sync_remote(&metadata.config)?;
 
     ensure_git_work_tree()?;
     ensure_vault_clean()?;
 
     let branch = current_branch()?;
-    run_git(["fetch", &remote, &branch])?;
+    validate_git_ref_component("branch", &branch)?;
+    // `--` ends option parsing so a hostile remote/branch value can never be
+    // interpreted by git as an option such as `--upload-pack=<cmd>` (H1).
+    run_git(["fetch", "--", &remote, &branch])?;
 
     let local = git_output(["rev-parse", "HEAD"])?
         .ok_or_else(|| DotLockError::Io("could not resolve local Git HEAD for sync".to_string()))?;
@@ -64,7 +68,7 @@ pub fn sync_with_remote(vault_path: &str) -> DotLockResult<SyncSummary> {
             status: SyncStatus::UpToDate,
         }),
         RefState::Behind => {
-            run_git(["pull", "--ff-only", "--no-rebase", &remote, &branch])?;
+            run_git(["pull", "--ff-only", "--no-rebase", "--", &remote, &branch])?;
             Ok(SyncSummary {
                 remote,
                 branch,
@@ -94,11 +98,16 @@ pub fn classify_refs(equal: bool, local_is_ancestor: bool, remote_is_ancestor: b
     }
 }
 
-fn sync_remote(config: &VaultConfig) -> &str {
-    config
+fn sync_remote(config: &VaultConfig) -> DotLockResult<String> {
+    let remote = config
         .auto_fetch_remote
         .as_deref()
-        .unwrap_or(DEFAULT_REMOTE)
+        .unwrap_or(DEFAULT_REMOTE);
+    // `auto_fetch_remote` lives in the committed `vault.toml` and is
+    // attacker-controlled by anyone with write access to the repo; reject
+    // option-shaped values before they ever reach a git invocation (H1).
+    validate_git_ref_component("auto_fetch_remote", remote)?;
+    Ok(remote.to_string())
 }
 
 fn ensure_git_work_tree() -> DotLockResult<()> {

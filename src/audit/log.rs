@@ -15,7 +15,8 @@ use crate::{
     crypto::share::sign_audit_entry_hash,
     domain::{error::DotLockError, model::DotLockResult},
     storage::{
-        identity::{load_local_identity, load_local_identity_metadata},
+        identity::{load_local_identity, load_local_identity_metadata, session_signer},
+        paths::dotlock_data_root,
         secure_fs,
         vault_file::load_vault_metadata,
     },
@@ -23,6 +24,7 @@ use crate::{
 
 const AUDIT_DIR: &str = "audit";
 const AUDIT_FILE: &str = "audit.log";
+const HWM_FILE: &str = "hwm.toml";
 const ZERO_HASH: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,9 +48,56 @@ struct HashMaterial<'a> {
     prev_hash: &'a str,
 }
 
+/// Signed monotonic high-water mark for the audit log: total entry count
+/// (across rotated logs) plus the hash of the newest entry. Deleting the last
+/// N entries leaves a log shorter than the recorded count, which `dl audit
+/// verify` rejects (tail-truncation detection, H4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditHighWaterMark {
+    pub count: u64,
+    pub head_hash: String,
+    #[serde(default)]
+    pub signer_fingerprint: String,
+    #[serde(default)]
+    pub signature: String,
+}
+
+pub fn hwm_material(count: u64, head_hash: &str) -> String {
+    format!("dotlock:v1:audit-hwm:count={count}:head={head_hash}")
+}
+
+pub fn load_high_water_mark(log_path: &Path) -> DotLockResult<Option<AuditHighWaterMark>> {
+    let Some(parent) = log_path.parent() else {
+        return Ok(None);
+    };
+    let path = parent.join(HWM_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = secure_fs::read_to_string(&path)?;
+    let hwm = toml::from_str::<AuditHighWaterMark>(&content)
+        .map_err(|e| DotLockError::Crypto(format!("failed to parse audit high-water mark: {e}")))?;
+    Ok(Some(hwm))
+}
+
+fn store_high_water_mark(log_path: &Path, count: u64, head_hash: &str) -> DotLockResult<()> {
+    let Some(parent) = log_path.parent() else {
+        return Ok(());
+    };
+    let (signer_fingerprint, signature) = sign_entry_best_effort(&hwm_material(count, head_hash));
+    let hwm = AuditHighWaterMark {
+        count,
+        head_hash: head_hash.to_string(),
+        signer_fingerprint,
+        signature,
+    };
+    let content = toml::to_string(&hwm).map_err(|e| DotLockError::Crypto(e.to_string()))?;
+    secure_fs::write_string_atomic(&parent.join(HWM_FILE), &content, 0o700, 0o600)
+}
+
 pub fn audit_log_path() -> DotLockResult<PathBuf> {
     let metadata = load_vault_metadata(".lock/vault.toml")?;
-    Ok(audit_root().join(metadata.project_uuid).join(AUDIT_FILE))
+    Ok(audit_root()?.join(metadata.project_uuid).join(AUDIT_FILE))
 }
 
 pub fn append_entry(action: &str, payload: Value) -> DotLockResult<()> {
@@ -61,7 +110,21 @@ pub fn append_entry(action: &str, payload: Value) -> DotLockResult<()> {
     rotate_if_needed(&path)?;
     secure_fs::reject_symlink(&path)?;
 
-    let prev_hash = last_entry_hash_across_logs(&path)?.unwrap_or_else(|| ZERO_HASH.to_string());
+    let existing = read_all_entries(&path)?;
+    let prev_hash = existing
+        .last()
+        .map(|entry| entry.entry_hash.clone())
+        .unwrap_or_else(|| ZERO_HASH.to_string());
+    let count = existing.len() as u64 + 1;
+    if let Some(hwm) = load_high_water_mark(&path)?
+        && hwm.count > count
+    {
+        return Err(DotLockError::Crypto(format!(
+            "audit log has fewer entries ({}) than the recorded high-water mark ({}); the log tail was truncated",
+            count - 1,
+            hwm.count
+        )));
+    }
     let ts = now_secs();
     let entry_hash = compute_entry_hash(ts, action, &payload, &prev_hash)?;
     let (signer_fingerprint, signature) = sign_entry_best_effort(&entry_hash);
@@ -71,7 +134,7 @@ pub fn append_entry(action: &str, payload: Value) -> DotLockResult<()> {
         action: action.to_string(),
         payload,
         prev_hash,
-        entry_hash,
+        entry_hash: entry_hash.clone(),
         signer_fingerprint,
         signature,
     };
@@ -91,6 +154,7 @@ pub fn append_entry(action: &str, payload: Value) -> DotLockResult<()> {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     }
     writeln!(file, "{line}").map_err(DotLockError::from)?;
+    store_high_water_mark(&path, count, &entry_hash)?;
     Ok(())
 }
 
@@ -232,11 +296,6 @@ pub fn compute_entry_hash(
     Ok(format!("sha256:{}", hex_lower(&Sha256::digest(bytes))))
 }
 
-fn last_entry_hash_across_logs(path: &Path) -> DotLockResult<Option<String>> {
-    let entries = read_all_entries(path)?;
-    Ok(entries.last().map(|entry| entry.entry_hash.clone()))
-}
-
 fn audit_log_paths(path: &Path) -> DotLockResult<Vec<PathBuf>> {
     let Some(parent) = path.parent() else {
         return Ok(Vec::new());
@@ -298,7 +357,16 @@ fn open_log_reader(path: &Path) -> DotLockResult<Box<dyn Read>> {
     Ok(Box::new(Cursor::new(output.stdout)))
 }
 
-fn sign_entry_best_effort(entry_hash: &str) -> (String, String) {
+pub(crate) fn sign_entry_best_effort(entry_hash: &str) -> (String, String) {
+    // Prefer the in-memory session signer: it is populated whenever a local
+    // identity is loaded (and decrypted, for passphrase-encrypted ones), so
+    // encrypted identities sign audit entries instead of writing anonymous
+    // ones (H4).
+    if let Some(identity) = session_signer()
+        && let Ok(signature) = sign_audit_entry_hash(entry_hash, &identity.private_key_pem)
+    {
+        return (identity.fingerprint, signature);
+    }
     let Ok(metadata) = load_local_identity_metadata() else {
         return ("anonymous".to_string(), String::new());
     };
@@ -314,26 +382,15 @@ fn sign_entry_best_effort(entry_hash: &str) -> (String, String) {
     }
 }
 
-fn audit_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("DOTLOCK_AUDIT_DIR") {
-        return PathBuf::from(dir);
-    }
-
-    #[cfg(not(windows))]
+/// Audit-root resolution hard-fails when no home/config directory resolves:
+/// audit logs must never be written into a committable `./.lock` (H6).
+fn audit_root() -> DotLockResult<PathBuf> {
+    if let Ok(dir) = std::env::var("DOTLOCK_AUDIT_DIR")
+        && !dir.trim().is_empty()
     {
-        if let Ok(home) = std::env::var("HOME") {
-            return Path::new(&home).join(".lock").join(AUDIT_DIR);
-        }
+        return Ok(PathBuf::from(dir));
     }
-
-    #[cfg(windows)]
-    {
-        if let Ok(dir) = std::env::var("LOCALAPPDATA") {
-            return Path::new(&dir).join("dotlock").join(AUDIT_DIR);
-        }
-    }
-
-    PathBuf::from(".").join(".lock").join(AUDIT_DIR)
+    Ok(dotlock_data_root()?.join(AUDIT_DIR))
 }
 
 fn summarize_payload(payload: &Value) -> String {
@@ -414,7 +471,17 @@ fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::compute_entry_hash;
+    use super::{compute_entry_hash, sign_entry_best_effort};
+    use crate::{
+        crypto::share::{IdentityProtection, generate_identity, verify_audit_entry_hash_signature},
+        storage::{
+            identity::{
+                LocalIdentity, LocalIdentityMetadata, clear_session_signer,
+                register_session_signer, test_identity_env_lock,
+            },
+            secure_fs,
+        },
+    };
 
     #[test]
     fn entry_hash_changes_when_payload_changes() {
@@ -430,5 +497,54 @@ mod tests {
         let second = compute_entry_hash(1, "run", &json!({"cmd":["a"]}), "sha256:1").expect("hash");
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn session_signer_signs_entries_even_when_disk_identity_is_encrypted() {
+        let _guard = test_identity_env_lock().lock().expect("lock");
+        // Simulate the default setup: the on-disk identity is passphrase
+        // encrypted (which previously always produced anonymous entries).
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("dotlock-audit-signer-{unique}"));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let meta = LocalIdentityMetadata {
+            fingerprint: "encrypted-fp".to_string(),
+            encrypted: true,
+        };
+        let content = toml::to_string_pretty(&meta).expect("meta");
+        secure_fs::write_string_atomic(&dir.join("identity.toml"), &content, 0o700, 0o600)
+            .expect("write meta");
+        unsafe {
+            std::env::set_var("DOTLOCK_IDENTITY_DIR", &dir);
+        }
+
+        clear_session_signer();
+        // Without an unlocked signer in memory, encrypted identities fall
+        // back to anonymous entries.
+        let (fingerprint, signature) = sign_entry_best_effort("sha256:test");
+        assert_eq!(fingerprint, "anonymous");
+        assert!(signature.is_empty());
+
+        // Once the identity is unlocked during the command, its decrypted
+        // key signs audit entries in memory.
+        let generated = generate_identity(IdentityProtection::Plain).expect("identity");
+        register_session_signer(&LocalIdentity {
+            fingerprint: generated.fingerprint.clone(),
+            private_key_pem: generated.private_key_pem.clone(),
+            public_key_pem: generated.public_key_pem.clone(),
+        });
+        let (fingerprint, signature) = sign_entry_best_effort("sha256:test");
+        assert_eq!(fingerprint, generated.fingerprint);
+        verify_audit_entry_hash_signature("sha256:test", &signature, &generated.public_key_pem)
+            .expect("signature verifies");
+
+        clear_session_signer();
+        unsafe {
+            std::env::remove_var("DOTLOCK_IDENTITY_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

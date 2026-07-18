@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::{
     crypto::VaultConfig,
     domain::{error::DotLockError, model::DotLockResult},
+    git::validate_git_ref_component,
     storage::vault_file::{load_vault_metadata, record_vault_write, save_vault_metadata},
 };
 
@@ -73,12 +74,11 @@ fn set_config_field(config: &mut VaultConfig, key: &str, value: &str) -> DotLock
             Ok(())
         }
         "auto_fetch_remote" => {
-            if value.trim().is_empty() {
-                return Err(DotLockError::Io(
-                    "auto_fetch_remote cannot be empty".to_string(),
-                ));
-            }
-            config.auto_fetch_remote = Some(value.to_string());
+            // Reject option-shaped values (e.g. `--upload-pack=<cmd>`) at
+            // config-set time; the git invocation sites validate again in
+            // case a tampered vault.toml bypassed this path (H1).
+            validate_git_ref_component("auto_fetch_remote", value.trim())?;
+            config.auto_fetch_remote = Some(value.trim().to_string());
             Ok(())
         }
         "auto_ratchet_after_writes" => {
@@ -212,6 +212,23 @@ mod tests {
         unset_config_value(&path, "auto_fetch_remote").expect("unset remote");
         let metadata = load_vault_metadata(&path).expect("load metadata again");
 
+        assert_eq!(metadata.config.auto_fetch_remote, None);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_option_injection_in_auto_fetch_remote() {
+        let path = temp_file("remote-injection");
+        save_vault_metadata(&path, &metadata()).expect("save metadata");
+
+        for value in ["--upload-pack=/tmp/evil", "-r", "ext::sh -c id", ""] {
+            assert!(
+                set_config_value(&path, "auto_fetch_remote", value).is_err(),
+                "should reject `{value}`"
+            );
+        }
+        let metadata = load_vault_metadata(&path).expect("load metadata");
         assert_eq!(metadata.config.auto_fetch_remote, None);
 
         let _ = fs::remove_file(path);
