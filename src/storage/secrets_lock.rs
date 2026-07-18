@@ -10,20 +10,24 @@ use uuid::Uuid;
 use crate::{
     crypto::{
         AccessMode,
-        integrity::{build_encrypted_hash_fields, file_sha256_b64},
+        integrity::{
+            build_encrypted_hash_fields, build_encrypted_hash_fields_from_bytes, bytes_sha256_b64,
+            file_sha256_b64,
+        },
         sdk,
         secret_cipher::{decryption_process, encryption_process},
         share::{unwrap_dek_with_private_key, wrap_dek_for_public_key_b64},
     },
     domain::{
         error::DotLockError,
-        model::{Alg, DataEncrypted, DotLockResult},
+        model::{Alg, DotLockResult},
     },
     storage::{
         identity::{load_local_identity, load_local_identity_metadata},
         project::SECRETS_FILE,
         secure_fs,
-        vault_file::{load_vault_metadata, record_vault_write, save_vault_metadata},
+        vault_file::{load_vault_metadata, record_vault_write},
+        vault_txn::{VaultPairWrite, commit_vault_pair},
     },
 };
 
@@ -133,11 +137,36 @@ fn migrate_legacy_secret_algorithms(file: &mut SecretsFile) -> DotLockResult<()>
     Ok(())
 }
 
-fn write_secrets_file<P: AsRef<Path>>(path: P, file: &SecretsFile) -> DotLockResult<()> {
-    let path = path.as_ref();
+fn serialize_secrets_file(file: &SecretsFile) -> DotLockResult<String> {
+    toml::to_string_pretty(file).map_err(|e| DotLockError::Crypto(e.to_string()))
+}
 
-    let content = toml::to_string_pretty(file).map_err(|e| DotLockError::Crypto(e.to_string()))?;
-    secure_fs::write_string_atomic(path, &content, 0o700, 0o600)
+/// Finalizes both states in memory (secrets bytes + metadata with the
+/// recomputed `secrets_hash_*`) and commits them as one transaction. Every
+/// mutator of the vault pair MUST route its writes through here.
+fn commit_secrets_and_metadata(
+    secrets_path: &Path,
+    file: &mut SecretsFile,
+    metadata: &mut crate::crypto::VaultKeyMetadata,
+    dek: &[u8; 32],
+    vault_path: &str,
+) -> DotLockResult<()> {
+    migrate_legacy_secret_algorithms(file)?;
+    let content = serialize_secrets_file(file)?;
+    let bytes = content.as_bytes();
+    let (nonce_b64, hash_b64) = build_encrypted_hash_fields_from_bytes(bytes, dek)?;
+    metadata.secrets_hash_nonce_b64 = nonce_b64;
+    metadata.secrets_hash_b64 = hash_b64;
+    metadata.secrets_hash_sha256_b64 = bytes_sha256_b64(bytes);
+    record_vault_write(metadata);
+    commit_vault_pair(
+        Path::new(vault_path),
+        secrets_path,
+        VaultPairWrite {
+            metadata,
+            secrets_lock_bytes: Some(bytes),
+        },
+    )
 }
 
 pub fn save_secrets_file<P: AsRef<Path>>(
@@ -148,9 +177,8 @@ pub fn save_secrets_file<P: AsRef<Path>>(
 ) -> DotLockResult<()> {
     let mut file = file.clone();
     migrate_legacy_secret_timestamps(&mut file);
-    migrate_legacy_secret_algorithms(&mut file)?;
-    write_secrets_file(path.as_ref(), &file)?;
-    refresh_vault_hash(path.as_ref(), dek, vault_path)
+    let mut metadata = load_vault_metadata(vault_path)?;
+    commit_secrets_and_metadata(path.as_ref(), &mut file, &mut metadata, dek, vault_path)
 }
 
 pub fn refresh_vault_hash(
@@ -164,43 +192,75 @@ pub fn refresh_vault_hash(
     metadata.secrets_hash_b64 = hash_b64;
     metadata.secrets_hash_sha256_b64 = file_sha256_b64(secrets_path)?;
     record_vault_write(&mut metadata);
-    save_vault_metadata(vault_path, &metadata)
+    commit_vault_pair(
+        Path::new(vault_path),
+        secrets_path,
+        VaultPairWrite {
+            metadata: &metadata,
+            secrets_lock_bytes: None,
+        },
+    )
 }
 
-#[allow(dead_code)]
-pub fn upsert_secret<P: AsRef<Path>>(
-    path: P,
-    encrypted: DataEncrypted<'_>,
+/// Shared core of the upsert paths: resolves (or mints) the per-secret SDK,
+/// encrypts the payload, updates the record in `file`, and registers the SDK
+/// wrapping in the metadata (project key + full-access recipients).
+fn upsert_record(
+    file: &mut SecretsFile,
+    metadata: &mut crate::crypto::VaultKeyMetadata,
+    name: String,
+    plaintext: String,
+    alg: Alg,
+    kind: SecretKind,
     dek: &[u8; 32],
-    vault_path: &str,
-) -> DotLockResult<()> {
-    let path = path.as_ref();
-    let mut file = load_secrets_file(path)?;
-
-    let data_str =
-        String::from_utf8(encrypted.data).map_err(|e| DotLockError::Crypto(e.to_string()))?;
-
-    if let Some(existing) = file
-        .secrets
-        .iter_mut()
-        .find(|secret| secret.name == encrypted.name)
-    {
-        existing.alg = None;
-        existing.data = data_str;
-        existing.updated_at = current_unix_timestamp();
-        existing.kind = SecretKind::Static;
+) -> DotLockResult<(SecretRecord, bool)> {
+    let now = current_unix_timestamp();
+    let existing_index = file.secrets.iter().position(|secret| secret.name == name);
+    let (record_id, sdk) = if let Some(index) = existing_index {
+        let existing = &file.secrets[index];
+        let sdk = secret_sdk_from_project_key(metadata, existing, dek)?.unwrap_or(*dek);
+        (existing.id.clone(), sdk)
     } else {
-        file.secrets.push(SecretRecord {
-            id: Uuid::new_v4().to_string(),
+        (Uuid::new_v4().to_string(), sdk::generate_sdk()?)
+    };
+
+    let encrypted = encryption_process(name, plaintext, alg, &sdk)?;
+    let data =
+        String::from_utf8(encrypted.data).map_err(|err| DotLockError::Crypto(err.to_string()))?;
+
+    let (record, created) = if let Some(index) = existing_index {
+        let existing = &mut file.secrets[index];
+        existing.alg = None;
+        existing.data = data;
+        existing.updated_at = now;
+        existing.kind = kind;
+        (existing.clone(), false)
+    } else {
+        let record = SecretRecord {
+            id: record_id,
             name: encrypted.name,
             alg: None,
-            data: data_str,
-            updated_at: current_unix_timestamp(),
-            kind: SecretKind::Static,
-        });
+            data,
+            updated_at: now,
+            kind,
+        };
+        file.secrets.push(record.clone());
+        (record, true)
+    };
+
+    metadata
+        .wrapped_sdks_under_kek
+        .insert(record.id.clone(), sdk::wrap_sdk_for_project_key(&sdk, dek)?);
+    for recipient in &mut metadata.recipients {
+        if recipient.full_access {
+            recipient.wrapped_sdks.insert(
+                record.id.clone(),
+                wrap_dek_for_public_key_b64(&sdk, &recipient.public_key_b64)?,
+            );
+        }
     }
 
-    save_secrets_file(path, &file, dek, vault_path)
+    Ok((record, created))
 }
 
 pub fn upsert_plain_secret<P: AsRef<Path>>(
@@ -217,61 +277,18 @@ pub fn upsert_plain_secret<P: AsRef<Path>>(
     metadata.version = metadata.version.max(5);
     reject_limited_identity_write(&metadata)?;
 
-    let now = current_unix_timestamp();
-    let (record_id, sdk) = if let Some(existing) =
-        file.secrets.iter().find(|secret| secret.name == name)
-    {
-        let sdk = secret_sdk_from_project_key(&metadata, existing, dek)?.unwrap_or_else(|| *dek);
-        (existing.id.clone(), sdk)
-    } else {
-        (Uuid::new_v4().to_string(), sdk::generate_sdk()?)
-    };
-
-    let encrypted = encryption_process(name.clone(), value, alg, &sdk)?;
-    let data =
-        String::from_utf8(encrypted.data).map_err(|err| DotLockError::Crypto(err.to_string()))?;
-
-    let record = if let Some(existing) = file.secrets.iter_mut().find(|secret| secret.name == name)
-    {
-        existing.alg = None;
-        existing.data = data;
-        existing.updated_at = now;
-        existing.kind = SecretKind::Static;
-        existing.clone()
-    } else {
-        let record = SecretRecord {
-            id: record_id,
-            name: encrypted.name,
-            alg: None,
-            data,
-            updated_at: now,
-            kind: SecretKind::Static,
-        };
-        file.secrets.push(record.clone());
-        record
-    };
-
-    metadata
-        .wrapped_sdks_under_kek
-        .insert(record.id.clone(), sdk::wrap_sdk_for_project_key(&sdk, dek)?);
-    for recipient in &mut metadata.recipients {
-        if recipient.full_access {
-            recipient.wrapped_sdks.insert(
-                record.id.clone(),
-                wrap_dek_for_public_key_b64(&sdk, &recipient.public_key_b64)?,
-            );
-        }
-    }
+    let (record, _) = upsert_record(
+        &mut file,
+        &mut metadata,
+        name,
+        value,
+        alg,
+        SecretKind::Static,
+        dek,
+    )?;
 
     migrate_legacy_secret_timestamps(&mut file);
-    migrate_legacy_secret_algorithms(&mut file)?;
-    write_secrets_file(path, &file)?;
-    let (nonce_b64, hash_b64) = build_encrypted_hash_fields(path, dek)?;
-    metadata.secrets_hash_nonce_b64 = nonce_b64;
-    metadata.secrets_hash_b64 = hash_b64;
-    metadata.secrets_hash_sha256_b64 = file_sha256_b64(path)?;
-    record_vault_write(&mut metadata);
-    save_vault_metadata(vault_path, &metadata)?;
+    commit_secrets_and_metadata(path, &mut file, &mut metadata, dek, vault_path)?;
 
     Ok(record)
 }
@@ -344,14 +361,13 @@ pub fn migrate_all_secrets_to_envelope(dek: &[u8; 32], vault_path: &str) -> DotL
     }
 
     metadata.version = metadata.version.max(5);
-    migrate_legacy_secret_algorithms(&mut file)?;
-    write_secrets_file(SECRETS_FILE, &file)?;
-    let (nonce_b64, hash_b64) = build_encrypted_hash_fields(SECRETS_FILE, dek)?;
-    metadata.secrets_hash_nonce_b64 = nonce_b64;
-    metadata.secrets_hash_b64 = hash_b64;
-    metadata.secrets_hash_sha256_b64 = file_sha256_b64(SECRETS_FILE)?;
-    record_vault_write(&mut metadata);
-    save_vault_metadata(vault_path, &metadata)
+    commit_secrets_and_metadata(
+        Path::new(SECRETS_FILE),
+        &mut file,
+        &mut metadata,
+        dek,
+        vault_path,
+    )
 }
 
 pub fn rotate_secret_sdks_after_acl_removal(
@@ -422,14 +438,13 @@ pub fn rotate_secret_sdks_after_acl_removal(
         }
     }
 
-    migrate_legacy_secret_algorithms(&mut file)?;
-    write_secrets_file(SECRETS_FILE, &file)?;
-    let (nonce_b64, hash_b64) = build_encrypted_hash_fields(SECRETS_FILE, dek)?;
-    metadata.secrets_hash_nonce_b64 = nonce_b64;
-    metadata.secrets_hash_b64 = hash_b64;
-    metadata.secrets_hash_sha256_b64 = file_sha256_b64(SECRETS_FILE)?;
-    record_vault_write(&mut metadata);
-    save_vault_metadata(vault_path, &metadata)
+    commit_secrets_and_metadata(
+        Path::new(SECRETS_FILE),
+        &mut file,
+        &mut metadata,
+        dek,
+        vault_path,
+    )
 }
 
 pub fn decrypt_secret_value(secret: &SecretRecord, dek: &[u8; 32]) -> DotLockResult<String> {
@@ -533,67 +548,24 @@ pub fn upsert_many<P: AsRef<Path>>(
     };
 
     for entry in entries {
-        let existing_index = file
-            .secrets
-            .iter()
-            .position(|secret| secret.name == entry.name);
-        let (record_id, sdk) = if let Some(index) = existing_index {
-            let existing = &file.secrets[index];
-            let sdk =
-                secret_sdk_from_project_key(&metadata, existing, dek)?.unwrap_or_else(|| *dek);
-            (existing.id.clone(), sdk)
-        } else {
-            (Uuid::new_v4().to_string(), sdk::generate_sdk()?)
-        };
-        let encrypted = encryption_process(entry.name.clone(), entry.value, entry.alg, &sdk)?;
-        let data = String::from_utf8(encrypted.data)
-            .map_err(|err| DotLockError::Crypto(err.to_string()))?;
-        let now = current_unix_timestamp();
-
-        let record = if let Some(index) = existing_index {
-            let existing = &mut file.secrets[index];
-            existing.alg = None;
-            existing.data = data;
-            existing.updated_at = now;
-            existing.kind = SecretKind::Static;
-            summary.updated += 1;
-            existing.clone()
-        } else {
-            let record = SecretRecord {
-                id: record_id,
-                name: encrypted.name,
-                alg: None,
-                data,
-                updated_at: now,
-                kind: SecretKind::Static,
-            };
-            file.secrets.push(record.clone());
+        let (_, created) = upsert_record(
+            &mut file,
+            &mut metadata,
+            entry.name,
+            entry.value,
+            entry.alg,
+            SecretKind::Static,
+            dek,
+        )?;
+        if created {
             summary.created += 1;
-            record
-        };
-
-        metadata
-            .wrapped_sdks_under_kek
-            .insert(record.id.clone(), sdk::wrap_sdk_for_project_key(&sdk, dek)?);
-        for recipient in &mut metadata.recipients {
-            if recipient.full_access {
-                recipient.wrapped_sdks.insert(
-                    record.id.clone(),
-                    wrap_dek_for_public_key_b64(&sdk, &recipient.public_key_b64)?,
-                );
-            }
+        } else {
+            summary.updated += 1;
         }
     }
 
     migrate_legacy_secret_timestamps(&mut file);
-    migrate_legacy_secret_algorithms(&mut file)?;
-    write_secrets_file(path, &file)?;
-    let (nonce_b64, hash_b64) = build_encrypted_hash_fields(path, dek)?;
-    metadata.secrets_hash_nonce_b64 = nonce_b64;
-    metadata.secrets_hash_b64 = hash_b64;
-    metadata.secrets_hash_sha256_b64 = file_sha256_b64(path)?;
-    record_vault_write(&mut metadata);
-    save_vault_metadata(vault_path, &metadata)?;
+    commit_secrets_and_metadata(path, &mut file, &mut metadata, dek, vault_path)?;
 
     Ok(summary)
 }
@@ -611,68 +583,25 @@ pub fn upsert_dynamic_secret<P: AsRef<Path>>(
     metadata.version = metadata.version.max(5);
     reject_limited_identity_write(&metadata)?;
 
-    let now = current_unix_timestamp();
-    let (record_id, sdk) = if let Some(existing) =
-        file.secrets.iter().find(|secret| secret.name == name)
-    {
-        let sdk = secret_sdk_from_project_key(&metadata, existing, dek)?.unwrap_or_else(|| *dek);
-        (existing.id.clone(), sdk)
-    } else {
-        (Uuid::new_v4().to_string(), sdk::generate_sdk()?)
-    };
-
     let dynamic_json =
         serde_json::to_string(&dynamic).map_err(|err| DotLockError::Crypto(err.to_string()))?;
-    let encrypted = encryption_process(name.clone(), dynamic_json, Alg::XChaCha20Poly1305, &sdk)?;
-    let data =
-        String::from_utf8(encrypted.data).map_err(|err| DotLockError::Crypto(err.to_string()))?;
-
     let kind = SecretKind::Dynamic {
         provider: None,
         config: None,
         bootstrap: Vec::new(),
     };
-    let record = if let Some(existing) = file.secrets.iter_mut().find(|secret| secret.name == name)
-    {
-        existing.alg = None;
-        existing.data = data;
-        existing.updated_at = now;
-        existing.kind = kind;
-        existing.clone()
-    } else {
-        let record = SecretRecord {
-            id: record_id,
-            name: encrypted.name,
-            alg: None,
-            data,
-            updated_at: now,
-            kind,
-        };
-        file.secrets.push(record.clone());
-        record
-    };
-
-    metadata
-        .wrapped_sdks_under_kek
-        .insert(record.id.clone(), sdk::wrap_sdk_for_project_key(&sdk, dek)?);
-    for recipient in &mut metadata.recipients {
-        if recipient.full_access {
-            recipient.wrapped_sdks.insert(
-                record.id.clone(),
-                wrap_dek_for_public_key_b64(&sdk, &recipient.public_key_b64)?,
-            );
-        }
-    }
+    let (record, _) = upsert_record(
+        &mut file,
+        &mut metadata,
+        name,
+        dynamic_json,
+        Alg::XChaCha20Poly1305,
+        kind,
+        dek,
+    )?;
 
     migrate_legacy_secret_timestamps(&mut file);
-    migrate_legacy_secret_algorithms(&mut file)?;
-    write_secrets_file(path, &file)?;
-    let (nonce_b64, hash_b64) = build_encrypted_hash_fields(path, dek)?;
-    metadata.secrets_hash_nonce_b64 = nonce_b64;
-    metadata.secrets_hash_b64 = hash_b64;
-    metadata.secrets_hash_sha256_b64 = file_sha256_b64(path)?;
-    record_vault_write(&mut metadata);
-    save_vault_metadata(vault_path, &metadata)?;
+    commit_secrets_and_metadata(path, &mut file, &mut metadata, dek, vault_path)?;
 
     Ok(record)
 }
@@ -734,14 +663,13 @@ pub fn remove_secret_by_name(name: &str, dek: &[u8; 32], vault_path: &str) -> Do
         }
     }
 
-    migrate_legacy_secret_algorithms(&mut file)?;
-    write_secrets_file(SECRETS_FILE, &file)?;
-    let (nonce_b64, hash_b64) = build_encrypted_hash_fields(SECRETS_FILE, dek)?;
-    metadata.secrets_hash_nonce_b64 = nonce_b64;
-    metadata.secrets_hash_b64 = hash_b64;
-    metadata.secrets_hash_sha256_b64 = file_sha256_b64(SECRETS_FILE)?;
-    record_vault_write(&mut metadata);
-    save_vault_metadata(vault_path, &metadata)
+    commit_secrets_and_metadata(
+        Path::new(SECRETS_FILE),
+        &mut file,
+        &mut metadata,
+        dek,
+        vault_path,
+    )
 }
 
 #[cfg(test)]
@@ -966,5 +894,78 @@ updated_at = 1
         assert_eq!(metadata.bootstrap, vec!["AWS_KEY"]);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn crash_during_upsert_never_yields_tampered_secrets_file() {
+        use crate::{
+            crypto::integrity::verify_secrets_integrity,
+            storage::vault_txn::{CrashPoint, recover_pending, test_hooks},
+        };
+
+        for point in [
+            CrashPoint::AfterTemps,
+            CrashPoint::AfterJournal,
+            CrashPoint::AfterVaultRename,
+            CrashPoint::AfterSecretsRename,
+        ] {
+            let dir = temp_dir("crash-upsert");
+            let secrets_path = dir.join("secrets.lock");
+            let vault_path = dir.join("vault.toml");
+            let vault_path_str = vault_path.to_str().expect("vault path");
+            let dek = [8u8; 32];
+            save_vault_metadata(&vault_path, &metadata()).expect("save vault");
+
+            // A first, fully committed secret.
+            upsert_plain_secret(
+                &secrets_path,
+                "FIRST".to_string(),
+                "one".to_string(),
+                Alg::XChaCha20Poly1305,
+                &dek,
+                vault_path_str,
+            )
+            .expect("first upsert");
+
+            // Second upsert crashes mid-commit.
+            test_hooks::set_crash_after(Some(point));
+            let result = upsert_plain_secret(
+                &secrets_path,
+                "SECOND".to_string(),
+                "two".to_string(),
+                Alg::XChaCha20Poly1305,
+                &dek,
+                vault_path_str,
+            );
+            test_hooks::set_crash_after(None);
+            assert!(result.is_err(), "crash at {point:?} must surface an error");
+
+            // A new process resolves the interrupted transaction on open...
+            recover_pending(&vault_path, &secrets_path).expect("recover");
+
+            // ...and the pair is consistent: integrity check passes (never
+            // TamperedSecretsFile) and every present secret is decryptable.
+            let recovered_metadata = load_vault_metadata(&vault_path).expect("load metadata");
+            verify_secrets_integrity(&secrets_path, &recovered_metadata, &dek)
+                .expect("integrity must hold after crash+recovery");
+
+            let file = load_secrets_file(&secrets_path).expect("load secrets");
+            assert!(
+                file.secrets.iter().any(|secret| secret.name == "FIRST"),
+                "committed secret lost after crash at {point:?}"
+            );
+            for secret in &file.secrets {
+                let wrapped = recovered_metadata
+                    .wrapped_sdks_under_kek
+                    .get(&secret.id)
+                    .expect("every secret must keep its SDK wrapping");
+                let sdk = crate::crypto::sdk::unwrap_sdk_with_project_key(wrapped, &dek)
+                    .expect("unwrap sdk");
+                decryption_process(secret.data.clone(), Alg::XChaCha20Poly1305, &sdk)
+                    .expect("secret must decrypt after crash+recovery");
+            }
+
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 }

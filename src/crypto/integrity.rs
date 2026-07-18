@@ -131,6 +131,31 @@ pub fn file_sha256_b64(secrets_path: impl AsRef<Path>) -> DotLockResult<String> 
     Ok(general_purpose::STANDARD.encode(compute_file_sha256(secrets_path)?))
 }
 
+pub fn compute_bytes_sha256(bytes: &[u8]) -> [u8; HASH_LEN] {
+    let digest = Sha256::digest(bytes);
+    let mut out = [0u8; HASH_LEN];
+    out.copy_from_slice(&digest);
+    out
+}
+
+pub fn bytes_sha256_b64(bytes: &[u8]) -> String {
+    general_purpose::STANDARD.encode(compute_bytes_sha256(bytes))
+}
+
+/// Builds the encrypted integrity hash fields for in-memory `secrets.lock`
+/// content, so mutators can finalize metadata before any file is written.
+pub fn build_encrypted_hash_fields_from_bytes(
+    bytes: &[u8],
+    dek: &[u8; 32],
+) -> DotLockResult<(String, String)> {
+    let hash = compute_bytes_sha256(bytes);
+    let encrypted = encrypt_hash(&hash, dek)?;
+    Ok((
+        general_purpose::STANDARD.encode(encrypted.nonce),
+        general_purpose::STANDARD.encode(encrypted.ciphertext),
+    ))
+}
+
 pub fn build_encrypted_hash_fields(
     secrets_path: impl AsRef<Path>,
     dek: &[u8; 32],

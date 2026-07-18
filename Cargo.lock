@@ -412,6 +412,7 @@ dependencies = [
  "getrandom 0.4.2",
  "hkdf",
  "inquire",
+ "libc",
  "rsa",
  "serde",
  "serde_json",

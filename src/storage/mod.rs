@@ -9,3 +9,4 @@ pub mod secure_fs;
 pub mod shared_access;
 pub mod unlock_file;
 pub mod vault_file;
+pub mod vault_txn;

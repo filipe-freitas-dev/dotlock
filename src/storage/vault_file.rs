@@ -1,8 +1,12 @@
 use std::path::Path;
 
+use base64::{Engine, engine::general_purpose};
+
 use crate::{
     crypto::{
-        VaultKeyMetadata, sdk,
+        VaultKeyMetadata,
+        integrity::{decrypt_hash, encrypt_hash},
+        sdk,
         share::{RECIPIENT_ALG, wrap_dek_for_public_key_b64},
     },
     domain::{error::DotLockError, model::DotLockResult},
@@ -81,6 +85,12 @@ pub fn rotate_kek_wrapping(
         recipients_rewrapped += 1;
     }
 
+    // Re-encrypt the secrets integrity hash under the NEW project key in the
+    // same metadata object, so a single transactional write commits the rewrap
+    // and the hash together (a crash can never leave the hash encrypted under
+    // an unrecoverable key).
+    reencrypt_secrets_hash(metadata, current_project_key, new_project_key)?;
+
     metadata.kek_version = metadata.kek_version.saturating_add(1);
     metadata.kek_writes_since_rotate = 0;
 
@@ -92,6 +102,32 @@ pub fn rotate_kek_wrapping(
     })
 }
 
+fn reencrypt_secrets_hash(
+    metadata: &mut VaultKeyMetadata,
+    current_project_key: &[u8; 32],
+    new_project_key: &[u8; 32],
+) -> DotLockResult<()> {
+    if metadata.secrets_hash_b64.is_empty() || metadata.secrets_hash_nonce_b64.is_empty() {
+        return Ok(());
+    }
+
+    let nonce_bytes = general_purpose::STANDARD
+        .decode(&metadata.secrets_hash_nonce_b64)
+        .map_err(|_| DotLockError::LegacyVaultFormat)?;
+    let nonce: [u8; 24] = nonce_bytes
+        .try_into()
+        .map_err(|_| DotLockError::LegacyVaultFormat)?;
+    let ciphertext = general_purpose::STANDARD
+        .decode(&metadata.secrets_hash_b64)
+        .map_err(|_| DotLockError::LegacyVaultFormat)?;
+
+    let hash = decrypt_hash(&nonce, &ciphertext, current_project_key)?;
+    let encrypted = encrypt_hash(&hash, new_project_key)?;
+    metadata.secrets_hash_nonce_b64 = general_purpose::STANDARD.encode(encrypted.nonce);
+    metadata.secrets_hash_b64 = general_purpose::STANDARD.encode(encrypted.ciphertext);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -99,7 +135,13 @@ mod tests {
         storage::vault_file::rotate_kek_wrapping,
     };
 
-    fn metadata() -> VaultKeyMetadata {
+    const TEST_SECRETS_HASH: [u8; 32] = [7u8; 32];
+
+    fn metadata_with_hash_key(hash_key: &[u8; 32]) -> VaultKeyMetadata {
+        use base64::{Engine, engine::general_purpose};
+
+        let encrypted = crate::crypto::integrity::encrypt_hash(&TEST_SECRETS_HASH, hash_key)
+            .expect("encrypt hash");
         VaultKeyMetadata {
             version: 3,
             project_uuid: "project".to_string(),
@@ -121,10 +163,14 @@ mod tests {
                 auto_ratchet_after_writes: Some(10),
                 ..VaultConfig::default()
             },
-            secrets_hash_nonce_b64: "hash_nonce".to_string(),
-            secrets_hash_b64: "hash".to_string(),
+            secrets_hash_nonce_b64: general_purpose::STANDARD.encode(encrypted.nonce),
+            secrets_hash_b64: general_purpose::STANDARD.encode(encrypted.ciphertext),
             secrets_hash_sha256_b64: "hash_plain".to_string(),
         }
+    }
+
+    fn metadata() -> VaultKeyMetadata {
+        metadata_with_hash_key(&[8u8; 32])
     }
 
     #[test]
@@ -184,5 +230,52 @@ mod tests {
 
         assert_ne!(metadata.recipients[0].wrapped_dek_b64, before);
         assert_eq!(summary.recipients_rewrapped, 1);
+    }
+
+    #[test]
+    fn rotate_kek_wrapping_reencrypts_secrets_hash_under_new_project_key() {
+        use base64::{Engine, engine::general_purpose};
+
+        let old_project_key = [8u8; 32];
+        let new_project_key = [9u8; 32];
+        let mut metadata = metadata();
+        let old_nonce = metadata.secrets_hash_nonce_b64.clone();
+        let old_hash = metadata.secrets_hash_b64.clone();
+
+        rotate_kek_wrapping(&mut metadata, &old_project_key, &new_project_key).expect("rotate");
+
+        assert_ne!(metadata.secrets_hash_nonce_b64, old_nonce);
+        assert_ne!(metadata.secrets_hash_b64, old_hash);
+
+        let nonce: [u8; 24] = general_purpose::STANDARD
+            .decode(&metadata.secrets_hash_nonce_b64)
+            .expect("nonce b64")
+            .try_into()
+            .expect("nonce len");
+        let ciphertext = general_purpose::STANDARD
+            .decode(&metadata.secrets_hash_b64)
+            .expect("hash b64");
+        // Decryptable under the NEW key with the same plaintext hash...
+        let hash = crate::crypto::integrity::decrypt_hash(&nonce, &ciphertext, &new_project_key)
+            .expect("decrypt under new key");
+        assert_eq!(hash, super::tests::TEST_SECRETS_HASH);
+        // ...and no longer under the old key.
+        assert!(
+            crate::crypto::integrity::decrypt_hash(&nonce, &ciphertext, &old_project_key).is_err()
+        );
+    }
+
+    #[test]
+    fn rotate_kek_wrapping_leaves_legacy_empty_hash_untouched() {
+        let old_project_key = [8u8; 32];
+        let new_project_key = [9u8; 32];
+        let mut metadata = metadata();
+        metadata.secrets_hash_nonce_b64 = String::new();
+        metadata.secrets_hash_b64 = String::new();
+
+        rotate_kek_wrapping(&mut metadata, &old_project_key, &new_project_key).expect("rotate");
+
+        assert!(metadata.secrets_hash_nonce_b64.is_empty());
+        assert!(metadata.secrets_hash_b64.is_empty());
     }
 }

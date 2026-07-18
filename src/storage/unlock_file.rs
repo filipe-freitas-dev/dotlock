@@ -19,8 +19,18 @@ use crate::{
         identity::{load_local_identity, load_local_identity_metadata},
         project::SECRETS_FILE,
         vault_file::load_vault_metadata,
+        vault_txn::recover_pending,
     },
 };
+
+/// Resolves any interrupted vault-pair transaction before the vault is read.
+fn recover_pending_before_access(vault_path: &str) -> DotLockResult<()> {
+    recover_pending(
+        std::path::Path::new(vault_path),
+        std::path::Path::new(SECRETS_FILE),
+    )?;
+    Ok(())
+}
 
 fn unwrap_dek_with_passphrase(
     metadata: &crate::crypto::VaultKeyMetadata,
@@ -83,6 +93,7 @@ fn unlock_vault_with_dek(
 }
 
 pub fn unlock_vault_with_master_password(path: &str) -> DotLockResult<Zeroizing<[u8; 32]>> {
+    recover_pending_before_access(path)?;
     let metadata = load_vault_metadata(path)?;
     let passphrase = prompt_unlock_password()?;
     let dek = unwrap_dek_with_passphrase(&metadata, &passphrase)?;
@@ -94,6 +105,7 @@ pub fn unlock_vault_with_master_password(path: &str) -> DotLockResult<Zeroizing<
 pub fn unlock_vault_with_master_password_and_passphrase(
     path: &str,
 ) -> DotLockResult<(Zeroizing<[u8; 32]>, String)> {
+    recover_pending_before_access(path)?;
     let metadata = load_vault_metadata(path)?;
     let passphrase = prompt_unlock_password()?;
     let dek = unwrap_dek_with_passphrase(&metadata, &passphrase)?;
@@ -178,6 +190,7 @@ fn print_shared_recipients(metadata: &crate::crypto::VaultKeyMetadata) {
 }
 
 pub fn unlock_vault(path: &str) -> DotLockResult<Zeroizing<[u8; 32]>> {
+    recover_pending_before_access(path)?;
     let metadata = load_vault_metadata(path)?;
 
     if let Some(dek) = read_cached_dek() {
