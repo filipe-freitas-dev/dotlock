@@ -3,8 +3,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
@@ -22,6 +20,7 @@ use crate::{
     },
     domain::{
         error::DotLockError,
+        keys::{ProjectKey, SecretKey},
         model::{Alg, DotLockResult},
     },
     storage::{
@@ -33,71 +32,12 @@ use crate::{
     },
 };
 
-pub const DEFAULT_SECRET_ALG: &str = "xchacha20-poly1305";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SecretsFile {
-    pub version: u32,
-    #[serde(default)]
-    pub secrets: Vec<SecretRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SecretRecord {
-    pub id: String,
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub alg: Option<String>,
-    pub data: String,
-    #[serde(default)]
-    pub updated_at: i64,
-    /// Monotonic per-secret write counter (H2). `0` marks a legacy record
-    /// encrypted without AAD; every write through `upsert_record` (or a
-    /// re-encryption) sets `version >= 1` and binds
-    /// `id`/`name`/`updated_at`/`version` into the ciphertext's AEAD
-    /// associated data, so plaintext ordering metadata can no longer be forged
-    /// without failing authentication.
-    #[serde(default)]
-    pub version: u64,
-    #[serde(default)]
-    pub kind: SecretKind,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum SecretKind {
-    #[default]
-    Static,
-    Dynamic {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        provider: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        config: Option<Value>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        bootstrap: Vec<String>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DynamicSecretMetadata {
-    pub provider: String,
-    pub config: Value,
-    #[serde(default)]
-    pub bootstrap: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_sha256: Option<String>,
-}
-
-impl Default for SecretsFile {
-    fn default() -> Self {
-        Self {
-            version: 2,
-            secrets: Vec::new(),
-        }
-    }
-}
+// Secret-record entities live in the domain layer (A2); re-exported here so
+// storage-centric call sites keep their historical import paths.
+pub use crate::domain::secret::{
+    DEFAULT_SECRET_ALG, DynamicSecretMetadata, SecretKind, SecretRecord, SecretsFile,
+    secret_record_aad,
+};
 
 pub fn load_secrets_file<P: AsRef<Path>>(path: P) -> DotLockResult<SecretsFile> {
     let path = path.as_ref();
@@ -136,32 +76,12 @@ fn migrate_legacy_secret_timestamps(file: &mut SecretsFile) {
     }
 }
 
-/// Canonical AEAD associated data for a secret record (H2 + M4): binds the
-/// record's identity (`id`, `name`) and ordering metadata (`updated_at`,
-/// monotonic `version`) into the ciphertext's authentication tag.
-/// Length-prefixed encoding, so no field combination is ambiguous.
-pub fn secret_record_aad(id: &str, name: &str, updated_at: i64, version: u64) -> Vec<u8> {
-    const DOMAIN: &[u8] = b"dotlock/secret-record-aad/v1";
-    let mut aad = Vec::with_capacity(DOMAIN.len() + id.len() + name.len() + 40);
-    for part in [DOMAIN, id.as_bytes(), name.as_bytes()] {
-        aad.extend_from_slice(&(part.len() as u64).to_le_bytes());
-        aad.extend_from_slice(part);
-    }
-    aad.extend_from_slice(&updated_at.to_le_bytes());
-    aad.extend_from_slice(&version.to_le_bytes());
-    aad
-}
-
-fn record_aad(secret: &SecretRecord) -> Vec<u8> {
-    secret_record_aad(&secret.id, &secret.name, secret.updated_at, secret.version)
-}
-
 /// Decrypts a record's value with the record-appropriate authentication:
 /// `version >= 1` records must authenticate against their claimed
 /// `id`/`name`/`updated_at`/`version` (a record whose plaintext ordering
 /// metadata was forged — e.g. a replayed ciphertext with an inflated
 /// timestamp — fails here); `version == 0` records are legacy pre-AAD data.
-pub fn decrypt_record_with_key(secret: &SecretRecord, key: &[u8; 32]) -> DotLockResult<String> {
+pub fn decrypt_record_with_key(secret: &SecretRecord, key: &SecretKey) -> DotLockResult<String> {
     if secret.version == 0 {
         return decryption_process(secret.data.clone(), secret_algorithm(secret)?, key);
     }
@@ -169,7 +89,7 @@ pub fn decrypt_record_with_key(secret: &SecretRecord, key: &[u8; 32]) -> DotLock
         secret.data.clone(),
         secret_algorithm(secret)?,
         key,
-        &record_aad(secret),
+        &secret.aad(),
     )
     .map_err(|_| {
         DotLockError::Crypto(format!(
@@ -205,7 +125,7 @@ fn commit_secrets_and_metadata(
     secrets_path: &Path,
     file: &mut SecretsFile,
     metadata: &mut crate::crypto::VaultKeyMetadata,
-    dek: &[u8; 32],
+    dek: &ProjectKey,
     vault_path: &str,
 ) -> DotLockResult<()> {
     migrate_legacy_secret_algorithms(file)?;
@@ -228,7 +148,7 @@ fn commit_secrets_and_metadata(
 
 pub fn refresh_vault_hash(
     secrets_path: &Path,
-    dek: &[u8; 32],
+    dek: &ProjectKey,
     vault_path: &str,
 ) -> DotLockResult<()> {
     let mut metadata = load_vault_metadata(vault_path)?;
@@ -257,7 +177,7 @@ fn upsert_record(
     plaintext: String,
     alg: Alg,
     kind: SecretKind,
-    dek: &[u8; 32],
+    dek: &ProjectKey,
 ) -> DotLockResult<(SecretRecord, bool)> {
     let now = current_unix_timestamp();
     let existing_index = file.secrets.iter().position(|secret| secret.name == name);
@@ -310,7 +230,7 @@ fn upsert_record(
     };
 
     metadata
-        .wrapped_sdks_under_kek
+        .wrapped_sdks_under_dek
         .insert(record.id.clone(), sdk::wrap_sdk_for_project_key(&sdk, dek)?);
     wrap_sdk_for_authorized_full_access_recipients(metadata, &record.id, &sdk)?;
 
@@ -324,7 +244,7 @@ fn upsert_record(
 fn wrap_sdk_for_authorized_full_access_recipients(
     metadata: &mut crate::crypto::VaultKeyMetadata,
     record_id: &str,
-    sdk: &[u8; 32],
+    sdk: &SecretKey,
 ) -> DotLockResult<()> {
     let enforce_grants = !metadata.authorized_signers.is_empty();
     let project_uuid = metadata.project_uuid.clone();
@@ -344,7 +264,7 @@ fn wrap_sdk_for_authorized_full_access_recipients(
         }
         recipient.wrapped_sdks.insert(
             record_id.to_string(),
-            wrap_dek_for_public_key_b64(sdk, &recipient.public_key_b64)?,
+            wrap_dek_for_public_key_b64(sdk.as_bytes(), &recipient.public_key_b64)?,
         );
     }
     Ok(())
@@ -355,7 +275,7 @@ pub fn upsert_plain_secret<P: AsRef<Path>>(
     name: String,
     value: String,
     alg: Alg,
-    dek: &[u8; 32],
+    dek: &ProjectKey,
     vault_path: &str,
 ) -> DotLockResult<SecretRecord> {
     let path = path.as_ref();
@@ -380,6 +300,9 @@ pub fn upsert_plain_secret<P: AsRef<Path>>(
     Ok(record)
 }
 
+/// Storage-side wrapper for the pure domain rule
+/// [`crate::domain::vault::VaultKeyMetadata::reject_limited_identity_write_for_fingerprint`]:
+/// resolves the local identity's fingerprint, then delegates.
 fn reject_limited_identity_write(metadata: &crate::crypto::VaultKeyMetadata) -> DotLockResult<()> {
     if metadata.access_mode != AccessMode::Shared {
         return Ok(());
@@ -387,42 +310,22 @@ fn reject_limited_identity_write(metadata: &crate::crypto::VaultKeyMetadata) -> 
     let Ok(identity_meta) = load_local_identity_metadata() else {
         return Ok(());
     };
-    reject_limited_identity_write_for_fingerprint(metadata, &identity_meta.fingerprint)
+    metadata.reject_limited_identity_write_for_fingerprint(&identity_meta.fingerprint)
 }
 
-fn reject_limited_identity_write_for_fingerprint(
-    metadata: &crate::crypto::VaultKeyMetadata,
-    fingerprint: &str,
-) -> DotLockResult<()> {
-    if metadata.access_mode != AccessMode::Shared {
-        return Ok(());
-    }
-    let Some(recipient) = metadata
-        .recipients
-        .iter()
-        .find(|recipient| recipient.public_key_fingerprint == fingerprint)
-    else {
-        return Ok(());
-    };
-    if recipient.wrapped_dek_b64.is_empty() {
-        return Err(DotLockError::AccessDenied {
-            secret: "write requires full-access recipient or master password".to_string(),
-        });
-    }
-    Ok(())
-}
-
-pub fn migrate_all_secrets_to_envelope(dek: &[u8; 32], vault_path: &str) -> DotLockResult<()> {
+pub fn migrate_all_secrets_to_envelope(dek: &ProjectKey, vault_path: &str) -> DotLockResult<()> {
     let mut file = load_secrets_file(SECRETS_FILE)?;
     let mut metadata = load_vault_metadata(vault_path)?;
     reject_limited_identity_write(&metadata)?;
     let mut changed = false;
 
     for secret in &mut file.secrets {
-        if metadata.wrapped_sdks_under_kek.contains_key(&secret.id) {
+        if metadata.wrapped_sdks_under_dek.contains_key(&secret.id) {
             continue;
         }
-        let value = decrypt_record_with_key(secret, dek)?;
+        // Pre-envelope record: its value is encrypted directly under the
+        // project key (the sanctioned legacy DEK-as-SDK bridge).
+        let value = decrypt_record_with_key(secret, &SecretKey::from_legacy_project_key(dek))?;
         let sdk = sdk::generate_sdk()?;
         let now = current_unix_timestamp();
         let next_version = secret.version.saturating_add(1).max(1);
@@ -441,7 +344,7 @@ pub fn migrate_all_secrets_to_envelope(dek: &[u8; 32], vault_path: &str) -> DotL
         secret.version = next_version;
         let secret_id = secret.id.clone();
         metadata
-            .wrapped_sdks_under_kek
+            .wrapped_sdks_under_dek
             .insert(secret_id.clone(), sdk::wrap_sdk_for_project_key(&sdk, dek)?);
         wrap_sdk_for_authorized_full_access_recipients(&mut metadata, &secret_id, &sdk)?;
         changed = true;
@@ -464,7 +367,7 @@ pub fn migrate_all_secrets_to_envelope(dek: &[u8; 32], vault_path: &str) -> DotL
 pub fn rotate_secret_sdks_after_acl_removal(
     secret_ids: &[String],
     removed_recipient_query: &str,
-    dek: &[u8; 32],
+    dek: &ProjectKey,
     vault_path: &str,
 ) -> DotLockResult<()> {
     let mut file = load_secrets_file(SECRETS_FILE)?;
@@ -515,7 +418,7 @@ pub fn rotate_secret_sdks_after_acl_removal(
         secret.alg = None;
         secret.updated_at = now;
         secret.version = next_version;
-        metadata.wrapped_sdks_under_kek.insert(
+        metadata.wrapped_sdks_under_dek.insert(
             secret.id.clone(),
             sdk::wrap_sdk_for_project_key(&new_sdk, dek)?,
         );
@@ -541,7 +444,7 @@ pub fn rotate_secret_sdks_after_acl_removal(
             if recipient.full_access || recipient.wrapped_sdks.contains_key(secret_id) {
                 recipient.wrapped_sdks.insert(
                     secret.id.clone(),
-                    wrap_dek_for_public_key_b64(&new_sdk, &recipient.public_key_b64)?,
+                    wrap_dek_for_public_key_b64(new_sdk.as_bytes(), &recipient.public_key_b64)?,
                 );
             }
         }
@@ -556,7 +459,7 @@ pub fn rotate_secret_sdks_after_acl_removal(
     )
 }
 
-pub fn decrypt_secret_value(secret: &SecretRecord, dek: &[u8; 32]) -> DotLockResult<String> {
+pub fn decrypt_secret_value(secret: &SecretRecord, dek: &ProjectKey) -> DotLockResult<String> {
     let metadata = load_vault_metadata(crate::storage::project::VAULT_FILE)?;
     let key = if metadata.access_mode == AccessMode::Shared {
         match secret_sdk_from_local_identity(&metadata, secret)? {
@@ -590,11 +493,11 @@ pub fn secret_algorithm(secret: &SecretRecord) -> DotLockResult<Alg> {
 fn secret_key_from_project_key_or_legacy(
     metadata: &crate::crypto::VaultKeyMetadata,
     secret: &SecretRecord,
-    dek: &[u8; 32],
-) -> DotLockResult<[u8; 32]> {
+    dek: &ProjectKey,
+) -> DotLockResult<SecretKey> {
     match secret_sdk_from_project_key(metadata, secret, dek)? {
         Some(sdk) => Ok(sdk),
-        None if metadata.version < 5 => Ok(*dek),
+        None if metadata.version < 5 => Ok(SecretKey::from_legacy_project_key(dek)),
         None => Err(DotLockError::MissingSecretKeyWrapping {
             id: secret.id.clone(),
         }),
@@ -604,10 +507,10 @@ fn secret_key_from_project_key_or_legacy(
 fn secret_sdk_from_project_key(
     metadata: &crate::crypto::VaultKeyMetadata,
     secret: &SecretRecord,
-    dek: &[u8; 32],
-) -> DotLockResult<Option<[u8; 32]>> {
+    dek: &ProjectKey,
+) -> DotLockResult<Option<SecretKey>> {
     metadata
-        .wrapped_sdks_under_kek
+        .wrapped_sdks_under_dek
         .get(&secret.id)
         .map(|wrapped| sdk::unwrap_sdk_with_project_key(wrapped, dek))
         .transpose()
@@ -616,7 +519,7 @@ fn secret_sdk_from_project_key(
 fn secret_sdk_from_local_identity(
     metadata: &crate::crypto::VaultKeyMetadata,
     secret: &SecretRecord,
-) -> DotLockResult<Option<[u8; 32]>> {
+) -> DotLockResult<Option<SecretKey>> {
     let Ok(identity_meta) = load_local_identity_metadata() else {
         return Ok(None);
     };
@@ -631,7 +534,8 @@ fn secret_sdk_from_local_identity(
         return Ok(None);
     };
     let identity = load_local_identity()?;
-    unwrap_dek_with_private_key(wrapped_sdk, &identity.private_key_pem).map(Some)
+    unwrap_dek_with_private_key(wrapped_sdk, &identity.private_key_pem)
+        .map(|sdk| Some(SecretKey::new(sdk)))
 }
 
 pub fn find_secret_by_name(name: &str) -> DotLockResult<SecretRecord> {
@@ -663,7 +567,7 @@ pub struct UpsertSummary {
 pub fn upsert_many<P: AsRef<Path>>(
     path: P,
     entries: Vec<PlainSecretEntry>,
-    dek: &[u8; 32],
+    dek: &ProjectKey,
     vault_path: &str,
 ) -> DotLockResult<UpsertSummary> {
     let path = path.as_ref();
@@ -703,7 +607,7 @@ pub fn upsert_dynamic_secret<P: AsRef<Path>>(
     path: P,
     name: String,
     dynamic: DynamicSecretMetadata,
-    dek: &[u8; 32],
+    dek: &ProjectKey,
     vault_path: &str,
 ) -> DotLockResult<SecretRecord> {
     let path = path.as_ref();
@@ -737,7 +641,7 @@ pub fn upsert_dynamic_secret<P: AsRef<Path>>(
 
 pub fn decrypt_dynamic_metadata(
     secret: &SecretRecord,
-    dek: &[u8; 32],
+    dek: &ProjectKey,
 ) -> DotLockResult<DynamicSecretMetadata> {
     let plaintext = decrypt_secret_value(secret, dek)?;
     if !plaintext.trim().is_empty() {
@@ -767,7 +671,7 @@ pub fn decrypt_dynamic_metadata(
     }
 }
 
-pub fn remove_secret_by_name(name: &str, dek: &[u8; 32], vault_path: &str) -> DotLockResult<()> {
+pub fn remove_secret_by_name(name: &str, dek: &ProjectKey, vault_path: &str) -> DotLockResult<()> {
     let mut metadata = load_vault_metadata(vault_path)?;
     reject_limited_identity_write(&metadata)?;
 
@@ -788,7 +692,7 @@ pub fn remove_secret_by_name(name: &str, dek: &[u8; 32], vault_path: &str) -> Do
     }
 
     for id in &removed_ids {
-        metadata.wrapped_sdks_under_kek.remove(id);
+        metadata.wrapped_sdks_under_dek.remove(id);
         for recipient in &mut metadata.recipients {
             recipient.wrapped_sdks.remove(id);
         }
@@ -815,7 +719,10 @@ mod tests {
             AccessMode, VaultConfig, VaultKeyMetadata, VaultRecipient,
             secret_cipher::decryption_process,
         },
-        domain::model::Alg,
+        domain::{
+            keys::{ProjectKey, SecretKey},
+            model::Alg,
+        },
         storage::{
             secrets_lock::{
                 PlainSecretEntry, SecretRecord, load_secrets_file, upsert_many, upsert_plain_secret,
@@ -849,7 +756,7 @@ mod tests {
             kek_writes_since_rotate: 0,
             wrapped_dek_nonce_b64: "nonce".to_string(),
             wrapped_dek_b64: "wrapped".to_string(),
-            wrapped_sdks_under_kek: std::collections::HashMap::new(),
+            wrapped_sdks_under_dek: std::collections::HashMap::new(),
             access_mode: AccessMode::MasterPassword,
             recipients: Vec::new(),
             authorized_signers: Vec::new(),
@@ -865,7 +772,7 @@ mod tests {
         let dir = temp_dir("envelope");
         let secrets_path = dir.join("secrets.lock");
         let vault_path = dir.join("vault.toml");
-        let dek = [8u8; 32];
+        let dek = ProjectKey::new([8u8; 32]);
         save_vault_metadata(&vault_path, &metadata()).expect("save vault");
 
         let record = upsert_plain_secret(
@@ -885,9 +792,16 @@ mod tests {
         assert_eq!(file.secrets[0].alg, None);
         let serialized = fs::read_to_string(&secrets_path).expect("read secrets");
         assert!(!serialized.contains("alg ="));
-        assert!(metadata.wrapped_sdks_under_kek.contains_key(&record.id));
+        assert!(metadata.wrapped_sdks_under_dek.contains_key(&record.id));
+        // The record must NOT decrypt under the raw project key: it is
+        // envelope-encrypted under its own SDK.
         assert!(
-            decryption_process(file.secrets[0].data.clone(), Alg::XChaCha20Poly1305, &dek).is_err()
+            decryption_process(
+                file.secrets[0].data.clone(),
+                Alg::XChaCha20Poly1305,
+                &SecretKey::from_legacy_project_key(&dek)
+            )
+            .is_err()
         );
 
         let _ = fs::remove_dir_all(dir);
@@ -898,7 +812,7 @@ mod tests {
         let dir = temp_dir("batch-envelope");
         let secrets_path = dir.join("secrets.lock");
         let vault_path = dir.join("vault.toml");
-        let dek = [8u8; 32];
+        let dek = ProjectKey::new([8u8; 32]);
         let identity = crate::crypto::share::generate_identity(
             crate::crypto::share::IdentityProtection::Plain,
         )
@@ -913,7 +827,7 @@ mod tests {
             public_key_b64: crate::crypto::share::encode_public_key_b64(&identity.public_key_pem)
                 .expect("public key b64"),
             wrapped_dek_b64: crate::crypto::share::wrap_dek_for_public_key(
-                &dek,
+                dek.as_bytes(),
                 &identity.public_key_pem,
             )
             .expect("wrap project key"),
@@ -940,35 +854,18 @@ mod tests {
         let metadata = load_vault_metadata(&vault_path).expect("load metadata");
         let record = &file.secrets[0];
         assert_eq!(record.alg, None);
-        assert!(metadata.wrapped_sdks_under_kek.contains_key(&record.id));
+        assert!(metadata.wrapped_sdks_under_dek.contains_key(&record.id));
         assert!(metadata.recipients[0].wrapped_sdks.contains_key(&record.id));
-        assert!(decryption_process(record.data.clone(), Alg::XChaCha20Poly1305, &dek).is_err());
+        assert!(
+            decryption_process(
+                record.data.clone(),
+                Alg::XChaCha20Poly1305,
+                &SecretKey::from_legacy_project_key(&dek)
+            )
+            .is_err()
+        );
 
         let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn limited_identity_cannot_write_without_project_key() {
-        let mut metadata = metadata();
-        metadata.access_mode = AccessMode::Shared;
-        metadata.recipients.push(VaultRecipient {
-            id: "alice-id".to_string(),
-            label: "alice".to_string(),
-            alg: "rsa-oaep-sha256".to_string(),
-            public_key_fingerprint: "alice-fp".to_string(),
-            public_key_b64: "public".to_string(),
-            wrapped_dek_b64: String::new(),
-            wrapped_sdks: std::collections::HashMap::new(),
-            grant_signature_b64: String::new(),
-            grant_signer_fingerprint: String::new(),
-            full_access: false,
-        });
-        let result = super::reject_limited_identity_write_for_fingerprint(&metadata, "alice-fp");
-
-        assert!(matches!(
-            result,
-            Err(crate::domain::error::DotLockError::AccessDenied { .. })
-        ));
     }
 
     #[test]
@@ -982,7 +879,7 @@ mod tests {
         let secrets_path = dir.join("secrets.lock");
         let vault_path = dir.join("vault.toml");
         let vault_str = vault_path.to_str().expect("vault path");
-        let dek = [8u8; 32];
+        let dek = ProjectKey::new([8u8; 32]);
         save_vault_metadata(&vault_path, &metadata()).expect("save vault");
 
         // Owner creates a secret through the normal envelope path.
@@ -1043,7 +940,8 @@ mod tests {
             unsafe {
                 std::env::set_var("DOTLOCK_IDENTITY_DIR", &identity_dir);
             }
-            let result = remove_secret_by_name("FOO", &[0u8; 32], vault_str);
+            let result =
+                remove_secret_by_name("FOO", &ProjectKey::read_only_placeholder(), vault_str);
             unsafe {
                 std::env::remove_var("DOTLOCK_IDENTITY_DIR");
             }
@@ -1080,7 +978,7 @@ mod tests {
             version: 0,
             kind: super::SecretKind::Static,
         };
-        let dek = [8u8; 32];
+        let dek = ProjectKey::new([8u8; 32]);
 
         // v5+ vault: a missing wrapping is an orphaned secret, never a silent
         // fallback to the raw project key.
@@ -1097,24 +995,7 @@ mod tests {
         assert_eq!(legacy.version, 2);
         let key = super::secret_key_from_project_key_or_legacy(&legacy, &record, &dek)
             .expect("legacy fallback");
-        assert_eq!(key, dek);
-    }
-
-    #[test]
-    fn legacy_secret_records_default_to_static_kind() {
-        let record = toml::from_str::<SecretRecord>(
-            r#"
-id = "secret-id"
-name = "FOO"
-alg = "xchacha20-poly1305"
-data = "ciphertext"
-updated_at = 1
-"#,
-        )
-        .expect("record");
-
-        assert!(matches!(record.kind, super::SecretKind::Static));
-        assert_eq!(record.alg.as_deref(), Some(super::DEFAULT_SECRET_ALG));
+        assert_eq!(key.as_bytes(), dek.as_bytes());
     }
 
     /// Backward compat (H2): a legacy `version == 0` record — encrypted
@@ -1123,7 +1004,7 @@ updated_at = 1
     /// authenticate against its claimed metadata.
     #[test]
     fn legacy_version_zero_records_decrypt_without_aad() {
-        let key = [9u8; 32];
+        let key = SecretKey::new([9u8; 32]);
         // Legacy ciphertext: no AAD (empty AAD is bit-compatible with the
         // pre-AAD format).
         let encrypted = crate::crypto::secret_cipher::encryption_process_with_aad(
@@ -1163,7 +1044,7 @@ updated_at = 1
         let dir = temp_dir("dynamic-envelope");
         let secrets_path = dir.join("secrets.lock");
         let vault_path = dir.join("vault.toml");
-        let dek = [8u8; 32];
+        let dek = ProjectKey::new([8u8; 32]);
         save_vault_metadata(&vault_path, &metadata()).expect("save vault");
 
         let record = super::upsert_dynamic_secret(
@@ -1187,7 +1068,7 @@ updated_at = 1
 
         let vault_metadata = load_vault_metadata(&vault_path).expect("load vault");
         let wrapped_sdk = vault_metadata
-            .wrapped_sdks_under_kek
+            .wrapped_sdks_under_dek
             .get(&record.id)
             .expect("wrapped sdk");
         let sdk =
@@ -1218,7 +1099,7 @@ updated_at = 1
             let secrets_path = dir.join("secrets.lock");
             let vault_path = dir.join("vault.toml");
             let vault_path_str = vault_path.to_str().expect("vault path");
-            let dek = [8u8; 32];
+            let dek = ProjectKey::new([8u8; 32]);
             save_vault_metadata(&vault_path, &metadata()).expect("save vault");
 
             // A first, fully committed secret.
@@ -1261,7 +1142,7 @@ updated_at = 1
             );
             for secret in &file.secrets {
                 let wrapped = recovered_metadata
-                    .wrapped_sdks_under_kek
+                    .wrapped_sdks_under_dek
                     .get(&secret.id)
                     .expect("every secret must keep its SDK wrapping");
                 let sdk = crate::crypto::sdk::unwrap_sdk_with_project_key(wrapped, &dek)

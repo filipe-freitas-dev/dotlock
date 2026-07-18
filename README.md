@@ -353,7 +353,7 @@ dl rotate mp
 
 ### Rotate key wrapping material
 
-**What:** `dl rotate kek` rotates the key wrapping layer and rewraps secret SDKs and full-access recipient project keys.
+**What:** `dl rotate kek` rotates the project key (DEK) and rewraps secret SDKs and full-access recipient wrappings (historical command name; the KEK itself is always re-derived from the master password).
 
 **How:**
 
@@ -365,7 +365,7 @@ dl rotate kek
 
 ### Rotate the project key
 
-**What:** `dl rotate project-key` generates a new project key and rewrites encrypted secret records.
+**What:** `dl rotate project-key` generates a new project key (DEK) and rewraps every secret data key under it; secret ciphertexts stay unchanged.
 
 **How:**
 

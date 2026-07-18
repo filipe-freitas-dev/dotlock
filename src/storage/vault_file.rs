@@ -9,7 +9,7 @@ use crate::{
         sdk,
         share::{RECIPIENT_ALG, wrap_dek_for_public_key_b64},
     },
-    domain::{error::DotLockError, model::DotLockResult},
+    domain::{error::DotLockError, keys::ProjectKey, model::DotLockResult},
     storage::secure_fs,
 };
 
@@ -59,16 +59,21 @@ pub fn should_auto_ratchet_for_next_write(metadata: &VaultKeyMetadata) -> bool {
         })
 }
 
-pub fn rotate_kek_wrapping(
+/// Rotates the PROJECT KEY (DEK) wrapping model: every per-secret SDK and
+/// every recipient's `wrapped_dek_b64` is rewrapped under `new_project_key`,
+/// and the integrity hash is re-encrypted. `kek_version` is bumped only
+/// because the KEK that wraps the new DEK is derived with it — `dl rotate`
+/// rotates the DEK, not "the KEK" in isolation.
+pub fn rotate_project_key_wrapping(
     metadata: &mut VaultKeyMetadata,
-    current_project_key: &[u8; 32],
-    new_project_key: &[u8; 32],
+    current_project_key: &ProjectKey,
+    new_project_key: &ProjectKey,
 ) -> DotLockResult<RatchetSummary> {
     let old_kek_version = metadata.kek_version;
     let mut secrets_rewrapped = 0usize;
     let mut rewrapped_sdks = std::collections::HashMap::new();
 
-    for (secret_id, wrapped_sdk) in &metadata.wrapped_sdks_under_kek {
+    for (secret_id, wrapped_sdk) in &metadata.wrapped_sdks_under_dek {
         let secret_key = sdk::unwrap_sdk_with_project_key(wrapped_sdk, current_project_key)?;
         rewrapped_sdks.insert(
             secret_id.clone(),
@@ -76,7 +81,7 @@ pub fn rotate_kek_wrapping(
         );
         secrets_rewrapped += 1;
     }
-    metadata.wrapped_sdks_under_kek = rewrapped_sdks;
+    metadata.wrapped_sdks_under_dek = rewrapped_sdks;
 
     // H3: once the vault records authorized signers, only recipients whose
     // grant signature verifies receive the fresh project key. A recipient
@@ -102,7 +107,7 @@ pub fn rotate_kek_wrapping(
             continue;
         }
         recipient.wrapped_dek_b64 =
-            wrap_dek_for_public_key_b64(new_project_key, &recipient.public_key_b64)?;
+            wrap_dek_for_public_key_b64(new_project_key.as_bytes(), &recipient.public_key_b64)?;
         recipient.alg = RECIPIENT_ALG.to_string();
         recipients_rewrapped += 1;
     }
@@ -127,8 +132,8 @@ pub fn rotate_kek_wrapping(
 
 fn reencrypt_secrets_hash(
     metadata: &mut VaultKeyMetadata,
-    current_project_key: &[u8; 32],
-    new_project_key: &[u8; 32],
+    current_project_key: &ProjectKey,
+    new_project_key: &ProjectKey,
 ) -> DotLockResult<()> {
     if metadata.secrets_hash_b64.is_empty() || metadata.secrets_hash_nonce_b64.is_empty() {
         return Ok(());
@@ -155,12 +160,13 @@ fn reencrypt_secrets_hash(
 mod tests {
     use crate::{
         crypto::{AccessMode, VaultConfig, VaultKeyMetadata, sdk},
-        storage::vault_file::rotate_kek_wrapping,
+        domain::keys::{ProjectKey, SecretKey},
+        storage::vault_file::rotate_project_key_wrapping,
     };
 
     const TEST_SECRETS_HASH: [u8; 32] = [7u8; 32];
 
-    fn metadata_with_hash_key(hash_key: &[u8; 32]) -> VaultKeyMetadata {
+    fn metadata_with_hash_key(hash_key: &ProjectKey) -> VaultKeyMetadata {
         use base64::{Engine, engine::general_purpose};
 
         let encrypted = crate::crypto::integrity::encrypt_hash(&TEST_SECRETS_HASH, hash_key)
@@ -179,7 +185,7 @@ mod tests {
             kek_writes_since_rotate: 7,
             wrapped_dek_nonce_b64: "nonce".to_string(),
             wrapped_dek_b64: "wrapped".to_string(),
-            wrapped_sdks_under_kek: std::collections::HashMap::new(),
+            wrapped_sdks_under_dek: std::collections::HashMap::new(),
             access_mode: AccessMode::MasterPassword,
             recipients: Vec::new(),
             authorized_signers: Vec::new(),
@@ -194,29 +200,32 @@ mod tests {
     }
 
     fn metadata() -> VaultKeyMetadata {
-        metadata_with_hash_key(&[8u8; 32])
+        metadata_with_hash_key(&ProjectKey::new([8u8; 32]))
     }
 
     #[test]
-    fn rotate_kek_wrapping_rewraps_sdks_without_changing_secret_keys() {
-        let old_project_key = [8u8; 32];
-        let new_project_key = [9u8; 32];
-        let sdk = [3u8; 32];
+    fn rotate_project_key_wrapping_rewraps_sdks_without_changing_secret_keys() {
+        let old_project_key = ProjectKey::new([8u8; 32]);
+        let new_project_key = ProjectKey::new([9u8; 32]);
+        let sdk = SecretKey::new([3u8; 32]);
         let mut metadata = metadata();
-        metadata.wrapped_sdks_under_kek.insert(
+        metadata.wrapped_sdks_under_dek.insert(
             "secret-id".to_string(),
             sdk::wrap_sdk_for_project_key(&sdk, &old_project_key).expect("wrap old sdk"),
         );
-        let before = metadata.wrapped_sdks_under_kek["secret-id"].clone();
+        let before = metadata.wrapped_sdks_under_dek["secret-id"].clone();
 
         let summary =
-            rotate_kek_wrapping(&mut metadata, &old_project_key, &new_project_key).expect("rotate");
+            rotate_project_key_wrapping(&mut metadata, &old_project_key, &new_project_key)
+                .expect("rotate");
 
-        let after = metadata.wrapped_sdks_under_kek["secret-id"].clone();
+        let after = metadata.wrapped_sdks_under_dek["secret-id"].clone();
         assert_ne!(before, after);
         assert_eq!(
-            sdk::unwrap_sdk_with_project_key(&after, &new_project_key).expect("unwrap new sdk"),
-            sdk
+            sdk::unwrap_sdk_with_project_key(&after, &new_project_key)
+                .expect("unwrap new sdk")
+                .as_bytes(),
+            sdk.as_bytes()
         );
         assert_eq!(metadata.kek_version, 2);
         assert_eq!(metadata.kek_writes_since_rotate, 0);
@@ -224,16 +233,16 @@ mod tests {
     }
 
     #[test]
-    fn rotate_kek_wrapping_can_rewrap_legacy_project_key_recipients_without_plaintext_decrypt() {
-        let old_project_key = [8u8; 32];
-        let new_project_key = [9u8; 32];
+    fn rotate_project_key_wrapping_can_rewrap_legacy_recipients_without_plaintext_decrypt() {
+        let old_project_key = ProjectKey::new([8u8; 32]);
+        let new_project_key = ProjectKey::new([9u8; 32]);
         let mut metadata = metadata();
         let identity = crate::crypto::share::generate_identity(
             crate::crypto::share::IdentityProtection::Plain,
         )
         .expect("identity");
         let before = crate::crypto::share::wrap_dek_for_public_key(
-            &old_project_key,
+            old_project_key.as_bytes(),
             &identity.public_key_pem,
         )
         .expect("wrap old project key");
@@ -252,23 +261,25 @@ mod tests {
         });
 
         let summary =
-            rotate_kek_wrapping(&mut metadata, &old_project_key, &new_project_key).expect("rotate");
+            rotate_project_key_wrapping(&mut metadata, &old_project_key, &new_project_key)
+                .expect("rotate");
 
         assert_ne!(metadata.recipients[0].wrapped_dek_b64, before);
         assert_eq!(summary.recipients_rewrapped, 1);
     }
 
     #[test]
-    fn rotate_kek_wrapping_reencrypts_secrets_hash_under_new_project_key() {
+    fn rotate_project_key_wrapping_reencrypts_secrets_hash_under_new_project_key() {
         use base64::{Engine, engine::general_purpose};
 
-        let old_project_key = [8u8; 32];
-        let new_project_key = [9u8; 32];
+        let old_project_key = ProjectKey::new([8u8; 32]);
+        let new_project_key = ProjectKey::new([9u8; 32]);
         let mut metadata = metadata();
         let old_nonce = metadata.secrets_hash_nonce_b64.clone();
         let old_hash = metadata.secrets_hash_b64.clone();
 
-        rotate_kek_wrapping(&mut metadata, &old_project_key, &new_project_key).expect("rotate");
+        rotate_project_key_wrapping(&mut metadata, &old_project_key, &new_project_key)
+            .expect("rotate");
 
         assert_ne!(metadata.secrets_hash_nonce_b64, old_nonce);
         assert_ne!(metadata.secrets_hash_b64, old_hash);
@@ -295,14 +306,14 @@ mod tests {
     /// the fresh project key for a recipient whose grant signature does not
     /// verify — its stale wrapping is left behind and becomes useless.
     #[test]
-    fn rotate_kek_wrapping_skips_recipients_without_valid_grant() {
+    fn rotate_project_key_wrapping_skips_recipients_without_valid_grant() {
         use crate::{
             crypto::{AuthorizedSigner, VaultRecipient},
             storage::shared_access::{recipient_grant_is_valid, recipient_grant_payload},
         };
 
-        let old_project_key = [8u8; 32];
-        let new_project_key = [9u8; 32];
+        let old_project_key = ProjectKey::new([8u8; 32]);
+        let new_project_key = ProjectKey::new([9u8; 32]);
         let owner = crate::crypto::share::generate_identity(
             crate::crypto::share::IdentityProtection::Plain,
         )
@@ -360,7 +371,8 @@ mod tests {
         metadata.recipients = vec![signed_recipient, injected_recipient];
 
         let summary =
-            rotate_kek_wrapping(&mut metadata, &old_project_key, &new_project_key).expect("rotate");
+            rotate_project_key_wrapping(&mut metadata, &old_project_key, &new_project_key)
+                .expect("rotate");
 
         assert_eq!(summary.recipients_rewrapped, 1);
         assert_eq!(summary.recipients_skipped, 1);
@@ -372,20 +384,21 @@ mod tests {
             &owner.private_key_pem,
         )
         .expect("unwrap new project key");
-        assert_eq!(unwrapped, new_project_key);
+        assert_eq!(&unwrapped, new_project_key.as_bytes());
         // ...while the injected one was never wrapped to the new key.
         assert_eq!(metadata.recipients[1].wrapped_dek_b64, "old-injected-wrap");
     }
 
     #[test]
-    fn rotate_kek_wrapping_leaves_legacy_empty_hash_untouched() {
-        let old_project_key = [8u8; 32];
-        let new_project_key = [9u8; 32];
+    fn rotate_project_key_wrapping_leaves_legacy_empty_hash_untouched() {
+        let old_project_key = ProjectKey::new([8u8; 32]);
+        let new_project_key = ProjectKey::new([9u8; 32]);
         let mut metadata = metadata();
         metadata.secrets_hash_nonce_b64 = String::new();
         metadata.secrets_hash_b64 = String::new();
 
-        rotate_kek_wrapping(&mut metadata, &old_project_key, &new_project_key).expect("rotate");
+        rotate_project_key_wrapping(&mut metadata, &old_project_key, &new_project_key)
+            .expect("rotate");
 
         assert!(metadata.secrets_hash_nonce_b64.is_empty());
         assert!(metadata.secrets_hash_b64.is_empty());

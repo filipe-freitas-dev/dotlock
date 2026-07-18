@@ -6,6 +6,7 @@ use chacha20poly1305::{
 
 use crate::domain::{
     error::DotLockError,
+    keys::SecretKey,
     model::{Alg, DataEncrypted, DotLockResult},
 };
 
@@ -16,12 +17,12 @@ pub fn encryption_process_with_aad<'a>(
     name: String,
     value: String,
     alg: Alg,
-    dek: &[u8; 32],
+    key: &SecretKey,
     aad: &[u8],
 ) -> DotLockResult<DataEncrypted<'a>> {
     match alg {
         Alg::XChaCha20Poly1305 => {
-            let encrypted = encrypt_xchacha20poly1305(value, dek, aad)?;
+            let encrypted = encrypt_xchacha20poly1305(value, key, aad)?;
             Ok(DataEncrypted {
                 alg: "xchacha20-poly1305",
                 name,
@@ -33,10 +34,10 @@ pub fn encryption_process_with_aad<'a>(
 
 fn encrypt_xchacha20poly1305(
     plaintext: String,
-    key: &[u8; 32],
+    key: &SecretKey,
     aad: &[u8],
 ) -> DotLockResult<String> {
-    let cipher = XChaCha20Poly1305::new(key.into());
+    let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
 
     let ciphertext = cipher
@@ -61,25 +62,25 @@ fn encrypt_xchacha20poly1305(
 pub fn decryption_process(
     encrypted_data: String,
     alg: Alg,
-    dek: &[u8; 32],
+    key: &SecretKey,
 ) -> DotLockResult<String> {
-    decryption_process_with_aad(encrypted_data, alg, dek, &[])
+    decryption_process_with_aad(encrypted_data, alg, key, &[])
 }
 
 pub fn decryption_process_with_aad(
     encrypted_data: String,
     alg: Alg,
-    dek: &[u8; 32],
+    key: &SecretKey,
     aad: &[u8],
 ) -> DotLockResult<String> {
     match alg {
-        Alg::XChaCha20Poly1305 => decrypt_xchacha20poly1305(encrypted_data, dek, aad),
+        Alg::XChaCha20Poly1305 => decrypt_xchacha20poly1305(encrypted_data, key, aad),
     }
 }
 
 fn decrypt_xchacha20poly1305(
     encrypted_data: String,
-    key: &[u8; 32],
+    key: &SecretKey,
     aad: &[u8],
 ) -> DotLockResult<String> {
     let data = general_purpose::STANDARD
@@ -93,7 +94,7 @@ fn decrypt_xchacha20poly1305(
     let nonce = &data[..24];
     let ciphertext = &data[24..];
 
-    let cipher = XChaCha20Poly1305::new(key.into());
+    let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
 
     let plaintext = cipher
         .decrypt(
@@ -111,11 +112,11 @@ fn decrypt_xchacha20poly1305(
 #[cfg(test)]
 mod tests {
     use super::{decryption_process_with_aad, encryption_process_with_aad};
-    use crate::domain::model::Alg;
+    use crate::domain::{keys::SecretKey, model::Alg};
 
     #[test]
     fn aad_binds_ciphertext_to_its_metadata() {
-        let key = [5u8; 32];
+        let key = SecretKey::new([5u8; 32]);
         let encrypted = encryption_process_with_aad(
             "FOO".to_string(),
             "value".to_string(),

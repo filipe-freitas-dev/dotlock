@@ -17,7 +17,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     crypto::{AccessMode, VaultKeyMetadata},
-    domain::{error::DotLockError, model::DotLockResult},
+    domain::{error::DotLockError, keys::ProjectKey, model::DotLockResult},
     storage::{paths::dotlock_data_root, secure_fs, vault_file::load_vault_metadata},
 };
 
@@ -182,7 +182,7 @@ fn cache_aad(session: &str, expires_at: u64) -> String {
     format!("dotlock:v1:session-cache:session={session}:expires_at={expires_at}")
 }
 
-pub fn read_cached_dek() -> Option<Zeroizing<[u8; 32]>> {
+pub fn read_cached_dek() -> Option<ProjectKey> {
     if shared_mode_active() && !shared_cache_enabled() {
         let _ = invalidate_cache();
         return None;
@@ -236,10 +236,10 @@ pub fn read_cached_dek() -> Option<Zeroizing<[u8; 32]>> {
     };
 
     let dek: [u8; 32] = plaintext.as_slice().try_into().ok()?;
-    Some(Zeroizing::new(dek))
+    Some(ProjectKey::new(dek))
 }
 
-pub fn write_cached_dek(dek: &[u8; 32]) -> DotLockResult<()> {
+pub fn write_cached_dek(dek: &ProjectKey) -> DotLockResult<()> {
     if shared_mode_active() && !shared_cache_enabled() {
         let _ = invalidate_cache();
         return Ok(());
@@ -261,7 +261,7 @@ pub fn write_cached_dek(dek: &[u8; 32]) -> DotLockResult<()> {
         .encrypt(
             XNonce::from_slice(&nonce),
             Payload {
-                msg: dek.as_ref(),
+                msg: dek.as_bytes().as_slice(),
                 aad: aad.as_bytes(),
             },
         )
@@ -307,6 +307,7 @@ mod tests {
     use super::{read_cached_dek, shared_cache_enabled, write_cached_dek};
     use crate::{
         crypto::{AccessMode, VaultConfig, VaultKeyMetadata},
+        domain::keys::ProjectKey,
         storage::vault_file::save_vault_metadata,
     };
     use base64::{Engine, engine::general_purpose};
@@ -348,7 +349,7 @@ mod tests {
             kek_writes_since_rotate: 0,
             wrapped_dek_nonce_b64: "nonce".to_string(),
             wrapped_dek_b64: "wrapped".to_string(),
-            wrapped_sdks_under_kek: std::collections::HashMap::new(),
+            wrapped_sdks_under_dek: std::collections::HashMap::new(),
             access_mode,
             recipients: Vec::new(),
             authorized_signers: Vec::new(),
@@ -407,7 +408,7 @@ mod tests {
         let env = CacheTestEnv::new("cache", AccessMode::Shared);
 
         assert!(!shared_cache_enabled());
-        write_cached_dek(&[5u8; 32]).expect("write cache");
+        write_cached_dek(&ProjectKey::new([5u8; 32])).expect("write cache");
         assert!(read_cached_dek().is_none());
 
         drop(env);
@@ -417,11 +418,11 @@ mod tests {
     fn cached_dek_roundtrips_and_is_wrapped_on_disk() {
         let _guard = env_lock().lock().expect("lock");
         let env = CacheTestEnv::new("cache-wrap", AccessMode::MasterPassword);
-        let dek = [7u8; 32];
+        let dek = ProjectKey::new([7u8; 32]);
 
         write_cached_dek(&dek).expect("write cache");
         let content = fs::read_to_string(env.cache_file()).expect("read cache file");
-        let raw_b64 = general_purpose::STANDARD.encode(dek);
+        let raw_b64 = general_purpose::STANDARD.encode(dek.as_bytes());
         assert!(
             !content.contains(&raw_b64),
             "on-disk cache must not contain the raw base64 DEK"
@@ -429,7 +430,7 @@ mod tests {
         assert!(content.contains("wrapped_dek_b64"));
 
         let cached = read_cached_dek().expect("read cached dek");
-        assert_eq!(*cached, dek);
+        assert_eq!(cached.as_bytes(), dek.as_bytes());
 
         drop(env);
     }
@@ -442,7 +443,7 @@ mod tests {
             std::env::set_var("DOTLOCK_CACHE_TTL", "0");
         }
 
-        write_cached_dek(&[9u8; 32]).expect("write cache");
+        write_cached_dek(&ProjectKey::new([9u8; 32])).expect("write cache");
         assert!(env.cache_file().exists());
         assert!(read_cached_dek().is_none());
         assert!(
@@ -458,7 +459,7 @@ mod tests {
         let _guard = env_lock().lock().expect("lock");
         let env = CacheTestEnv::new("cache-tamper", AccessMode::MasterPassword);
 
-        write_cached_dek(&[3u8; 32]).expect("write cache");
+        write_cached_dek(&ProjectKey::new([3u8; 32])).expect("write cache");
         let path = env.cache_file();
         let content = fs::read_to_string(&path).expect("read cache file");
         let tampered = content.replace("expires_at = ", "expires_at = 9");

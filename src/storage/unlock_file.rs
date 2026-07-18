@@ -1,6 +1,6 @@
 use base64::{Engine, engine::general_purpose};
 use colored::Colorize;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 use crate::{
     audit::record_unlock,
@@ -13,7 +13,7 @@ use crate::{
         prompt_unlock_password,
         share::unwrap_dek_with_private_key,
     },
-    domain::{error::DotLockError, model::DotLockResult},
+    domain::{error::DotLockError, keys::ProjectKey, model::DotLockResult},
     storage::{
         cache::{invalidate_cache, read_cached_dek, write_cached_dek},
         identity::{load_local_identity, load_local_identity_metadata},
@@ -31,7 +31,7 @@ use crate::{
 /// and is additionally rejected by every integrity-hash writer.
 pub enum UnlockAccess {
     /// Full access: the real project key (DEK) was recovered.
-    Full(Zeroizing<[u8; 32]>),
+    Full(ProjectKey),
     /// Limited recipient: only per-secret SDKs from the recipient's
     /// `wrapped_sdks` are available; no project key exists for this identity.
     Limited,
@@ -40,7 +40,7 @@ pub enum UnlockAccess {
 impl UnlockAccess {
     /// Returns the project key, or a permission error for limited identities.
     /// Every mutating path must obtain its key through here.
-    pub fn require_full(self) -> DotLockResult<Zeroizing<[u8; 32]>> {
+    pub fn require_full(self) -> DotLockResult<ProjectKey> {
         match self {
             UnlockAccess::Full(dek) => Ok(dek),
             UnlockAccess::Limited => Err(DotLockError::AccessDenied {
@@ -53,10 +53,10 @@ impl UnlockAccess {
     /// all-zero placeholder that can never act as a project key: their
     /// per-secret SDKs are resolved from the recipient's `wrapped_sdks`, and
     /// every write/integrity path rejects the all-zero key.
-    pub fn into_read_key(self) -> Zeroizing<[u8; 32]> {
+    pub fn into_read_key(self) -> ProjectKey {
         match self {
             UnlockAccess::Full(dek) => dek,
-            UnlockAccess::Limited => Zeroizing::new([0u8; 32]),
+            UnlockAccess::Limited => ProjectKey::read_only_placeholder(),
         }
     }
 }
@@ -81,7 +81,7 @@ fn recover_pending_before_access(vault_path: &str) -> DotLockResult<()> {
 /// construction). The caller must verify the pending-merge marker against the
 /// files first. Key correctness is still guaranteed: both the identity unwrap
 /// and the password unwrap fail on wrong credentials.
-pub fn unlock_full_for_reconcile(path: &str) -> DotLockResult<Zeroizing<[u8; 32]>> {
+pub fn unlock_full_for_reconcile(path: &str) -> DotLockResult<ProjectKey> {
     recover_pending(
         std::path::Path::new(path),
         std::path::Path::new(SECRETS_FILE),
@@ -97,22 +97,24 @@ pub fn unlock_full_for_reconcile(path: &str) -> DotLockResult<Zeroizing<[u8; 32]
         && !recipient.wrapped_dek_b64.is_empty()
         && let Ok(identity) = load_local_identity()
     {
-        let dek =
-            unwrap_dek_with_private_key(&recipient.wrapped_dek_b64, &identity.private_key_pem)?;
+        let dek = ProjectKey::new(unwrap_dek_with_private_key(
+            &recipient.wrapped_dek_b64,
+            &identity.private_key_pem,
+        )?);
         record_unlock_best_effort("identity", &metadata);
-        return Ok(Zeroizing::new(dek));
+        return Ok(dek);
     }
 
     let passphrase = prompt_unlock_password()?;
     let dek = unwrap_dek_with_passphrase(&metadata, &passphrase)?;
     record_unlock_best_effort("password", &metadata);
-    Ok(Zeroizing::new(dek))
+    Ok(dek)
 }
 
 fn unwrap_dek_with_passphrase(
     metadata: &crate::crypto::VaultKeyMetadata,
     passphrase: &str,
-) -> DotLockResult<[u8; 32]> {
+) -> DotLockResult<ProjectKey> {
     let salt = general_purpose::STANDARD
         .decode(&metadata.salt_b64)
         .map_err(|_| DotLockError::LegacyVaultFormat)?;
@@ -160,14 +162,14 @@ fn unwrap_dek_with_passphrase(
 
 fn unlock_vault_with_dek(
     metadata: &crate::crypto::VaultKeyMetadata,
-    dek: [u8; 32],
-) -> DotLockResult<Zeroizing<[u8; 32]>> {
+    dek: ProjectKey,
+) -> DotLockResult<ProjectKey> {
     verify_secrets_integrity(SECRETS_FILE, metadata, &dek)?;
     write_cached_dek(&dek)?;
-    Ok(Zeroizing::new(dek))
+    Ok(dek)
 }
 
-pub fn unlock_vault_with_master_password(path: &str) -> DotLockResult<Zeroizing<[u8; 32]>> {
+pub fn unlock_vault_with_master_password(path: &str) -> DotLockResult<ProjectKey> {
     recover_pending_before_access(path)?;
     let metadata = load_vault_metadata(path)?;
     let passphrase = prompt_unlock_password()?;
@@ -179,7 +181,7 @@ pub fn unlock_vault_with_master_password(path: &str) -> DotLockResult<Zeroizing<
 
 pub fn unlock_vault_with_master_password_and_passphrase(
     path: &str,
-) -> DotLockResult<(Zeroizing<[u8; 32]>, String)> {
+) -> DotLockResult<(ProjectKey, String)> {
     recover_pending_before_access(path)?;
     let metadata = load_vault_metadata(path)?;
     let passphrase = prompt_unlock_password()?;
@@ -206,7 +208,10 @@ fn try_unlock_vault_with_local_identity(
         record_unlock_best_effort("identity", metadata);
         return Ok(UnlockAccess::Limited);
     }
-    let dek = unwrap_dek_with_private_key(&recipient.wrapped_dek_b64, &identity.private_key_pem)?;
+    let dek = ProjectKey::new(unwrap_dek_with_private_key(
+        &recipient.wrapped_dek_b64,
+        &identity.private_key_pem,
+    )?);
     let dek = unlock_vault_with_dek(metadata, dek)?;
     record_unlock_best_effort("identity", metadata);
     Ok(UnlockAccess::Full(dek))
@@ -298,8 +303,7 @@ fn record_unlock_best_effort(method: &str, metadata: &crate::crypto::VaultKeyMet
 #[cfg(test)]
 mod tests {
     use super::UnlockAccess;
-    use crate::domain::error::DotLockError;
-    use zeroize::Zeroizing;
+    use crate::domain::{error::DotLockError, keys::ProjectKey};
 
     #[test]
     fn limited_access_never_yields_a_project_key_for_writes() {
@@ -309,14 +313,18 @@ mod tests {
 
     #[test]
     fn full_access_yields_the_project_key() {
-        let dek = UnlockAccess::Full(Zeroizing::new([8u8; 32]))
+        let dek = UnlockAccess::Full(ProjectKey::new([8u8; 32]))
             .require_full()
             .expect("full access");
-        assert_eq!(*dek, [8u8; 32]);
+        assert_eq!(dek.as_bytes(), &[8u8; 32]);
     }
 
     #[test]
     fn limited_read_key_is_the_all_zero_placeholder() {
-        assert_eq!(*UnlockAccess::Limited.into_read_key(), [0u8; 32]);
+        assert!(
+            UnlockAccess::Limited
+                .into_read_key()
+                .is_read_only_placeholder()
+        );
     }
 }

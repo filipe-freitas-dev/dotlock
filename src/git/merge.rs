@@ -248,7 +248,7 @@ fn merge_vault_metadata(
     // vault.
     if let Some(marker) = &marker {
         for id in &marker.merged_ids {
-            if !merged.wrapped_sdks_under_kek.contains_key(id) {
+            if !merged.wrapped_sdks_under_dek.contains_key(id) {
                 return Err(DotLockError::MissingSecretKeyWrapping { id: id.clone() });
             }
         }
@@ -276,7 +276,7 @@ fn merge_vault_metadata(
     Ok(())
 }
 
-/// Merges `wrapped_sdks_under_kek` (and each recipient's `wrapped_sdks`) as a
+/// Merges `wrapped_sdks_under_dek` (and each recipient's `wrapped_sdks`) as a
 /// union by secret id. On a same-id conflict the wrapping comes from the same
 /// side as the winning ciphertext (`theirs_won`), so SDK and ciphertext never
 /// diverge.
@@ -285,12 +285,12 @@ fn union_sdk_wrappings(
     theirs: &VaultKeyMetadata,
     theirs_won: &HashSet<&String>,
 ) {
-    for (id, wrapped) in &theirs.wrapped_sdks_under_kek {
+    for (id, wrapped) in &theirs.wrapped_sdks_under_dek {
         let take_theirs =
-            theirs_won.contains(id) || !merged.wrapped_sdks_under_kek.contains_key(id);
+            theirs_won.contains(id) || !merged.wrapped_sdks_under_dek.contains_key(id);
         if take_theirs {
             merged
-                .wrapped_sdks_under_kek
+                .wrapped_sdks_under_dek
                 .insert(id.clone(), wrapped.clone());
         }
     }
@@ -593,7 +593,9 @@ mod driver_tests {
         },
     };
 
-    const DEK: [u8; 32] = [8u8; 32];
+    fn dek() -> crate::domain::keys::ProjectKey {
+        crate::domain::keys::ProjectKey::new([8u8; 32])
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -620,7 +622,7 @@ mod driver_tests {
             kek_writes_since_rotate: 0,
             wrapped_dek_nonce_b64: "nonce".to_string(),
             wrapped_dek_b64: "wrapped".to_string(),
-            wrapped_sdks_under_kek: std::collections::HashMap::new(),
+            wrapped_sdks_under_dek: std::collections::HashMap::new(),
             access_mode: AccessMode::MasterPassword,
             recipients: Vec::new(),
             authorized_signers: Vec::new(),
@@ -669,7 +671,7 @@ mod driver_tests {
                 name.to_string(),
                 value.to_string(),
                 Alg::XChaCha20Poly1305,
-                &DEK,
+                &dek(),
                 self.vault.to_str().expect("vault path"),
             )
             .expect("upsert");
@@ -717,10 +719,10 @@ mod driver_tests {
             .find(|secret| secret.name == name)
             .unwrap_or_else(|| panic!("secret {name} missing from merge"));
         let wrapped = metadata
-            .wrapped_sdks_under_kek
+            .wrapped_sdks_under_dek
             .get(&secret.id)
             .unwrap_or_else(|| panic!("secret {name} lost its SDK wrapping in the merge"));
-        let sdk = sdk::unwrap_sdk_with_project_key(wrapped, &DEK).expect("unwrap sdk");
+        let sdk = sdk::unwrap_sdk_with_project_key(wrapped, &dek()).expect("unwrap sdk");
         decrypt_record_with_key(secret, &sdk)
             .unwrap_or_else(|err| panic!("secret {name} undecryptable after merge: {err}"))
     }
@@ -744,7 +746,7 @@ mod driver_tests {
         assert_eq!(file.secrets.len(), 3);
         for secret in &file.secrets {
             assert!(
-                metadata.wrapped_sdks_under_kek.contains_key(&secret.id),
+                metadata.wrapped_sdks_under_dek.contains_key(&secret.id),
                 "secret {} has no wrapping after merge",
                 secret.name
             );
@@ -781,7 +783,7 @@ mod driver_tests {
         let theirs = base.copy_to("k2-win-theirs");
         // Their side re-keys the secret (fresh SDK, like an ACL rotation).
         let mut theirs_metadata = load_vault_metadata(&theirs.vault).expect("load theirs vault");
-        theirs_metadata.wrapped_sdks_under_kek.clear();
+        theirs_metadata.wrapped_sdks_under_dek.clear();
         save_vault_metadata(&theirs.vault, &theirs_metadata).expect("save theirs vault");
         theirs.set("A", "ignored"); // version 2
         theirs.set("A", "theirs-val"); // version 3: legitimately newer
@@ -794,7 +796,7 @@ mod driver_tests {
 
         // The legitimate winner also survives reconcile (its ciphertext
         // authenticates under the claimed metadata).
-        reconcile_pending_merge(&ours.vault, &ours.secrets, &ours.dir, &DEK).expect("reconcile");
+        reconcile_pending_merge(&ours.vault, &ours.secrets, &ours.dir, &dek()).expect("reconcile");
         assert_eq!(decrypt_with_wrapping(&ours, "A"), "theirs-val");
 
         base.cleanup();
@@ -825,7 +827,7 @@ mod driver_tests {
         assert_eq!(merged.secrets[0].version, 99);
 
         // ...but it can never be silently blessed.
-        let err = reconcile_pending_merge(&ours.vault, &ours.secrets, &ours.dir, &DEK)
+        let err = reconcile_pending_merge(&ours.vault, &ours.secrets, &ours.dir, &dek())
             .expect_err("reconcile must reject the replayed record");
         assert!(
             err.to_string().contains("failed authentication"),
@@ -863,7 +865,7 @@ mod driver_tests {
             .expect("C present")
             .id
             .clone();
-        theirs_metadata.wrapped_sdks_under_kek.remove(&c_id);
+        theirs_metadata.wrapped_sdks_under_dek.remove(&c_id);
         save_vault_metadata(&theirs.vault, &theirs_metadata).expect("save theirs vault");
 
         let result = run_driver(&ours, &theirs, &base);
@@ -892,14 +894,14 @@ mod driver_tests {
 
         // Stale hash by construction: the driver never re-signed it.
         let metadata = load_vault_metadata(&ours.vault).expect("load merged vault");
-        assert!(verify_secrets_integrity(&ours.secrets, &metadata, &DEK).is_err());
+        assert!(verify_secrets_integrity(&ours.secrets, &metadata, &dek()).is_err());
 
-        reconcile_pending_merge(&ours.vault, &ours.secrets, &ours.dir, &DEK).expect("reconcile");
+        reconcile_pending_merge(&ours.vault, &ours.secrets, &ours.dir, &dek()).expect("reconcile");
 
         assert!(load_marker(&ours.dir).expect("load marker").is_none());
         ensure_no_pending_merge(&ours.dir).expect("marker removed");
         let metadata = load_vault_metadata(&ours.vault).expect("reload merged vault");
-        verify_secrets_integrity(&ours.secrets, &metadata, &DEK)
+        verify_secrets_integrity(&ours.secrets, &metadata, &dek())
             .expect("integrity green after reconcile");
         assert_eq!(decrypt_with_wrapping(&ours, "A"), "a-val");
         assert_eq!(decrypt_with_wrapping(&ours, "B"), "b-val");
@@ -926,7 +928,7 @@ mod driver_tests {
         content.push_str("\n# tampered\n");
         secure_fs::write_string_atomic(&ours.secrets, &content, 0o700, 0o600).expect("tamper");
 
-        let err = reconcile_pending_merge(&ours.vault, &ours.secrets, &ours.dir, &DEK)
+        let err = reconcile_pending_merge(&ours.vault, &ours.secrets, &ours.dir, &dek())
             .expect_err("must refuse tampered content");
         assert!(err.to_string().contains("no longer matches"));
         // The marker stays: access remains blocked until manual resolution.

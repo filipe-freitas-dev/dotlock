@@ -182,7 +182,7 @@ mod tests {
             kek_writes_since_rotate: 0,
             wrapped_dek_nonce_b64: "nonce".to_string(),
             wrapped_dek_b64: "wrapped".to_string(),
-            wrapped_sdks_under_kek: std::collections::HashMap::new(),
+            wrapped_sdks_under_dek: std::collections::HashMap::new(),
             access_mode: AccessMode::MasterPassword,
             recipients: Vec::new(),
             authorized_signers: Vec::new(),

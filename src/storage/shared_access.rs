@@ -1,7 +1,6 @@
 use std::{collections::HashMap, path::Path};
 
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 use crate::{
     crypto::{
@@ -13,11 +12,11 @@ use crate::{
         },
         update_master_password_metadata,
     },
-    domain::{error::DotLockError, model::DotLockResult},
+    domain::{error::DotLockError, keys::ProjectKey, model::DotLockResult},
     storage::{
         identity::LocalIdentity,
         vault_file::{
-            RatchetSummary, load_vault_metadata, record_vault_write, rotate_kek_wrapping,
+            RatchetSummary, load_vault_metadata, record_vault_write, rotate_project_key_wrapping,
             save_vault_metadata,
         },
         vault_txn::{VaultPairWrite, commit_vault_pair},
@@ -155,7 +154,7 @@ pub fn grant_recipient(
     vault_path: &str,
     public_key_pem: &str,
     label: &str,
-    dek: &[u8; 32],
+    dek: &ProjectKey,
 ) -> DotLockResult<VaultRecipient> {
     grant_recipient_with_secret_ids(vault_path, public_key_pem, label, dek, None, None)
 }
@@ -164,7 +163,7 @@ pub fn grant_recipient_with_secret_ids(
     vault_path: &str,
     public_key_pem: &str,
     label: &str,
-    dek: &[u8; 32],
+    dek: &ProjectKey,
     allowed_secret_ids: Option<&[String]>,
     signer: Option<&LocalIdentity>,
 ) -> DotLockResult<VaultRecipient> {
@@ -175,7 +174,7 @@ pub fn grant_recipient_with_secret_ids(
     let public_key_b64 = encode_public_key_b64(public_key_pem)?;
     let full_access = allowed_secret_ids.is_none();
     let wrapped_dek_b64 = if full_access {
-        wrap_dek_for_public_key(dek, public_key_pem)?
+        wrap_dek_for_public_key(dek.as_bytes(), public_key_pem)?
     } else {
         String::new()
     };
@@ -250,20 +249,23 @@ pub fn grant_recipient_with_secret_ids(
 fn wrap_allowed_sdks(
     metadata: &VaultKeyMetadata,
     public_key_pem: &str,
-    dek: &[u8; 32],
+    dek: &ProjectKey,
     allowed_secret_ids: Option<&[String]>,
 ) -> DotLockResult<HashMap<String, String>> {
     let ids: Vec<String> = match allowed_secret_ids {
         Some(ids) => ids.to_vec(),
-        None => metadata.wrapped_sdks_under_kek.keys().cloned().collect(),
+        None => metadata.wrapped_sdks_under_dek.keys().cloned().collect(),
     };
     let mut wrapped = HashMap::new();
     for secret_id in ids {
-        let Some(project_wrapped_sdk) = metadata.wrapped_sdks_under_kek.get(&secret_id) else {
+        let Some(project_wrapped_sdk) = metadata.wrapped_sdks_under_dek.get(&secret_id) else {
             continue;
         };
         let sdk = crate::crypto::sdk::unwrap_sdk_with_project_key(project_wrapped_sdk, dek)?;
-        wrapped.insert(secret_id, wrap_dek_for_public_key(&sdk, public_key_pem)?);
+        wrapped.insert(
+            secret_id,
+            wrap_dek_for_public_key(sdk.as_bytes(), public_key_pem)?,
+        );
     }
     Ok(wrapped)
 }
@@ -292,7 +294,7 @@ pub struct RevokeOutcome {
     /// The freshly rotated project key. The CLI invalidates the session cache
     /// instead of reusing it; tests use it to verify the vault stays readable.
     #[allow(dead_code)]
-    pub new_dek: Zeroizing<[u8; 32]>,
+    pub new_dek: ProjectKey,
     pub summary: RatchetSummary,
 }
 
@@ -312,17 +314,17 @@ pub fn revoke_recipient_and_rotate(
     vault_path: &str,
     secrets_path: &str,
     query: &str,
-    current_dek: &[u8; 32],
+    current_dek: &ProjectKey,
     passphrase: &str,
 ) -> DotLockResult<RevokeOutcome> {
     let mut metadata = load_vault_metadata(vault_path)?;
     let removed = revoke_recipient_in_memory(&mut metadata, query)?;
 
-    let new_dek = Zeroizing::new(generate_dek()?);
+    let new_dek = generate_dek()?;
     // Rewraps every per-secret SDK and every remaining recipient's DEK under
     // the new project key, and re-encrypts `secrets_hash_*` under it, in the
     // same metadata object.
-    let summary = rotate_kek_wrapping(&mut metadata, current_dek, &new_dek)?;
+    let summary = rotate_project_key_wrapping(&mut metadata, current_dek, &new_dek)?;
     update_master_password_metadata(&mut metadata, &new_dek, passphrase)?;
 
     commit_vault_pair(
@@ -363,7 +365,7 @@ pub fn add_recipient_secret_ids(
     vault_path: &str,
     query: &str,
     secret_ids: &[String],
-    dek: &[u8; 32],
+    dek: &ProjectKey,
 ) -> DotLockResult<usize> {
     let mut metadata = load_vault_metadata(vault_path)?;
     let recipient = metadata
@@ -383,13 +385,13 @@ pub fn add_recipient_secret_ids(
         if recipient.wrapped_sdks.contains_key(secret_id) {
             continue;
         }
-        let Some(project_wrapped_sdk) = metadata.wrapped_sdks_under_kek.get(secret_id) else {
+        let Some(project_wrapped_sdk) = metadata.wrapped_sdks_under_dek.get(secret_id) else {
             continue;
         };
         let sdk = crate::crypto::sdk::unwrap_sdk_with_project_key(project_wrapped_sdk, dek)?;
         recipient.wrapped_sdks.insert(
             secret_id.clone(),
-            wrap_dek_for_public_key_b64(&sdk, &recipient.public_key_b64)?,
+            wrap_dek_for_public_key_b64(sdk.as_bytes(), &recipient.public_key_b64)?,
         );
         added += 1;
     }
@@ -415,6 +417,7 @@ mod tests {
             AccessMode, VaultConfig, VaultKeyMetadata,
             share::{IdentityProtection, generate_identity},
         },
+        domain::keys::ProjectKey,
         storage::vault_file::{load_vault_metadata, save_vault_metadata},
     };
 
@@ -446,7 +449,7 @@ mod tests {
             kek_writes_since_rotate: 0,
             wrapped_dek_nonce_b64: "nonce".to_string(),
             wrapped_dek_b64: "wrapped".to_string(),
-            wrapped_sdks_under_kek: std::collections::HashMap::new(),
+            wrapped_sdks_under_dek: std::collections::HashMap::new(),
             access_mode: AccessMode::MasterPassword,
             recipients: Vec::new(),
             authorized_signers: Vec::new(),
@@ -468,7 +471,7 @@ mod tests {
             path.to_str().expect("path"),
             &identity.public_key_pem,
             "alice",
-            &[3u8; 32],
+            &ProjectKey::new([3u8; 32]),
         )
         .expect("grant");
         let listed = list_recipients(path.to_str().expect("path")).expect("list");
@@ -521,7 +524,7 @@ mod tests {
         let vault_str = vault_path.to_str().expect("vault path");
         let secrets_str = secrets_path.to_str().expect("secrets path");
 
-        let old_dek = [8u8; 32];
+        let old_dek = ProjectKey::new([8u8; 32]);
         let passphrase = "test-passphrase";
         let mut metadata = metadata();
         update_master_password_metadata(&mut metadata, &old_dek, passphrase).expect("wrap dek");
@@ -581,7 +584,7 @@ mod tests {
             .find(|secret| secret.name == "A")
             .expect("record A");
         let wrapped_sdk = metadata
-            .wrapped_sdks_under_kek
+            .wrapped_sdks_under_dek
             .get(&record_a.id)
             .expect("SDK wrapping for A");
         let sdk_a = sdk::unwrap_sdk_with_project_key(wrapped_sdk, &outcome.new_dek)
@@ -630,7 +633,7 @@ mod tests {
         };
         let unlocked_dek = unwrap_dek(&kek, &wrapped, &metadata.project, &metadata.environment)
             .expect("owner password unlock");
-        assert_eq!(unlocked_dek, *outcome.new_dek);
+        assert_eq!(unlocked_dek.as_bytes(), outcome.new_dek.as_bytes());
 
         // (5) integrity verifies under the new DEK and rejects the old one.
         verify_secrets_integrity(&secrets_path, &metadata, &outcome.new_dek)
@@ -647,13 +650,21 @@ mod tests {
     fn grant_can_limit_recipient_to_allowed_secret_sdks() {
         let path = temp_file("shared-access-allow");
         let mut metadata = metadata();
-        metadata.wrapped_sdks_under_kek.insert(
+        metadata.wrapped_sdks_under_dek.insert(
             "foo-id".to_string(),
-            crate::crypto::sdk::wrap_sdk_for_project_key(&[1u8; 32], &[3u8; 32]).expect("wrap foo"),
+            crate::crypto::sdk::wrap_sdk_for_project_key(
+                &crate::domain::keys::SecretKey::new([1u8; 32]),
+                &ProjectKey::new([3u8; 32]),
+            )
+            .expect("wrap foo"),
         );
-        metadata.wrapped_sdks_under_kek.insert(
+        metadata.wrapped_sdks_under_dek.insert(
             "bar-id".to_string(),
-            crate::crypto::sdk::wrap_sdk_for_project_key(&[2u8; 32], &[3u8; 32]).expect("wrap bar"),
+            crate::crypto::sdk::wrap_sdk_for_project_key(
+                &crate::domain::keys::SecretKey::new([2u8; 32]),
+                &ProjectKey::new([3u8; 32]),
+            )
+            .expect("wrap bar"),
         );
         save_vault_metadata(&path, &metadata).expect("save metadata");
         let identity =
@@ -663,7 +674,7 @@ mod tests {
             path.to_str().expect("path"),
             &identity.public_key_pem,
             "alice",
-            &[3u8; 32],
+            &ProjectKey::new([3u8; 32]),
             Some(&["foo-id".to_string()]),
             None,
         )
@@ -720,7 +731,7 @@ mod tests {
             path.to_str().expect("path"),
             &grantee.public_key_pem,
             "bob",
-            &[3u8; 32],
+            &ProjectKey::new([3u8; 32]),
             None,
             Some(&signer),
         )

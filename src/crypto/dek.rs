@@ -3,7 +3,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
 };
 
-use crate::domain::{error::DotLockError, model::DotLockResult};
+use crate::domain::{error::DotLockError, keys::ProjectKey, model::DotLockResult};
 
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
@@ -13,18 +13,18 @@ pub struct WrappedDek {
     pub ciphertext: Vec<u8>,
 }
 
-pub fn generate_dek() -> DotLockResult<[u8; KEY_LEN]> {
+pub fn generate_dek() -> DotLockResult<ProjectKey> {
     let mut dek = [0u8; KEY_LEN];
 
     getrandom::fill(&mut dek)
         .map_err(|e| DotLockError::Crypto(format!("failed to generate DEK: {e}")))?;
 
-    Ok(dek)
+    Ok(ProjectKey::new(dek))
 }
 
 pub fn wrap_dek(
     kek: &[u8; KEY_LEN],
-    dek: &[u8; KEY_LEN],
+    dek: &ProjectKey,
     project: &str,
     environment: &str,
 ) -> DotLockResult<WrappedDek> {
@@ -41,7 +41,7 @@ pub fn wrap_dek(
         .encrypt(
             XNonce::from_slice(&nonce),
             Payload {
-                msg: dek,
+                msg: dek.as_bytes().as_slice(),
                 aad: aad.as_bytes(),
             },
         )
@@ -55,7 +55,7 @@ pub fn unwrap_dek(
     wrapped: &WrappedDek,
     project: &str,
     environment: &str,
-) -> DotLockResult<[u8; KEY_LEN]> {
+) -> DotLockResult<ProjectKey> {
     let aad = format!("dotlock:v1:wrapped-dek:project={project}:env={environment}");
 
     let cipher = XChaCha20Poly1305::new(kek.into());
@@ -74,5 +74,5 @@ pub fn unwrap_dek(
         .try_into()
         .map_err(|_| DotLockError::Crypto("invalid DEK length".to_string()))?;
 
-    Ok(dek)
+    Ok(ProjectKey::new(dek))
 }

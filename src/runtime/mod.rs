@@ -2,7 +2,7 @@ use std::{process::Command, time::Instant};
 
 use crate::{
     audit::{record_dynamic_resolve, record_run},
-    domain::{error::DotLockError, model::DotLockResult},
+    domain::{error::DotLockError, keys::ProjectKey, model::DotLockResult},
     providers::resolve_provider,
     storage::{
         project::SECRETS_FILE,
@@ -11,7 +11,7 @@ use crate::{
     },
 };
 
-pub fn run_with_secrets(command: Vec<String>, dek: &[u8; 32]) -> DotLockResult<()> {
+pub fn run_with_secrets(command: Vec<String>, dek: &ProjectKey) -> DotLockResult<()> {
     if command.is_empty() {
         return Err(DotLockError::MissingCommand);
     }
@@ -57,7 +57,7 @@ pub fn run_with_secrets(command: Vec<String>, dek: &[u8; 32]) -> DotLockResult<(
 
 pub fn secret_value_for_runtime(
     secret: &crate::storage::secrets_lock::SecretRecord,
-    dek: &[u8; 32],
+    dek: &ProjectKey,
     all_secrets: &[crate::storage::secrets_lock::SecretRecord],
 ) -> DotLockResult<Option<String>> {
     match &secret.kind {
@@ -81,7 +81,7 @@ pub fn secret_value_for_runtime(
 pub fn resolve_dynamic_secret(
     secret_name: &str,
     dynamic: &crate::storage::secrets_lock::DynamicSecretMetadata,
-    dek: &[u8; 32],
+    dek: &ProjectKey,
     all_secrets: &[crate::storage::secrets_lock::SecretRecord],
 ) -> DotLockResult<String> {
     let mut bootstrap_values = serde_json::Map::new();

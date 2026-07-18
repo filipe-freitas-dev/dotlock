@@ -4,31 +4,35 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
 };
 
-use crate::domain::{error::DotLockError, model::DotLockResult};
+use crate::domain::{
+    error::DotLockError,
+    keys::{ProjectKey, SecretKey},
+    model::DotLockResult,
+};
 
 const SDK_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
 const SDK_AAD: &[u8] = b"dotlock:v3:sdk-wrap";
 
-pub fn generate_sdk() -> DotLockResult<[u8; SDK_LEN]> {
+pub fn generate_sdk() -> DotLockResult<SecretKey> {
     let mut sdk = [0u8; SDK_LEN];
     getrandom::fill(&mut sdk).map_err(|err| DotLockError::Crypto(err.to_string()))?;
-    Ok(sdk)
+    Ok(SecretKey::new(sdk))
 }
 
 pub fn wrap_sdk_for_project_key(
-    sdk: &[u8; SDK_LEN],
-    project_key: &[u8; 32],
+    sdk: &SecretKey,
+    project_key: &ProjectKey,
 ) -> DotLockResult<String> {
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::fill(&mut nonce).map_err(|err| DotLockError::Crypto(err.to_string()))?;
 
-    let cipher = XChaCha20Poly1305::new(project_key.into());
+    let cipher = XChaCha20Poly1305::new(project_key.as_bytes().into());
     let ciphertext = cipher
         .encrypt(
             XNonce::from_slice(&nonce),
             Payload {
-                msg: sdk,
+                msg: sdk.as_bytes().as_slice(),
                 aad: SDK_AAD,
             },
         )
@@ -42,8 +46,8 @@ pub fn wrap_sdk_for_project_key(
 
 pub fn unwrap_sdk_with_project_key(
     wrapped_sdk_b64: &str,
-    project_key: &[u8; 32],
-) -> DotLockResult<[u8; SDK_LEN]> {
+    project_key: &ProjectKey,
+) -> DotLockResult<SecretKey> {
     let data = general_purpose::STANDARD
         .decode(wrapped_sdk_b64)
         .map_err(|err| {
@@ -55,7 +59,7 @@ pub fn unwrap_sdk_with_project_key(
         ));
     }
 
-    let cipher = XChaCha20Poly1305::new(project_key.into());
+    let cipher = XChaCha20Poly1305::new(project_key.as_bytes().into());
     let plaintext = cipher
         .decrypt(
             XNonce::from_slice(&data[..NONCE_LEN]),
@@ -66,7 +70,8 @@ pub fn unwrap_sdk_with_project_key(
         )
         .map_err(|_| DotLockError::Crypto("failed to unwrap secret key".to_string()))?;
 
-    plaintext
+    let sdk: [u8; SDK_LEN] = plaintext
         .try_into()
-        .map_err(|_| DotLockError::Crypto("invalid secret key size".to_string()))
+        .map_err(|_| DotLockError::Crypto("invalid secret key size".to_string()))?;
+    Ok(SecretKey::new(sdk))
 }

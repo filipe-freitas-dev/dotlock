@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     crypto::VaultKeyMetadata,
-    domain::{error::DotLockError, model::DotLockResult},
+    domain::{error::DotLockError, keys::ProjectKey, model::DotLockResult},
     storage::secure_fs,
 };
 
@@ -38,11 +38,11 @@ pub struct EncryptedHash {
     pub ciphertext: Vec<u8>,
 }
 
-pub fn encrypt_hash(hash: &[u8; HASH_LEN], dek: &[u8; 32]) -> DotLockResult<EncryptedHash> {
+pub fn encrypt_hash(hash: &[u8; HASH_LEN], dek: &ProjectKey) -> DotLockResult<EncryptedHash> {
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::fill(&mut nonce).map_err(|e| DotLockError::Crypto(e.to_string()))?;
 
-    let cipher = XChaCha20Poly1305::new(dek.into());
+    let cipher = XChaCha20Poly1305::new(dek.as_bytes().into());
     let ciphertext = cipher
         .encrypt(
             XNonce::from_slice(&nonce),
@@ -59,9 +59,9 @@ pub fn encrypt_hash(hash: &[u8; HASH_LEN], dek: &[u8; 32]) -> DotLockResult<Encr
 pub fn decrypt_hash(
     nonce: &[u8; NONCE_LEN],
     ciphertext: &[u8],
-    dek: &[u8; 32],
+    dek: &ProjectKey,
 ) -> DotLockResult<[u8; HASH_LEN]> {
-    let cipher = XChaCha20Poly1305::new(dek.into());
+    let cipher = XChaCha20Poly1305::new(dek.as_bytes().into());
     let plaintext = cipher
         .decrypt(
             XNonce::from_slice(nonce),
@@ -81,7 +81,7 @@ pub fn decrypt_hash(
 pub fn verify_secrets_integrity<P: AsRef<Path>>(
     secrets_path: P,
     metadata: &VaultKeyMetadata,
-    dek: &[u8; 32],
+    dek: &ProjectKey,
 ) -> DotLockResult<()> {
     if metadata.secrets_hash_b64.is_empty() || metadata.secrets_hash_nonce_b64.is_empty() {
         return Err(DotLockError::LegacyVaultFormat);
@@ -145,8 +145,8 @@ pub fn bytes_sha256_b64(bytes: &[u8]) -> String {
 /// Rejects the all-zero key. A zeroed array is the placeholder handed to
 /// read-only (limited-identity) unlocks; encrypting the integrity hash under
 /// it would brick the vault for every full-access user on the next unlock.
-fn reject_all_zero_key(dek: &[u8; 32]) -> DotLockResult<()> {
-    if dek == &[0u8; 32] {
+fn reject_all_zero_key(dek: &ProjectKey) -> DotLockResult<()> {
+    if dek.is_read_only_placeholder() {
         return Err(DotLockError::Crypto(
             "refusing to encrypt the integrity hash with an all-zero key (read-only unlock cannot sign the vault)".to_string(),
         ));
@@ -158,7 +158,7 @@ fn reject_all_zero_key(dek: &[u8; 32]) -> DotLockResult<()> {
 /// content, so mutators can finalize metadata before any file is written.
 pub fn build_encrypted_hash_fields_from_bytes(
     bytes: &[u8],
-    dek: &[u8; 32],
+    dek: &ProjectKey,
 ) -> DotLockResult<(String, String)> {
     reject_all_zero_key(dek)?;
     let hash = compute_bytes_sha256(bytes);
@@ -171,7 +171,7 @@ pub fn build_encrypted_hash_fields_from_bytes(
 
 pub fn build_encrypted_hash_fields(
     secrets_path: impl AsRef<Path>,
-    dek: &[u8; 32],
+    dek: &ProjectKey,
 ) -> DotLockResult<(String, String)> {
     reject_all_zero_key(dek)?;
     let hash = compute_file_sha256(secrets_path)?;
@@ -185,11 +185,14 @@ pub fn build_encrypted_hash_fields(
 #[cfg(test)]
 mod tests {
     use super::{build_encrypted_hash_fields, build_encrypted_hash_fields_from_bytes};
-    use crate::domain::error::DotLockError;
+    use crate::domain::{error::DotLockError, keys::ProjectKey};
 
     #[test]
     fn build_encrypted_hash_fields_from_bytes_rejects_all_zero_key() {
-        let result = build_encrypted_hash_fields_from_bytes(b"content", &[0u8; 32]);
+        let result = build_encrypted_hash_fields_from_bytes(
+            b"content",
+            &ProjectKey::read_only_placeholder(),
+        );
         assert!(matches!(result, Err(DotLockError::Crypto(_))));
     }
 
@@ -197,7 +200,7 @@ mod tests {
     fn build_encrypted_hash_fields_rejects_all_zero_key() {
         let path = std::env::temp_dir().join("dotlock-zero-key-hash-test");
         std::fs::write(&path, b"content").expect("write");
-        let result = build_encrypted_hash_fields(&path, &[0u8; 32]);
+        let result = build_encrypted_hash_fields(&path, &ProjectKey::read_only_placeholder());
         assert!(matches!(result, Err(DotLockError::Crypto(_))));
         let _ = std::fs::remove_file(path);
     }
@@ -205,7 +208,8 @@ mod tests {
     #[test]
     fn build_encrypted_hash_fields_accepts_non_zero_key() {
         let (nonce_b64, hash_b64) =
-            build_encrypted_hash_fields_from_bytes(b"content", &[8u8; 32]).expect("build");
+            build_encrypted_hash_fields_from_bytes(b"content", &ProjectKey::new([8u8; 32]))
+                .expect("build");
         assert!(!nonce_b64.is_empty());
         assert!(!hash_b64.is_empty());
     }

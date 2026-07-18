@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     crypto::{integrity::file_sha256_b64, sdk},
-    domain::{error::DotLockError, model::DotLockResult},
+    domain::{error::DotLockError, keys::ProjectKey, model::DotLockResult},
     storage::{
         secrets_lock::{current_unix_timestamp, load_secrets_file, refresh_vault_hash},
         secure_fs,
@@ -177,7 +177,7 @@ pub fn reconcile_pending_merge(
     vault_path: &Path,
     secrets_path: &Path,
     lock_dir: &Path,
-    dek: &[u8; 32],
+    dek: &ProjectKey,
 ) -> DotLockResult<()> {
     let marker = load_marker(lock_dir)?
         .ok_or_else(|| DotLockError::Io("no pending merge to reconcile".to_string()))?;
@@ -191,7 +191,7 @@ pub fn reconcile_pending_merge(
         // and the vault must be repaired instead of blessed.
         for secret in &file.secrets {
             let wrapped = metadata
-                .wrapped_sdks_under_kek
+                .wrapped_sdks_under_dek
                 .get(&secret.id)
                 .ok_or_else(|| DotLockError::MissingSecretKeyWrapping {
                     id: secret.id.clone(),

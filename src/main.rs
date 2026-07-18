@@ -3,13 +3,13 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use colored::Colorize;
-use zeroize::Zeroizing;
 
 use crate::{
     audit::{audit_log_path, record_ratchet, rotate_current_log, show_entries, verify_log},
     crypto::{ask_master_password, dek::generate_dek, update_master_password_metadata},
     domain::{
         error::DotLockError,
+        keys::ProjectKey,
         model::{Alg, DotLockResult},
     },
     git::{
@@ -49,7 +49,7 @@ use crate::{
             unlock_vault_with_master_password, unlock_vault_with_master_password_and_passphrase,
         },
         vault_file::{
-            RatchetSummary, load_vault_metadata, record_vault_write, rotate_kek_wrapping,
+            RatchetSummary, load_vault_metadata, record_vault_write, rotate_project_key_wrapping,
             save_vault_metadata, should_auto_ratchet_for_next_write,
         },
         vault_txn::{VaultPairWrite, commit_vault_pair, recover_pending},
@@ -355,13 +355,16 @@ struct GitMergeArgs {
 
 #[derive(Subcommand, Debug)]
 enum RotateCommand {
-    /// Rotate only the key wrapping secret data keys
+    /// Rotate the project key (DEK) and rewrap the secret data keys
+    /// (historical name; does the same as `project-key` — the KEK only ever
+    /// wraps the DEK and is re-derived from the master password)
     #[command(alias = "k")]
     Kek,
     /// Change the master password wrapping the project key
     #[command(alias = "mp")]
     MasterPassword,
-    /// Generate a new project key and re-encrypt the secrets
+    /// Generate a new project key (DEK) and rewrap the secret data keys
+    /// (secret ciphertexts are unchanged; only their wrappings move)
     #[command(alias = "pk")]
     ProjectKey,
 }
@@ -937,7 +940,7 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
                 ensure_project_initialized()?;
                 let (dek, passphrase) =
                     unlock_vault_with_master_password_and_passphrase(VAULT_FILE)?;
-                let (_new_dek, summary) = rotate_project_key_wrapping(&dek, &passphrase)?;
+                let (_new_dek, summary) = rotate_project_key(&dek, &passphrase)?;
                 print_ratchet_summary(&summary);
                 Ok(())
             }
@@ -945,7 +948,7 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
                 ensure_project_initialized()?;
                 let (dek, passphrase) =
                     unlock_vault_with_master_password_and_passphrase(VAULT_FILE)?;
-                let (_new_dek, _) = rotate_project_key_wrapping(&dek, &passphrase)?;
+                let (_new_dek, _) = rotate_project_key(&dek, &passphrase)?;
                 println!("{} project key rotated", "ok:".green().bold());
                 Ok(())
             }
@@ -991,7 +994,7 @@ fn print_merge_diff(marker: &PendingMergeMarker) {
     }
 }
 
-fn prepare_project_key_for_write(access: UnlockAccess) -> DotLockResult<Zeroizing<[u8; 32]>> {
+fn prepare_project_key_for_write(access: UnlockAccess) -> DotLockResult<ProjectKey> {
     let current_dek = access.require_full()?;
     let metadata = load_vault_metadata(VAULT_FILE)?;
     if !should_auto_ratchet_for_next_write(&metadata) {
@@ -999,21 +1002,22 @@ fn prepare_project_key_for_write(access: UnlockAccess) -> DotLockResult<Zeroizin
     }
 
     let (verified_dek, passphrase) = unlock_vault_with_master_password_and_passphrase(VAULT_FILE)?;
-    let (new_dek, summary) = rotate_project_key_wrapping(&verified_dek, &passphrase)?;
+    let (new_dek, summary) = rotate_project_key(&verified_dek, &passphrase)?;
     print_ratchet_summary(&summary);
     Ok(new_dek)
 }
 
-fn rotate_project_key_wrapping(
-    current_dek: &[u8; 32],
+fn rotate_project_key(
+    current_dek: &ProjectKey,
     passphrase: &str,
-) -> DotLockResult<(Zeroizing<[u8; 32]>, RatchetSummary)> {
+) -> DotLockResult<(ProjectKey, RatchetSummary)> {
     let mut metadata = load_vault_metadata(VAULT_FILE)?;
-    let new_dek = Zeroizing::new(generate_dek()?);
-    // rotate_kek_wrapping rewraps the DEK/SDKs AND re-encrypts `secrets_hash_*`
-    // under the new DEK in the same metadata object; one transactional commit
-    // makes the whole rotation atomic (secrets.lock is unchanged by rotation).
-    let summary = rotate_kek_wrapping(&mut metadata, current_dek, &new_dek)?;
+    let new_dek = generate_dek()?;
+    // rotate_project_key_wrapping rewraps the SDKs/recipient wrappings AND
+    // re-encrypts `secrets_hash_*` under the new DEK in the same metadata
+    // object; one transactional commit makes the whole rotation atomic
+    // (secrets.lock is unchanged by rotation). `dl rotate` rotates the DEK.
+    let summary = rotate_project_key_wrapping(&mut metadata, current_dek, &new_dek)?;
     update_master_password_metadata(&mut metadata, &new_dek, passphrase)?;
     commit_vault_pair(
         std::path::Path::new(VAULT_FILE),
@@ -1076,7 +1080,7 @@ fn print_ratchet_summary(summary: &RatchetSummary) {
     }
 }
 
-fn decrypted_env_entries(dek: &[u8; 32]) -> DotLockResult<Vec<EnvEntry>> {
+fn decrypted_env_entries(dek: &ProjectKey) -> DotLockResult<Vec<EnvEntry>> {
     let mut secrets = load_secrets_file(SECRETS_FILE)?.secrets;
     secrets.sort_by(|a, b| a.name.cmp(&b.name));
 
