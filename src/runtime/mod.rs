@@ -21,7 +21,7 @@ pub fn run_with_secrets(command: Vec<String>, dek: &[u8; 32]) -> DotLockResult<(
     let mut envs = Vec::new();
 
     for secret in &file.secrets {
-        let value = match secret_value_for_runtime(&secret, dek, &file.secrets) {
+        let value = match secret_value_for_runtime(secret, dek, &file.secrets) {
             Ok(Some(value)) => value,
             Ok(None) => continue,
             Err(err) => return Err(err),

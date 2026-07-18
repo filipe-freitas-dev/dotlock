@@ -322,7 +322,7 @@ fn audit_log_paths(path: &Path) -> DotLockResult<Vec<PathBuf>> {
         }
     }
 
-    paths.sort_by(|left, right| log_sort_key(left).cmp(&log_sort_key(right)));
+    paths.sort_by_key(|path| log_sort_key(path));
     Ok(paths)
 }
 
@@ -444,7 +444,7 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> DotLockResult<u64> {
     let month_prime = month + if month > 2 { -3 } else { 9 };
     let doy = (153 * month_prime + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era as i64 * 146097 + doe as i64 - 719468;
+    let days = era * 146097 + doe - 719468;
     if days < 0 {
         return Err(DotLockError::Io("invalid --since date".to_string()));
     }
