@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::domain::{error::DotLockError, model::DotLockResult};
 
+#[cfg(not(windows))]
 const APP_DIR: &str = ".lock";
 
 /// Root directory for per-user DotLock state (identities, key caches, audit
