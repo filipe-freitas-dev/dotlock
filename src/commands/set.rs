@@ -58,7 +58,15 @@ pub fn run(args: SetArgs) -> DotLockResult<()> {
             None if stdin => read_value_from_stdin()?,
             None => prompt_secret_value(&name)?,
         };
-        upsert_plain_secret(SECRETS_FILE, name, value, alg, &dek, VAULT_FILE, &mut metadata)?
+        upsert_plain_secret(
+            SECRETS_FILE,
+            name,
+            value,
+            alg,
+            &dek,
+            VAULT_FILE,
+            &mut metadata,
+        )?
     };
 
     println!(

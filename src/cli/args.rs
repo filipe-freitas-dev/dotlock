@@ -54,6 +54,13 @@ pub enum Commands {
     /// Run a command with decrypted variables in its environment
     #[command(alias = "r")]
     Run(RunArgs),
+    /// Run a shell command line with decrypted variables in its environment
+    /// (FG4). The string is executed via `sh -c`; secrets are injected as
+    /// environment variables only and are never interpolated into the command
+    /// string. Prefer `dl run -- cmd args` (no shell) when you do not need
+    /// shell syntax.
+    #[command(alias = "e")]
+    Exec(ExecArgs),
     /// Drop the cached master password (sudo-style logout)
     #[command(alias = "k")]
     #[command(alias = "logout")]
@@ -92,6 +99,11 @@ pub enum Commands {
     /// Review and re-sign a vault combined by the Git merge driver
     #[command(alias = "rec")]
     Reconcile,
+    /// Diagnose and recover a vault whose integrity hash is out of sync
+    /// (FG6). Requires a valid full-access unlock — repair is a recovery
+    /// path, never a tamper bypass.
+    #[command(alias = "rep")]
+    Repair(RepairArgs),
     /// Git merge-driver entrypoint
     #[command(name = "_git-merge", hide = true)]
     GitMerge(GitMergeArgs),
@@ -130,8 +142,42 @@ pub struct UnsetArgs {
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
+    /// Load additional PLAINTEXT variables from a .env file (FG4 migration
+    /// aid). Vault secrets always win on name collision; env-file values are
+    /// not encrypted and not covered by the vault's integrity checks.
+    #[arg(long, value_name = "FILE")]
+    pub env_file: Option<PathBuf>,
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     pub command: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ExecArgs {
+    /// Load additional PLAINTEXT variables from a .env file (FG4 migration
+    /// aid). Vault secrets always win on name collision; env-file values are
+    /// not encrypted and not covered by the vault's integrity checks.
+    #[arg(long, value_name = "FILE")]
+    pub env_file: Option<PathBuf>,
+    /// Shell command line, executed as `sh -c "<command>"`. Multiple words
+    /// are joined with spaces, so both `dl exec "npm start && node x.js"`
+    /// and `dl exec npm start` work.
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    pub command: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct RepairArgs {
+    /// Print the diagnosis only; never modify anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Skip the interactive confirmation (for scripted recovery).
+    #[arg(long, short)]
+    pub yes: bool,
+    /// Remove records that are irrecoverable (missing SDK wrapping or failed
+    /// AEAD) and reseal the rest. Data loss is explicit and enumerated —
+    /// without this flag, repair only reports them and exits non-zero.
+    #[arg(long)]
+    pub prune: bool,
 }
 
 #[derive(Args, Debug)]
@@ -213,9 +259,17 @@ pub enum ShareCommand {
 }
 
 #[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct RotateArgs {
+    /// Rotate the project key only when a rotation is due per the configured
+    /// policy (FG5): `rotate_max_age_days` (age since last rotation) or
+    /// `auto_ratchet_after_writes` (write count). Exits 0 without rotating
+    /// (and without prompting for the password) when nothing is due —
+    /// cron/CI friendly.
+    #[arg(long)]
+    pub if_due: bool,
     #[command(subcommand)]
-    pub command: RotateCommand,
+    pub command: Option<RotateCommand>,
 }
 
 #[derive(Args, Debug)]
@@ -353,12 +407,21 @@ mod cli_tests {
 
         let cli = Cli::try_parse_from(["dl", "init", "--password-file", "/tmp/pw"])
             .expect("password-file");
-        assert_eq!(cli.password_file.as_deref(), Some(std::path::Path::new("/tmp/pw")));
+        assert_eq!(
+            cli.password_file.as_deref(),
+            Some(std::path::Path::new("/tmp/pw"))
+        );
 
         // The two explicit sources are mutually exclusive.
         assert!(
-            Cli::try_parse_from(["dl", "list", "--password-stdin", "--password-file", "/tmp/pw"])
-                .is_err()
+            Cli::try_parse_from([
+                "dl",
+                "list",
+                "--password-stdin",
+                "--password-file",
+                "/tmp/pw"
+            ])
+            .is_err()
         );
     }
 
@@ -381,9 +444,50 @@ mod cli_tests {
                 .expect("rotate alias")
                 .command,
             Commands::Rotate(RotateArgs {
-                command: RotateCommand::Kek
+                command: Some(RotateCommand::Kek),
+                if_due: false
             })
         ));
+    }
+
+    #[test]
+    fn parses_rotate_if_due_and_rejects_it_with_a_subcommand() {
+        // FG5: `dl rotate --if-due` needs no subcommand...
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "rotate", "--if-due"])
+                .expect("rotate --if-due")
+                .command,
+            Commands::Rotate(RotateArgs {
+                command: None,
+                if_due: true
+            })
+        ));
+        // ...and conflicts with an explicit rotation subcommand.
+        assert!(Cli::try_parse_from(["dl", "rotate", "--if-due", "project-key"]).is_err());
+    }
+
+    #[test]
+    fn parses_exec_shell_form_and_repair_flags() {
+        // FG4: shell-form command line with hyphenated words.
+        let cli = Cli::try_parse_from(["dl", "exec", "--env-file", ".env", "npm start --watch"])
+            .expect("exec");
+        let Commands::Exec(args) = cli.command else {
+            panic!("expected exec");
+        };
+        assert_eq!(args.command, vec!["npm start --watch"]);
+        assert_eq!(args.env_file.as_deref(), Some(std::path::Path::new(".env")));
+
+        // FG6: repair flags.
+        let cli = Cli::try_parse_from(["dl", "repair", "--dry-run"]).expect("repair dry-run");
+        let Commands::Repair(args) = cli.command else {
+            panic!("expected repair");
+        };
+        assert!(args.dry_run && !args.yes && !args.prune);
+        let cli = Cli::try_parse_from(["dl", "repair", "--prune", "--yes"]).expect("repair prune");
+        let Commands::Repair(args) = cli.command else {
+            panic!("expected repair");
+        };
+        assert!(!args.dry_run && args.yes && args.prune);
     }
 
     #[test]

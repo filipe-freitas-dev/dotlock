@@ -1,20 +1,33 @@
 use colored::Colorize;
 
 use crate::{
-    cli::{args::RotateCommand, present::print_ratchet_summary},
+    cli::{
+        args::{RotateArgs, RotateCommand},
+        present::print_ratchet_summary,
+    },
     commands::context::{VaultContext, rotate_project_key},
     crypto::{
         ask_master_password, integrity::seal_vault_metadata, update_master_password_metadata,
     },
-    domain::model::DotLockResult,
+    domain::{error::DotLockError, model::DotLockResult},
     storage::{
-        project::{SECRETS_FILE, VAULT_FILE},
-        vault_file::record_vault_write,
+        project::{SECRETS_FILE, VAULT_FILE, ensure_project_initialized},
+        secrets_lock::current_unix_timestamp,
+        vault_file::{load_vault_metadata, record_vault_write, rotation_due},
         vault_txn::{VaultPairWrite, commit_vault_pair},
     },
 };
 
-pub fn run(command: RotateCommand) -> DotLockResult<()> {
+pub fn run(args: RotateArgs) -> DotLockResult<()> {
+    if args.if_due {
+        return run_if_due();
+    }
+    let Some(command) = args.command else {
+        return Err(DotLockError::Io(
+            "specify what to rotate (`kek`, `project-key`, `master-password`) or pass `--if-due`"
+                .to_string(),
+        ));
+    };
     match command {
         RotateCommand::MasterPassword => {
             let (ctx, _passphrase) = VaultContext::unlock_with_master_password()?;
@@ -61,4 +74,44 @@ pub fn run(command: RotateCommand) -> DotLockResult<()> {
             Ok(())
         }
     }
+}
+
+/// FG5 scheduled rotation: rotates the project key ONLY when the configured
+/// policy says a rotation is due. The due-check reads the (unauthenticated at
+/// this point) metadata without unlocking, so a cron job that finds nothing
+/// due exits 0 without ever prompting for the master password.
+fn run_if_due() -> DotLockResult<()> {
+    ensure_project_initialized()?;
+    let metadata = load_vault_metadata(VAULT_FILE)?;
+    let Some(reason) = rotation_due(&metadata, current_unix_timestamp()) else {
+        println!(
+            "{} rotation not due (policies: rotate_max_age_days = {}, auto_ratchet_after_writes = {})",
+            "ok:".green().bold(),
+            metadata
+                .config
+                .rotate_max_age_days
+                .map(|days| days.to_string())
+                .unwrap_or_else(|| "off".to_string()),
+            metadata
+                .config
+                .auto_ratchet_after_writes
+                .map(|writes| writes.to_string())
+                .unwrap_or_else(|| "off".to_string()),
+        );
+        return Ok(());
+    };
+
+    println!("{} rotation due: {reason}", "info:".cyan().bold());
+    // The unlock re-runs pending-transaction recovery, the reconcile gate and
+    // the MAC/epoch checks against a fresh metadata read — the pre-check
+    // above only decided whether to bother the operator for a password.
+    let (ctx, passphrase) = VaultContext::unlock_with_master_password()?;
+    let VaultContext {
+        mut metadata,
+        access,
+    } = ctx;
+    let dek = access.require_full()?;
+    let (_new_dek, summary) = rotate_project_key(&mut metadata, &dek, &passphrase)?;
+    print_ratchet_summary(&summary);
+    Ok(())
 }

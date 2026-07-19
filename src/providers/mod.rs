@@ -278,8 +278,9 @@ fn read_limited<R: Read>(mut reader: R, limit: usize) -> DotLockResult<LimitedOu
 fn validate_provider_name(provider: &str) -> DotLockResult<()> {
     let mut chars = provider.chars();
     let valid = match chars.next() {
-        Some(first) if first.is_ascii_lowercase() || first.is_ascii_digit() => chars
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'),
+        Some(first) if first.is_ascii_lowercase() || first.is_ascii_digit() => {
+            chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        }
         _ => false,
     };
     if valid {
@@ -348,7 +349,11 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// non-root user can rewrite is an arbitrary-code-execution primitive.
 /// Reject group/world-writable paths and paths not owned by us or root.
 #[cfg(unix)]
-fn reject_insecure_unix_path(metadata: &std::fs::Metadata, what: &str, path: &Path) -> DotLockResult<()> {
+fn reject_insecure_unix_path(
+    metadata: &std::fs::Metadata,
+    what: &str,
+    path: &Path,
+) -> DotLockResult<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     if metadata.permissions().mode() & 0o022 != 0 {
         return Err(DotLockError::Io(format!(

@@ -88,6 +88,13 @@ pub fn config_lines(config: &VaultConfig) -> Vec<String> {
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "default(10)".to_string())
         ),
+        format!(
+            "rotate_max_age_days = {}",
+            config
+                .rotate_max_age_days
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "off".to_string())
+        ),
     ]
 }
 
@@ -140,6 +147,14 @@ fn set_config_field(config: &mut VaultConfig, key: &str, value: &str) -> DotLock
             config.dynamic_resolve_timeout_secs = Some(seconds);
             Ok(())
         }
+        "rotate_max_age_days" => {
+            let days = value.parse::<u64>().map_err(|_| {
+                DotLockError::Io("rotate_max_age_days must be a non-negative integer".to_string())
+            })?;
+            // 0 disables the policy, mirroring auto_ratchet_after_writes.
+            config.rotate_max_age_days = (days > 0).then_some(days);
+            Ok(())
+        }
         other => Err(DotLockError::Io(format!("unknown config key `{other}`"))),
     }
 }
@@ -164,6 +179,10 @@ fn unset_config_field(config: &mut VaultConfig, key: &str) -> DotLockResult<()> 
         }
         "dynamic_resolve_timeout_secs" => {
             config.dynamic_resolve_timeout_secs = None;
+            Ok(())
+        }
+        "rotate_max_age_days" => {
+            config.rotate_max_age_days = None;
             Ok(())
         }
         other => Err(DotLockError::Io(format!("unknown config key `{other}`"))),
@@ -235,6 +254,7 @@ mod tests {
             secrets_hash_nonce_b64: "hash_nonce".to_string(),
             secrets_hash_b64: "hash".to_string(),
             secrets_hash_sha256_b64: "hash_plain".to_string(),
+            last_rotated_at: 0,
             vault_epoch: 0,
             metadata_mac_b64: String::new(),
         }
@@ -287,6 +307,35 @@ mod tests {
         }
         let metadata = load_vault_metadata(&path).expect("load metadata");
         assert_eq!(metadata.config.auto_fetch_remote, None);
+
+        let _ = fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    /// FG5: the scheduled-rotation policy key round-trips through the sealed
+    /// config write path; 0 disables it like `auto_ratchet_after_writes`.
+    #[test]
+    fn sets_and_unsets_rotate_max_age_days() {
+        let path = temp_vault("rotate-age-config");
+        save_vault_metadata(&path, &metadata()).expect("save metadata");
+
+        let mut meta = load_vault_metadata(&path).expect("load");
+        set_config_value(&path, &mut meta, "rotate_max_age_days", "30", &dek()).expect("set days");
+        let metadata = load_vault_metadata(&path).expect("load metadata");
+        assert_eq!(metadata.config.rotate_max_age_days, Some(30));
+        // The policy is MAC-covered once set (FG5).
+        crate::crypto::integrity::verify_metadata_mac(&metadata, &dek()).expect("MAC verifies");
+
+        let mut meta = load_vault_metadata(&path).expect("load");
+        set_config_value(&path, &mut meta, "rotate_max_age_days", "0", &dek())
+            .expect("set zero disables");
+        let metadata = load_vault_metadata(&path).expect("load metadata");
+        assert_eq!(metadata.config.rotate_max_age_days, None);
+
+        let mut meta = load_vault_metadata(&path).expect("load");
+        set_config_value(&path, &mut meta, "rotate_max_age_days", "7", &dek()).expect("set again");
+        unset_config_value(&path, &mut meta, "rotate_max_age_days", &dek()).expect("unset");
+        let metadata = load_vault_metadata(&path).expect("load metadata");
+        assert_eq!(metadata.config.rotate_max_age_days, None);
 
         let _ = fs::remove_dir_all(path.parent().expect("parent"));
     }

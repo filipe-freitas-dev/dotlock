@@ -70,6 +70,13 @@ pub struct VaultConfig {
     pub auto_ratchet_after_writes: Option<u32>,
     #[serde(default)]
     pub dynamic_resolve_timeout_secs: Option<u64>,
+    /// FG5 scheduled-rotation policy: `dl rotate --if-due` rotates the
+    /// project key when more than this many days passed since
+    /// `last_rotated_at`. Complements (does not replace) the write-count
+    /// ratchet `auto_ratchet_after_writes`. MAC-covered when set (see
+    /// [`VaultKeyMetadata::canonical_mac_input`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotate_max_age_days: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +122,13 @@ pub struct VaultKeyMetadata {
     #[serde(default)]
     pub secrets_hash_sha256_b64: String,
 
+    /// Unix timestamp of the last project-key rotation (FG5). `0` means "no
+    /// rotation recorded" (pre-FG5 vault or never rotated with a policy) and
+    /// is never serialized, keeping older vault.toml files byte-stable.
+    /// MAC-covered when set (see [`Self::canonical_mac_input`]).
+    #[serde(default, skip_serializing_if = "i64_is_zero")]
+    pub last_rotated_at: i64,
+
     /// Monotonic write counter (M3): bumped by every sealed metadata write.
     /// Covered by `metadata_mac_b64`; unlock refuses to move backward past the
     /// newest epoch persisted in the per-user anchor outside the repo.
@@ -126,6 +140,10 @@ pub struct VaultKeyMetadata {
     /// PRESENT-but-wrong MAC hard-fails with `MetadataTampered`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub metadata_mac_b64: String,
+}
+
+fn i64_is_zero(value: &i64) -> bool {
+    *value == 0
 }
 
 fn push_part(buf: &mut Vec<u8>, part: &[u8]) {
@@ -248,6 +266,16 @@ impl VaultKeyMetadata {
         push_str(&mut buf, &self.secrets_hash_nonce_b64);
         push_str(&mut buf, &self.secrets_hash_b64);
         push_str(&mut buf, &self.secrets_hash_sha256_b64);
+        // FG5 rotation-policy block: appended ONLY when a policy field is in
+        // use, so vaults sealed before FG5 keep verifying with a byte-identical
+        // input. Once either field is set the block is covered by the MAC —
+        // stripping the fields (reverting to the legacy input) or altering
+        // them without resealing fails authentication.
+        if self.config.rotate_max_age_days.is_some() || self.last_rotated_at != 0 {
+            push_str(&mut buf, "rotation-policy/v1");
+            push_opt_u64(&mut buf, self.config.rotate_max_age_days);
+            push_str(&mut buf, &self.last_rotated_at.to_string());
+        }
         buf
     }
 
@@ -466,6 +494,70 @@ secrets_hash_sha256_b64 = "hash_plain"
         let mut changed = base.clone();
         changed.metadata_mac_b64 = "whatever".to_string();
         assert_eq!(changed.canonical_mac_input(), reference);
+    }
+
+    /// FG5 MAC compatibility: the rotation-policy block is appended to the
+    /// canonical input ONLY when one of its fields is in use, so vaults
+    /// sealed before FG5 keep verifying byte-for-byte; once a field is set,
+    /// both fields are covered (stripping or altering them breaks the MAC).
+    #[test]
+    fn rotation_policy_fields_are_mac_covered_only_when_set() {
+        let base = toml::from_str::<VaultKeyMetadata>(
+            r#"
+version = 7
+project_uuid = "project"
+project = "dotlock"
+environment = "dev"
+kdf = "argon2id"
+salt_b64 = "salt"
+memory_kib = 1
+iterations = 1
+parallelism = 1
+kek_version = 1
+wrapped_dek_nonce_b64 = "nonce"
+wrapped_dek_b64 = "wrapped"
+secrets_hash_nonce_b64 = "hash_nonce"
+secrets_hash_b64 = "hash"
+secrets_hash_sha256_b64 = "hash_plain"
+"#,
+        )
+        .expect("metadata");
+        let legacy_input = base.canonical_mac_input();
+
+        // Defaults: input ends exactly where the pre-FG5 input ended.
+        let mut with_defaults = base.clone();
+        with_defaults.last_rotated_at = 0;
+        with_defaults.config.rotate_max_age_days = None;
+        assert_eq!(with_defaults.canonical_mac_input(), legacy_input);
+
+        // Either field in use extends (and thus covers) the input.
+        let mut with_policy = base.clone();
+        with_policy.config.rotate_max_age_days = Some(30);
+        assert_ne!(with_policy.canonical_mac_input(), legacy_input);
+
+        let mut with_timestamp = base.clone();
+        with_timestamp.last_rotated_at = 1_700_000_000;
+        assert_ne!(with_timestamp.canonical_mac_input(), legacy_input);
+
+        // And the two fields are distinguishable from each other.
+        let mut both = with_policy.clone();
+        both.last_rotated_at = 1_700_000_000;
+        assert_ne!(
+            both.canonical_mac_input(),
+            with_policy.canonical_mac_input()
+        );
+
+        // `last_rotated_at == 0` is never serialized: an old vault.toml stays
+        // byte-stable until a rotation actually records a timestamp.
+        let serialized = toml::to_string_pretty(&base).expect("serialize");
+        assert!(!serialized.contains("last_rotated_at"));
+        assert!(!serialized.contains("rotate_max_age_days"));
+        let mut rotated = base.clone();
+        rotated.last_rotated_at = 1_700_000_000;
+        let serialized = toml::to_string_pretty(&rotated).expect("serialize");
+        assert!(serialized.contains("last_rotated_at = 1700000000"));
+        let reparsed = toml::from_str::<VaultKeyMetadata>(&serialized).expect("reparse");
+        assert_eq!(reparsed.last_rotated_at, 1_700_000_000);
     }
 
     #[test]

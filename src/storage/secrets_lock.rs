@@ -385,7 +385,13 @@ pub fn migrate_all_secrets_to_envelope(
     }
 
     metadata.version = metadata.version.max(5);
-    commit_secrets_and_metadata(Path::new(SECRETS_FILE), &mut file, metadata, dek, vault_path)
+    commit_secrets_and_metadata(
+        Path::new(SECRETS_FILE),
+        &mut file,
+        metadata,
+        dek,
+        vault_path,
+    )
 }
 
 pub fn rotate_secret_sdks_after_acl_removal(
@@ -474,7 +480,13 @@ pub fn rotate_secret_sdks_after_acl_removal(
         }
     }
 
-    commit_secrets_and_metadata(Path::new(SECRETS_FILE), &mut file, metadata, dek, vault_path)
+    commit_secrets_and_metadata(
+        Path::new(SECRETS_FILE),
+        &mut file,
+        metadata,
+        dek,
+        vault_path,
+    )
 }
 
 pub fn decrypt_secret_value(
@@ -557,6 +569,47 @@ fn secret_sdk_from_local_identity(
     let identity = load_local_identity()?;
     unwrap_dek_with_private_key(wrapped_sdk, &identity.private_key_pem)
         .map(|sdk| Some(SecretKey::new(sdk)))
+}
+
+/// Resolves the key that decrypts `secret` from the project key, surfacing
+/// [`DotLockError::MissingSecretKeyWrapping`] for orphaned records. Public
+/// wrapper used by the `dl repair` diagnosis (FG6); mutators keep going
+/// through the private helper.
+pub fn resolve_record_key(
+    metadata: &crate::crypto::VaultKeyMetadata,
+    secret: &SecretRecord,
+    dek: &ProjectKey,
+) -> DotLockResult<SecretKey> {
+    secret_key_from_project_key_or_legacy(metadata, secret, dek)
+}
+
+/// FG6 repair funnel: drops the (already-diagnosed-irrecoverable) records in
+/// `prune_ids` plus their SDK wrappings, then recomputes the integrity hash
+/// fields from the surviving content and commits both files through the
+/// transactional path — which reseals the metadata MAC and advances the epoch
+/// (M2/M3). With an empty `prune_ids` this is the pure "hash stale, content
+/// good" recovery: recompute + reseal, no record is touched.
+pub fn repair_reseal(
+    secrets_path: &Path,
+    vault_path: &str,
+    metadata: &mut crate::crypto::VaultKeyMetadata,
+    dek: &ProjectKey,
+    prune_ids: &[String],
+) -> DotLockResult<()> {
+    reject_limited_identity_write(metadata)?;
+    let _lock = lock_vault_pair(Path::new(vault_path))?;
+    let mut file = load_secrets_file(secrets_path)?;
+
+    file.secrets
+        .retain(|secret| !prune_ids.contains(&secret.id));
+    for id in prune_ids {
+        metadata.wrapped_sdks_under_dek.remove(id);
+        for recipient in &mut metadata.recipients {
+            recipient.wrapped_sdks.remove(id);
+        }
+    }
+
+    commit_secrets_and_metadata(secrets_path, &mut file, metadata, dek, vault_path)
 }
 
 pub fn find_secret_by_name(name: &str) -> DotLockResult<SecretRecord> {
@@ -703,8 +756,7 @@ pub fn remove_secret_by_name(
 ) -> DotLockResult<()> {
     reject_limited_identity_write(metadata)?;
 
-    let _lock =
-        lock_pair_and_refresh_metadata(Path::new(SECRETS_FILE), vault_path, metadata, dek)?;
+    let _lock = lock_pair_and_refresh_metadata(Path::new(SECRETS_FILE), vault_path, metadata, dek)?;
     let mut file = load_secrets_file(SECRETS_FILE)?;
     let removed_ids = file
         .secrets
@@ -728,7 +780,13 @@ pub fn remove_secret_by_name(
         }
     }
 
-    commit_secrets_and_metadata(Path::new(SECRETS_FILE), &mut file, metadata, dek, vault_path)
+    commit_secrets_and_metadata(
+        Path::new(SECRETS_FILE),
+        &mut file,
+        metadata,
+        dek,
+        vault_path,
+    )
 }
 
 #[cfg(test)]
@@ -788,6 +846,7 @@ mod tests {
             secrets_hash_nonce_b64: "hash_nonce".to_string(),
             secrets_hash_b64: "hash".to_string(),
             secrets_hash_sha256_b64: "hash_plain".to_string(),
+            last_rotated_at: 0,
             vault_epoch: 0,
             metadata_mac_b64: String::new(),
         }
@@ -1179,6 +1238,71 @@ mod tests {
             serde_json::from_str::<super::DynamicSecretMetadata>(&plaintext).expect("metadata");
         assert_eq!(metadata.provider, "echo");
         assert_eq!(metadata.bootstrap, vec!["AWS_KEY"]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// FG6: `repair_reseal` with prune ids removes exactly those records (and
+    /// their wrappings) and reseals the rest — integrity, MAC and epoch all
+    /// verify afterwards; with no prune ids it is a pure recompute+reseal.
+    #[test]
+    fn repair_reseal_prunes_only_the_listed_records_and_reseals() {
+        use crate::crypto::integrity::{verify_metadata_mac, verify_secrets_integrity};
+
+        let dir = temp_dir("repair-reseal");
+        let secrets_path = dir.join("secrets.lock");
+        let vault_path = dir.join("vault.toml");
+        let vault_str = vault_path.to_str().expect("vault path");
+        let dek = ProjectKey::new([8u8; 32]);
+        save_vault_metadata(&vault_path, &metadata()).expect("save vault");
+
+        for (name, value) in [("KEEP", "keep-value"), ("DOOMED", "doomed-value")] {
+            upsert_plain_secret(
+                &secrets_path,
+                name.to_string(),
+                value.to_string(),
+                Alg::XChaCha20Poly1305,
+                &dek,
+                vault_str,
+                &mut load_vault_metadata(&vault_path).expect("load vault metadata"),
+            )
+            .expect("upsert");
+        }
+
+        // Orphan DOOMED the way historical merge bugs did: drop its SDK
+        // wrapping (the hash-stale part is repaired by the same reseal).
+        let mut metadata = load_vault_metadata(&vault_path).expect("load");
+        let doomed_id = load_secrets_file(&secrets_path)
+            .expect("load secrets")
+            .secrets
+            .iter()
+            .find(|secret| secret.name == "DOOMED")
+            .expect("doomed present")
+            .id
+            .clone();
+        let epoch_before = metadata.vault_epoch;
+
+        super::repair_reseal(
+            &secrets_path,
+            vault_str,
+            &mut metadata,
+            &dek,
+            std::slice::from_ref(&doomed_id),
+        )
+        .expect("repair reseal");
+
+        let file = load_secrets_file(&secrets_path).expect("load secrets");
+        let metadata = load_vault_metadata(&vault_path).expect("load metadata");
+        assert_eq!(file.secrets.len(), 1);
+        assert_eq!(file.secrets[0].name, "KEEP");
+        assert!(!metadata.wrapped_sdks_under_dek.contains_key(&doomed_id));
+        assert!(metadata.vault_epoch > epoch_before, "epoch must advance");
+        verify_metadata_mac(&metadata, &dek).expect("MAC verifies after repair");
+        verify_secrets_integrity(&secrets_path, &metadata, &dek).expect("integrity after repair");
+        assert_eq!(
+            super::decrypt_secret_value(&file.secrets[0], &dek, &metadata).expect("decrypt keep"),
+            "keep-value"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }

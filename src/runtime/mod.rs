@@ -1,4 +1,4 @@
-use std::{process::Command, time::Instant};
+use std::{path::Path, process::Command, time::Instant};
 
 use crate::{
     audit::{record_dynamic_resolve, record_run},
@@ -6,13 +6,27 @@ use crate::{
     domain::{error::DotLockError, keys::ProjectKey, model::DotLockResult},
     providers::resolve_provider,
     storage::{
+        env_file::parse_env_file,
         project::SECRETS_FILE,
         secrets_lock::{SecretKind, decrypt_secret_value, load_secrets_file},
     },
 };
 
+/// Loads extra PLAINTEXT variables from a `.env` file for `--env-file` (FG4).
+/// The file is read through the symlink-safe reader; its values come from
+/// disk in the clear — they are NOT vault secrets and get no integrity
+/// protection. Precedence is decided in [`run_with_secrets`]: vault secrets
+/// always override env-file entries of the same name.
+pub fn load_env_file_vars(path: &Path) -> DotLockResult<Vec<(String, String)>> {
+    Ok(parse_env_file(path)?
+        .into_iter()
+        .map(|entry| (entry.key, entry.value))
+        .collect())
+}
+
 pub fn run_with_secrets(
     command: Vec<String>,
+    extra_env: Vec<(String, String)>,
     dek: &ProjectKey,
     metadata: &VaultKeyMetadata,
 ) -> DotLockResult<()> {
@@ -22,7 +36,11 @@ pub fn run_with_secrets(
 
     let file = load_secrets_file(SECRETS_FILE)?;
 
-    let mut envs = Vec::new();
+    // `--env-file` entries first, vault secrets afterwards: with
+    // `Command::envs` the LAST occurrence of a name wins, so a vault secret
+    // always overrides a plaintext env-file value of the same name.
+    let mut envs = extra_env;
+    let extra_count = envs.len();
 
     for secret in &file.secrets {
         let value = match secret_value_for_runtime(secret, dek, &file.secrets, metadata) {
@@ -33,7 +51,9 @@ pub fn run_with_secrets(
         envs.push((secret.name.clone(), value));
     }
 
-    let secrets_consumed = envs
+    // Only vault secret names are audited; env-file variables are plaintext
+    // input the user already controls.
+    let secrets_consumed = envs[extra_count..]
         .iter()
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();

@@ -151,6 +151,7 @@ mod tests {
             auto_fetch_remote: None,
             auto_ratchet_after_writes: None,
             dynamic_resolve_timeout_secs: None,
+            rotate_max_age_days: None,
         };
 
         assert!(auto_fetch_enabled(&config, None));

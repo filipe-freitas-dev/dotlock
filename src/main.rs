@@ -3,9 +3,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use crate::{
-    cli::args::{
-        AuditArgs, Cli, Commands, ConfigArgs, GitArgs, ProviderArgs, RotateArgs, ShareArgs,
-    },
+    cli::args::{AuditArgs, Cli, Commands, ConfigArgs, GitArgs, ProviderArgs, ShareArgs},
     domain::{error::DotLockError, model::DotLockResult},
     utils::report_error,
 };
@@ -50,12 +48,13 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
         Commands::List => commands::list::run(),
         Commands::Unset(args) => commands::unset::run(args),
         Commands::Run(args) => commands::run::run(args),
+        Commands::Exec(args) => commands::exec::run(args),
         Commands::Lock => commands::lock::run(),
         Commands::Migrate(args) => commands::migrate::run(args),
         Commands::Export(args) => commands::export::run(args),
         Commands::Cert(args) => commands::cert::run(args.command),
         Commands::Share(ShareArgs { command }) => commands::share::run(command),
-        Commands::Rotate(RotateArgs { command }) => commands::rotate::run(command),
+        Commands::Rotate(args) => commands::rotate::run(args),
         Commands::Audit(AuditArgs { command }) => commands::audit::run(command),
         Commands::Git(GitArgs { command }) => commands::git::run(command),
         Commands::GitMerge(args) => commands::git::run_merge(args),
@@ -63,5 +62,6 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
         Commands::Provider(ProviderArgs { command }) => commands::provider::run(command),
         Commands::Sync => commands::sync::run(),
         Commands::Reconcile => commands::reconcile::run(),
+        Commands::Repair(args) => commands::repair::run(args),
     }
 }

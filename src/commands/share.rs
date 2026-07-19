@@ -9,7 +9,8 @@ use crate::{
         cache::invalidate_cache,
         project::{SECRETS_FILE, VAULT_FILE, ensure_project_initialized},
         secrets_lock::{
-            load_secrets_file, migrate_all_secrets_to_envelope, rotate_secret_sdks_after_acl_removal,
+            load_secrets_file, migrate_all_secrets_to_envelope,
+            rotate_secret_sdks_after_acl_removal,
         },
         shared_access::{
             self, add_recipient_secret_ids, enable_shared_access, list_recipient_acl,
@@ -128,7 +129,8 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
 
             if let Some(add) = add {
                 let ids = resolve_secret_ids_csv(&add)?;
-                let added = add_recipient_secret_ids(VAULT_FILE, &mut metadata, &query, &ids, &dek)?;
+                let added =
+                    add_recipient_secret_ids(VAULT_FILE, &mut metadata, &query, &ids, &dek)?;
                 println!(
                     "{} added {} secret{} to {}",
                     "ok:".green().bold(),
@@ -141,7 +143,13 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
 
             if let Some(remove) = remove {
                 let ids = resolve_secret_ids_csv(&remove)?;
-                rotate_secret_sdks_after_acl_removal(&ids, &query, &dek, VAULT_FILE, &mut metadata)?;
+                rotate_secret_sdks_after_acl_removal(
+                    &ids,
+                    &query,
+                    &dek,
+                    VAULT_FILE,
+                    &mut metadata,
+                )?;
                 println!(
                     "{} removed {} secret{} from {}",
                     "ok:".green().bold(),

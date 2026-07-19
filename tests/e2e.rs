@@ -137,7 +137,10 @@ fn non_interactive_unlock_via_env_var_and_password_file() {
     let env = TestEnv::new();
     env.init_vault();
 
-    env.dl().args(["set", "FOO", "bar-value"]).assert().success();
+    env.dl()
+        .args(["set", "FOO", "bar-value"])
+        .assert()
+        .success();
 
     // Drop the session cache so the next command must actually unlock.
     env.dl().arg("lock").assert().success();
@@ -184,10 +187,17 @@ fn json_output_for_list_get_share_and_provider() {
     let env = TestEnv::new();
     env.init_vault();
 
-    env.dl().args(["set", "FOO", "bar-value"]).assert().success();
+    env.dl()
+        .args(["set", "FOO", "bar-value"])
+        .assert()
+        .success();
 
     // list --json: array of {id, name}, no values.
-    let out = env.dl().args(["list", "--json"]).output().expect("run list");
+    let out = env
+        .dl()
+        .args(["list", "--json"])
+        .output()
+        .expect("run list");
     assert!(out.status.success());
     let listed: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("list --json must be valid JSON");
@@ -451,6 +461,302 @@ fn restored_older_vault_pair_is_refused_as_rollback() {
         .assert()
         .success()
         .stdout(predicate::str::contains("old-value"));
+}
+
+/// FG4: `dl exec` runs a shell-form command line via `sh -c` with secrets
+/// injected as ENVIRONMENT variables only (never interpolated into the
+/// command string), and `--env-file` merges plaintext variables with vault
+/// secrets winning on name collision.
+#[test]
+fn exec_shell_form_and_env_file_fallback() {
+    let env = TestEnv::new();
+    env.init_vault();
+
+    env.dl()
+        .args(["set", "MY_SECRET", "vault-value"])
+        .assert()
+        .success();
+
+    // Shell-form: expansion happens in the child shell, where the secret
+    // exists only as an environment variable.
+    env.dl()
+        .args(["exec", r#"printf 'exec sees %s\n' "$MY_SECRET""#])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("exec sees vault-value"));
+
+    // Shell syntax (&&) works — the whole point of the shell form.
+    env.dl()
+        .args(["exec", r#"true && printf 'chained %s\n' "$MY_SECRET""#])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("chained vault-value"));
+
+    // --env-file: plaintext extras are injected, but a vault secret with the
+    // same name ALWAYS wins over the env-file value.
+    let env_file = env.project.join(".env.extra");
+    fs::write(
+        &env_file,
+        "EXTRA_VAR=from-env-file\nMY_SECRET=plaintext-should-lose\n",
+    )
+    .expect("write env file");
+    env.dl()
+        .args(["exec", "--env-file", ".env.extra"])
+        .arg(r#"printf '%s %s\n' "$EXTRA_VAR" "$MY_SECRET""#)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("from-env-file vault-value"))
+        .stdout(predicate::str::contains("plaintext-should-lose").not());
+
+    // `dl run --env-file` (argv form) gets the same merge semantics.
+    env.dl()
+        .args([
+            "run",
+            "--env-file",
+            ".env.extra",
+            "--",
+            "sh",
+            "-c",
+            r#"printf 'run %s %s\n' "$EXTRA_VAR" "$MY_SECRET""#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("run from-env-file vault-value"));
+}
+
+/// FG5: `dl rotate --if-due` is cron-friendly — exit 0 with no rotation (and
+/// no password prompt) when nothing is due, rotates when the policy says so,
+/// and the recorded `last_rotated_at` keeps the MAC-sealed vault healthy.
+#[test]
+fn rotate_if_due_noops_when_not_due_and_rotates_when_due() {
+    let env = TestEnv::new();
+    env.init_vault();
+
+    env.dl()
+        .args(["set", "FOO", "bar-value"])
+        .assert()
+        .success();
+
+    // No policy configured: not due, exit 0, no password required at all.
+    env.dl().arg("lock").assert().success();
+    env.dl()
+        .args(["rotate", "--if-due"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rotation not due"));
+
+    // Configure the age policy. The vault has never recorded a rotation
+    // (last_rotated_at = 0), so the first scheduled run is due and rotates.
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["config", "set", "rotate_max_age_days", "30"])
+        .assert()
+        .success();
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["rotate", "--if-due"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rotation due"))
+        .stdout(predicate::str::contains("rotated"));
+
+    // Immediately afterwards nothing is due: the rotation stamped
+    // last_rotated_at, which is now well within the 30-day budget.
+    env.dl()
+        .args(["rotate", "--if-due"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rotation not due"));
+
+    // The vault stays fully usable: MAC/epoch verify and the secret decrypts
+    // under the rotated project key.
+    env.dl().arg("lock").assert().success();
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["get", "FOO"])
+        .assert()
+        .success()
+        .stdout("bar-value\n");
+}
+
+/// FG6: `dl repair` recovers a hash-stale vault — dry-run diagnoses without
+/// touching anything, the real run recomputes + reseals, and the repair is
+/// audit-logged.
+#[test]
+fn repair_recovers_hash_stale_vault() {
+    let env = TestEnv::new();
+    env.init_vault();
+
+    env.dl()
+        .args(["set", "FOO", "bar-value"])
+        .assert()
+        .success();
+
+    // Desynchronize hash and content the way partial restores do.
+    let secrets = env.lock_path("secrets.lock");
+    let mut content = fs::read_to_string(&secrets).expect("read secrets.lock");
+    content.push_str("# restored from a partial backup\n");
+    fs::write(&secrets, &content).expect("write stale secrets.lock");
+
+    env.dl()
+        .args(["get", "FOO"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("modified outside"));
+
+    // Dry-run: prints the diagnosis, changes nothing.
+    let vault_before = fs::read(env.lock_path("vault.toml")).expect("vault bytes");
+    let secrets_before = fs::read(&secrets).expect("secrets bytes");
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["repair", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("STALE"))
+        .stdout(predicate::str::contains("dry run"));
+    assert_eq!(
+        fs::read(env.lock_path("vault.toml")).expect("vault bytes"),
+        vault_before
+    );
+    assert_eq!(fs::read(&secrets).expect("secrets bytes"), secrets_before);
+
+    // Real repair: recompute + reseal, then the vault works again.
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["repair", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("integrity hash recomputed"));
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["get", "FOO"])
+        .assert()
+        .success()
+        .stdout("bar-value\n");
+
+    // The repair is an auditable security event.
+    env.dl()
+        .args(["audit", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("repair"));
+}
+
+/// FG6: a record whose SDK wrapping is gone is IRRECOVERABLE — repair lists
+/// it, refuses to touch it without `--prune`, and `--prune --yes` removes
+/// exactly that record while the rest stays intact and integrity-valid.
+#[test]
+fn repair_prunes_only_irrecoverable_records() {
+    let env = TestEnv::new();
+    env.init_vault();
+
+    env.dl()
+        .args(["set", "KEEP", "keep-value"])
+        .assert()
+        .success();
+    env.dl()
+        .args(["set", "DOOMED", "doomed-value"])
+        .assert()
+        .success();
+
+    // Find DOOMED's record id via the machine-readable listing.
+    let out = env.dl().args(["list", "--json"]).output().expect("list");
+    let listed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    let doomed_id = listed
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|item| item["name"] == "DOOMED")
+        .expect("doomed listed")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    // Emulate the historical merge-bug state: DOOMED's SDK wrapping vanished
+    // from a vault.toml that predates the metadata MAC (legacy, no MAC line),
+    // so the record's ciphertext is permanently orphaned.
+    let vault = env.lock_path("vault.toml");
+    let content = fs::read_to_string(&vault).expect("read vault.toml");
+    let filtered: String = content
+        .lines()
+        .filter(|line| !line.contains(&doomed_id) && !line.starts_with("metadata_mac_b64"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_ne!(content, filtered, "fixture must drop the SDK wrapping");
+    fs::write(&vault, &filtered).expect("write orphaned vault.toml");
+
+    // Dry-run names the irrecoverable record.
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["repair", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("IRRECOVERABLE"))
+        .stdout(predicate::str::contains(&doomed_id));
+
+    // Without --prune: report and exit non-zero, never silent data loss.
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["repair", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("irrecoverable"))
+        .stderr(predicate::str::contains("--prune"));
+
+    // --prune --yes removes ONLY the orphaned record and reseals the rest.
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["repair", "--prune", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removed 1 irrecoverable record"))
+        .stdout(predicate::str::contains("DOOMED"));
+
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["get", "KEEP"])
+        .assert()
+        .success()
+        .stdout("keep-value\n");
+    env.dl()
+        .args(["get", "DOOMED"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found"));
+}
+
+/// FG6: repair is not a tamper bypass — without a valid master password it
+/// fails before modifying anything.
+#[test]
+fn repair_without_valid_password_changes_nothing() {
+    let env = TestEnv::new();
+    env.init_vault();
+
+    env.dl()
+        .args(["set", "FOO", "bar-value"])
+        .assert()
+        .success();
+
+    let secrets = env.lock_path("secrets.lock");
+    let mut content = fs::read_to_string(&secrets).expect("read secrets.lock");
+    content.push_str("# out-of-band edit\n");
+    fs::write(&secrets, &content).expect("write stale secrets.lock");
+
+    let vault_before = fs::read(env.lock_path("vault.toml")).expect("vault bytes");
+    let secrets_before = fs::read(&secrets).expect("secrets bytes");
+
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", "Wr0ng!Passw0rd!!")
+        .args(["repair", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid master password"));
+
+    assert_eq!(
+        fs::read(env.lock_path("vault.toml")).expect("vault bytes"),
+        vault_before
+    );
+    assert_eq!(fs::read(&secrets).expect("secrets bytes"), secrets_before);
 }
 
 #[test]

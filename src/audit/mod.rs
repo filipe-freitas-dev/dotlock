@@ -47,6 +47,23 @@ pub fn record_ratchet(
     )
 }
 
+/// FG6: every executed repair is a security-auditable event — what kind of
+/// recovery ran and exactly which record ids were pruned (never silently).
+pub fn record_repair(
+    hash_recomputed: bool,
+    pruned_ids: &[String],
+    irrecoverable_ids: &[String],
+) -> DotLockResult<()> {
+    log::append_entry(
+        "repair",
+        json!({
+            "hash_recomputed": hash_recomputed,
+            "pruned_ids": pruned_ids,
+            "irrecoverable_ids": irrecoverable_ids,
+        }),
+    )
+}
+
 pub fn record_dynamic_resolve(
     provider: &str,
     secret_name: &str,

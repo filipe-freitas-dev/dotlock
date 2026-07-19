@@ -291,6 +291,7 @@ pub fn initialize_vault_keys(project: &str, environment: &str) -> DotLockResult<
         secrets_hash_b64: String::new(),
         secrets_hash_sha256_b64: String::new(),
 
+        last_rotated_at: 0,
         vault_epoch: 0,
         metadata_mac_b64: String::new(),
     };

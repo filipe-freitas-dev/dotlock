@@ -59,6 +59,43 @@ pub fn should_auto_ratchet_for_next_write(metadata: &VaultKeyMetadata) -> bool {
         })
 }
 
+/// FG5: decides whether `dl rotate --if-due` should rotate NOW, returning a
+/// human-readable reason (or `None` when nothing is due). Two policies, both
+/// opt-in via `dl config set`:
+/// - `rotate_max_age_days`: age since `last_rotated_at` crossed the limit. A
+///   vault that never recorded a rotation (`last_rotated_at == 0`) is due
+///   immediately, establishing the baseline on the first scheduled run.
+/// - `auto_ratchet_after_writes`: the write counter already reached the
+///   threshold (the ratchet normally fires on the next write; a scheduled
+///   `--if-due` run rotates without waiting for one).
+pub fn rotation_due(metadata: &VaultKeyMetadata, now_unix: i64) -> Option<String> {
+    if let Some(max_age_days) = metadata.config.rotate_max_age_days
+        && max_age_days > 0
+    {
+        if metadata.last_rotated_at == 0 {
+            return Some("no rotation recorded yet (rotate_max_age_days is set)".to_string());
+        }
+        let age_secs = now_unix.saturating_sub(metadata.last_rotated_at);
+        let max_age_secs = (max_age_days as i64).saturating_mul(86_400);
+        if age_secs >= max_age_secs {
+            return Some(format!(
+                "last rotation is {} day(s) old (policy: rotate_max_age_days = {max_age_days})",
+                age_secs / 86_400
+            ));
+        }
+    }
+    if let Some(threshold) = metadata.config.auto_ratchet_after_writes
+        && threshold > 0
+        && metadata.kek_writes_since_rotate >= threshold
+    {
+        return Some(format!(
+            "{} write(s) since the last rotation (policy: auto_ratchet_after_writes = {threshold})",
+            metadata.kek_writes_since_rotate
+        ));
+    }
+    None
+}
+
 /// Rotates the PROJECT KEY (DEK) wrapping model: every per-secret SDK and
 /// every recipient's `wrapped_dek_b64` is rewrapped under `new_project_key`,
 /// and the integrity hash is re-encrypted. `kek_version` is bumped only
@@ -120,6 +157,9 @@ pub fn rotate_project_key_wrapping(
 
     metadata.kek_version = metadata.kek_version.saturating_add(1);
     metadata.kek_writes_since_rotate = 0;
+    // FG5: the timestamp feeds the `rotate_max_age_days` policy and is
+    // MAC-covered from here on (the caller reseals before committing).
+    metadata.last_rotated_at = crate::storage::secrets_lock::current_unix_timestamp();
 
     Ok(RatchetSummary {
         old_kek_version,
@@ -196,6 +236,7 @@ mod tests {
             secrets_hash_nonce_b64: general_purpose::STANDARD.encode(encrypted.nonce),
             secrets_hash_b64: general_purpose::STANDARD.encode(encrypted.ciphertext),
             secrets_hash_sha256_b64: "hash_plain".to_string(),
+            last_rotated_at: 0,
             vault_epoch: 0,
             metadata_mac_b64: String::new(),
         }
@@ -389,6 +430,53 @@ mod tests {
         assert_eq!(&unwrapped, new_project_key.as_bytes());
         // ...while the injected one was never wrapped to the new key.
         assert_eq!(metadata.recipients[1].wrapped_dek_b64, "old-injected-wrap");
+    }
+
+    /// FG5: the due-decision for `dl rotate --if-due`.
+    #[test]
+    fn rotation_due_honors_age_and_write_count_policies() {
+        use crate::storage::vault_file::rotation_due;
+
+        let now = 1_700_000_000i64;
+        let day = 86_400i64;
+
+        // No policy configured: never due.
+        let mut metadata = metadata();
+        metadata.config.auto_ratchet_after_writes = None;
+        assert!(rotation_due(&metadata, now).is_none());
+
+        // Age policy: not due while younger than the limit, due once crossed,
+        // and due immediately when no rotation was ever recorded.
+        metadata.config.rotate_max_age_days = Some(30);
+        metadata.last_rotated_at = now - 29 * day;
+        assert!(rotation_due(&metadata, now).is_none());
+        metadata.last_rotated_at = now - 30 * day;
+        assert!(rotation_due(&metadata, now).is_some());
+        metadata.last_rotated_at = 0;
+        assert!(rotation_due(&metadata, now).is_some());
+
+        // Write-count policy: due once the counter reaches the threshold.
+        let mut by_writes = super::tests::metadata();
+        by_writes.config.auto_ratchet_after_writes = Some(10);
+        by_writes.kek_writes_since_rotate = 9;
+        assert!(rotation_due(&by_writes, now).is_none());
+        by_writes.kek_writes_since_rotate = 10;
+        assert!(rotation_due(&by_writes, now).is_some());
+    }
+
+    /// FG5: a project-key rotation records its timestamp so the age policy
+    /// has a baseline.
+    #[test]
+    fn rotate_project_key_wrapping_records_last_rotated_at() {
+        let old_project_key = ProjectKey::new([8u8; 32]);
+        let new_project_key = ProjectKey::new([9u8; 32]);
+        let mut metadata = metadata();
+        assert_eq!(metadata.last_rotated_at, 0);
+
+        rotate_project_key_wrapping(&mut metadata, &old_project_key, &new_project_key)
+            .expect("rotate");
+
+        assert!(metadata.last_rotated_at > 0);
     }
 
     #[test]

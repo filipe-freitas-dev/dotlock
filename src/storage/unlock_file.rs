@@ -125,6 +125,42 @@ pub fn unlock_full_for_reconcile(path: &str) -> DotLockResult<ProjectKey> {
     Ok(dek)
 }
 
+/// Unlock used exclusively by `dl repair` (FG6): recovers the real project
+/// key against already-loaded metadata WITHOUT the secrets integrity check —
+/// a hash-stale vault is exactly what repair exists to fix — but WITH the
+/// metadata MAC check: repair recovers hash↔content desync, it never blesses
+/// a `vault.toml` someone rewrote outside DotLock. Key correctness is still
+/// proven (identity unwrap or password unwrap both fail on wrong
+/// credentials), so no DEK means no repair. The session cache is neither
+/// consulted nor refreshed: repairing always demands a fresh proof.
+pub fn unlock_full_for_repair(
+    metadata: &crate::crypto::VaultKeyMetadata,
+) -> DotLockResult<ProjectKey> {
+    if metadata.access_mode == AccessMode::Shared
+        && let Ok(identity_meta) = load_local_identity_metadata()
+        && let Some(recipient) = metadata
+            .recipients
+            .iter()
+            .find(|recipient| recipient.public_key_fingerprint == identity_meta.fingerprint)
+        && !recipient.wrapped_dek_b64.is_empty()
+        && let Ok(identity) = load_local_identity()
+    {
+        let dek = ProjectKey::new(unwrap_dek_with_private_key(
+            &recipient.wrapped_dek_b64,
+            &identity.private_key_pem,
+        )?);
+        verify_metadata_mac(metadata, &dek)?;
+        record_unlock_best_effort("identity", metadata);
+        return Ok(dek);
+    }
+
+    let passphrase = prompt_unlock_password()?;
+    let dek = unwrap_dek_with_passphrase(metadata, &passphrase)?;
+    verify_metadata_mac(metadata, &dek)?;
+    record_unlock_best_effort("password", metadata);
+    Ok(dek)
+}
+
 fn unwrap_dek_with_passphrase(
     metadata: &crate::crypto::VaultKeyMetadata,
     passphrase: &str,

@@ -506,6 +506,7 @@ mod tests {
             secrets_hash_nonce_b64: "hash_nonce".to_string(),
             secrets_hash_b64: "hash".to_string(),
             secrets_hash_sha256_b64: "hash_plain".to_string(),
+            last_rotated_at: 0,
             vault_epoch: 0,
             metadata_mac_b64: String::new(),
         }
