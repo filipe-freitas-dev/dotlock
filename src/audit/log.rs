@@ -142,6 +142,9 @@ pub fn append_entry(action: &str, payload: Value) -> DotLockResult<()> {
     let line = serde_json::to_string(&entry).map_err(|e| DotLockError::Crypto(e.to_string()))?;
     let mut options = OpenOptions::new();
     options.create(true).append(true);
+    // M9 (documented gap): on Windows there is no 0600 equivalent here; the
+    // log inherits the parent directory's default ACLs. Restrictive DACL
+    // support is tracked in README "Security Notes > Windows".
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

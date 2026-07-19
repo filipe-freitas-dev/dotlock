@@ -10,7 +10,7 @@ use crate::{
         AccessMode,
         integrity::{
             build_encrypted_hash_fields, build_encrypted_hash_fields_from_bytes, bytes_sha256_b64,
-            file_sha256_b64, seal_vault_metadata,
+            file_sha256_b64, seal_vault_metadata, verify_metadata_mac, verify_secrets_integrity,
         },
         sdk,
         secret_cipher::{
@@ -28,7 +28,7 @@ use crate::{
         project::SECRETS_FILE,
         secure_fs,
         vault_file::{load_vault_metadata, record_vault_write},
-        vault_txn::{VaultPairWrite, commit_vault_pair},
+        vault_txn::{TxnLock, VaultPairWrite, commit_vault_pair, lock_vault_pair},
     },
 };
 
@@ -272,6 +272,30 @@ fn wrap_sdk_for_authorized_full_access_recipients(
     Ok(())
 }
 
+/// M1: takes the inter-process vault-pair lock and, while holding it, refreshes
+/// `metadata` from disk if another writer committed since our unlock — so a
+/// concurrent `dl set` cannot make us clobber its secret or drop its SDK
+/// wrapping. The refreshed copy is only accepted after its MAC and the secrets
+/// hash verify against the caller's project key; a mismatch (tamper, or a
+/// concurrent key rotation that made our DEK stale) hard-fails instead of
+/// silently committing over it. Callers MUST hold the returned guard until
+/// after `commit_secrets_and_metadata`.
+fn lock_pair_and_refresh_metadata(
+    secrets_path: &Path,
+    vault_path: &str,
+    metadata: &mut crate::crypto::VaultKeyMetadata,
+    dek: &ProjectKey,
+) -> DotLockResult<TxnLock> {
+    let guard = lock_vault_pair(Path::new(vault_path))?;
+    let fresh = load_vault_metadata(vault_path)?;
+    if fresh.vault_epoch > metadata.vault_epoch {
+        verify_metadata_mac(&fresh, dek)?;
+        verify_secrets_integrity(secrets_path, &fresh, dek)?;
+        *metadata = fresh;
+    }
+    Ok(guard)
+}
+
 pub fn upsert_plain_secret<P: AsRef<Path>>(
     path: P,
     name: String,
@@ -282,6 +306,7 @@ pub fn upsert_plain_secret<P: AsRef<Path>>(
     metadata: &mut crate::crypto::VaultKeyMetadata,
 ) -> DotLockResult<SecretRecord> {
     let path = path.as_ref();
+    let _lock = lock_pair_and_refresh_metadata(path, vault_path, metadata, dek)?;
     let mut file = load_secrets_file(path)?;
     metadata.version = metadata.version.max(5);
     reject_limited_identity_write(metadata)?;
@@ -568,6 +593,7 @@ pub fn upsert_many<P: AsRef<Path>>(
     metadata: &mut crate::crypto::VaultKeyMetadata,
 ) -> DotLockResult<UpsertSummary> {
     let path = path.as_ref();
+    let _lock = lock_pair_and_refresh_metadata(path, vault_path, metadata, dek)?;
     let mut file = load_secrets_file(path)?;
     metadata.version = metadata.version.max(5);
     reject_limited_identity_write(metadata)?;
@@ -608,6 +634,7 @@ pub fn upsert_dynamic_secret<P: AsRef<Path>>(
     metadata: &mut crate::crypto::VaultKeyMetadata,
 ) -> DotLockResult<SecretRecord> {
     let path = path.as_ref();
+    let _lock = lock_pair_and_refresh_metadata(path, vault_path, metadata, dek)?;
     let mut file = load_secrets_file(path)?;
     metadata.version = metadata.version.max(5);
     reject_limited_identity_write(metadata)?;
@@ -676,6 +703,8 @@ pub fn remove_secret_by_name(
 ) -> DotLockResult<()> {
     reject_limited_identity_write(metadata)?;
 
+    let _lock =
+        lock_pair_and_refresh_metadata(Path::new(SECRETS_FILE), vault_path, metadata, dek)?;
     let mut file = load_secrets_file(SECRETS_FILE)?;
     let removed_ids = file
         .secrets
@@ -802,6 +831,72 @@ mod tests {
             )
             .is_err()
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// M1: two writers that unlocked BEFORE either committed (each holding
+    /// its own stale metadata copy, like two concurrent `dl set` processes)
+    /// must not lose each other's secret or SDK wrapping.
+    #[test]
+    fn concurrent_upserts_do_not_lose_updates() {
+        let dir = temp_dir("concurrent");
+        let secrets_path = dir.join("secrets.lock");
+        let vault_path = dir.join("vault.toml");
+        let dek = ProjectKey::new([8u8; 32]);
+        save_vault_metadata(&vault_path, &metadata()).expect("save vault");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = ["FIRST", "SECOND"]
+            .into_iter()
+            .map(|name| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let secrets_path = secrets_path.clone();
+                let vault_path = vault_path.clone();
+                let dek = dek.clone();
+                std::thread::spawn(move || {
+                    // Each writer starts from its own on-disk snapshot, taken
+                    // before either commit — the lost-update scenario.
+                    let mut metadata = load_vault_metadata(&vault_path).expect("load metadata");
+                    barrier.wait();
+                    upsert_plain_secret(
+                        &secrets_path,
+                        name.to_string(),
+                        format!("{name}-value"),
+                        Alg::XChaCha20Poly1305,
+                        &dek,
+                        vault_path.to_str().expect("vault path"),
+                        &mut metadata,
+                    )
+                    .expect("upsert");
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("writer thread");
+        }
+
+        let file = load_secrets_file(&secrets_path).expect("load secrets");
+        let metadata = load_vault_metadata(&vault_path).expect("load metadata");
+        assert_eq!(file.secrets.len(), 2, "one writer's secret was lost");
+        for name in ["FIRST", "SECOND"] {
+            let secret = file
+                .secrets
+                .iter()
+                .find(|secret| secret.name == name)
+                .unwrap_or_else(|| panic!("secret {name} missing"));
+            assert!(
+                metadata.wrapped_sdks_under_dek.contains_key(&secret.id),
+                "SDK wrapping for {name} was lost"
+            );
+            let value = super::decrypt_secret_value(secret, &dek, &metadata)
+                .unwrap_or_else(|err| panic!("secret {name} undecryptable: {err}"));
+            assert_eq!(value, format!("{name}-value"));
+        }
+        // The committed metadata must pass its own integrity checks.
+        crate::crypto::integrity::verify_metadata_mac(&metadata, &dek).expect("metadata MAC");
+        crate::crypto::integrity::verify_secrets_integrity(&secrets_path, &metadata, &dek)
+            .expect("secrets integrity");
 
         let _ = fs::remove_dir_all(dir);
     }

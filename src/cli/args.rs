@@ -86,7 +86,14 @@ pub enum Commands {
 #[derive(Args, Debug)]
 pub struct SetArgs {
     pub name: String,
+    /// Secret value. Prefer omitting it: with no VALUE, `dl set` reads the
+    /// secret from a hidden prompt (or from stdin with `--stdin`), keeping it
+    /// out of `ps`, `/proc/<pid>/cmdline` and shell history (M8).
     pub value: Option<String>,
+    /// Read the secret value from stdin (for pipes/scripts) instead of the
+    /// interactive hidden prompt.
+    #[arg(long)]
+    pub stdin: bool,
     #[arg(short, long, value_enum, default_value_t = Alg::XChaCha20Poly1305)]
     pub alg: Alg,
     #[arg(long)]

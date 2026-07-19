@@ -125,16 +125,39 @@ struct TxnJournal {
     secrets_new_sha256_b64: String,
 }
 
-/// Inter-process guard over the transaction journal. Uses `flock` on Unix so a
-/// crashed writer never leaves a stale lock behind.
-struct TxnLock {
-    _file: fs::File,
+thread_local! {
+    /// Directories whose vault lock is already held by this thread (M1).
+    /// Makes [`TxnLock::acquire`] reentrant: `flock` treats every `open` of
+    /// the lock file as an independent lock owner, so without this a mutator
+    /// that already holds the lock across its read-modify-write would
+    /// deadlock against its own `commit_vault_pair`.
+    static HELD_LOCK_DIRS: std::cell::RefCell<std::collections::HashSet<PathBuf>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Inter-process guard over the vault pair. Uses `flock` on Unix so a
+/// crashed writer never leaves a stale lock behind. Reentrant within a
+/// thread: nested acquisitions return a no-op guard.
+pub struct TxnLock {
+    /// `Some` only for the outermost guard; dropped entries release the
+    /// thread-local reentrancy marker.
+    held_dir: Option<PathBuf>,
+    _file: Option<fs::File>,
 }
 
 impl TxnLock {
     fn acquire(dir: &Path) -> DotLockResult<Self> {
-        let path = dir.join(LOCK_FILE);
         secure_fs::ensure_dir(dir, 0o700)?;
+        let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let already_held = HELD_LOCK_DIRS.with(|held| held.borrow().contains(&key));
+        if already_held {
+            return Ok(Self {
+                held_dir: None,
+                _file: None,
+            });
+        }
+
+        let path = dir.join(LOCK_FILE);
         secure_fs::reject_symlink(&path)?;
 
         let mut options = OpenOptions::new();
@@ -158,8 +181,30 @@ impl TxnLock {
             }
         }
 
-        Ok(Self { _file: file })
+        HELD_LOCK_DIRS.with(|held| held.borrow_mut().insert(key.clone()));
+        Ok(Self {
+            held_dir: Some(key),
+            _file: Some(file),
+        })
     }
+}
+
+impl Drop for TxnLock {
+    fn drop(&mut self) {
+        if let Some(dir) = self.held_dir.take() {
+            HELD_LOCK_DIRS.with(|held| {
+                held.borrow_mut().remove(&dir);
+            });
+        }
+    }
+}
+
+/// Acquires the inter-process vault-pair lock (M1). Mutators MUST hold this
+/// guard across their whole load -> modify -> commit window so two concurrent
+/// writers cannot lose each other's updates; `commit_vault_pair` re-enters the
+/// same lock without blocking.
+pub fn lock_vault_pair(vault_path: &Path) -> DotLockResult<TxnLock> {
+    TxnLock::acquire(&journal_dir(vault_path))
 }
 
 fn journal_dir(vault_path: &Path) -> PathBuf {

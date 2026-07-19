@@ -223,6 +223,37 @@ fn secret_lifecycle_set_get_list_export_run_unset() {
         .stdout(predicate::str::contains("no secrets stored"));
 }
 
+/// M8: `dl set NAME --stdin` reads the value from stdin so it never appears
+/// in argv (`ps`/`/proc`/shell history).
+#[test]
+fn set_reads_secret_value_from_stdin() {
+    let env = TestEnv::new();
+    if !env.init_vault() {
+        return;
+    }
+
+    env.dl()
+        .args(["set", "PIPED", "--stdin"])
+        .write_stdin("piped-value\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("secret PIPED saved"));
+
+    env.dl()
+        .args(["get", "PIPED"])
+        .assert()
+        .success()
+        .stdout("piped-value\n");
+
+    // Empty stdin is a clean error, not an empty secret.
+    env.dl()
+        .args(["set", "EMPTY", "--stdin"])
+        .write_stdin("")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no secret value received"));
+}
+
 /// Phase 0/1 guarantee: while a pending-merge marker exists every access is
 /// refused with a clear "run `dl reconcile`" error, and `dl reconcile` only
 /// re-signs after explicit confirmation (declining aborts and keeps the

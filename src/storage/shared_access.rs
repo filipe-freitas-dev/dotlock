@@ -440,7 +440,9 @@ pub fn add_recipient_secret_ids(
 }
 
 pub fn load_public_key_from_file(path: &Path) -> DotLockResult<String> {
-    std::fs::read_to_string(path).map_err(DotLockError::from)
+    // M5: symlink-safe (O_NOFOLLOW) read; a grant must never be tricked into
+    // reading an attacker-chosen key through a planted symlink.
+    crate::storage::secure_fs::read_to_string(path)
 }
 
 #[cfg(test)]

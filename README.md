@@ -679,8 +679,13 @@ Full-access recipients receive wrapped access to the project key and per-secret 
 - Commit `.lock/vault.toml` and `.lock/secrets.lock` if your team shares the encrypted vault through Git.
 - Use `dl sync` to refresh the vault safely from Git. It aborts on local vault changes or branch divergence instead of discarding data.
 - Keep local identity private keys protected. Use `dl cert init --plain` only for controlled automation or ephemeral environments.
-- Dynamic providers are executable code. Install them from trusted sources and keep provider directories non-world-writable.
+- Dynamic providers are executable code. Install them from trusted sources. DotLock refuses provider directories/binaries that are group- or world-writable or owned by another non-root user, and warns loudly when a dynamic secret's provider is not sha256-pinned — re-run `dl set <NAME> --provider <name>` to pin it.
+- Prefer `dl set NAME` (hidden prompt) or `dl set NAME --stdin` over `dl set NAME value`: a value passed as an argument is visible in `ps`, `/proc/<pid>/cmdline`, and shell history.
 - Audit logs are local by default. They are useful for local accountability and debugging, not a centralized compliance system.
+
+### Windows
+
+File-permission hardening (0600 key/vault files, 0700 private directories, `O_NOFOLLOW` symlink-safe opens) is implemented for Unix only. On Windows, files created by DotLock inherit the parent directory's default ACLs and symlink checks fall back to a check-then-open pattern; restrictive owner-only DACLs are not yet applied. Until that lands, treat the profile directory (`%USERPROFILE%\.dotlock`) and project `.lock/` directories as protected only by your account's default ACLs, and avoid shared/multi-user Windows machines for sensitive vaults.
 
 ## License
 

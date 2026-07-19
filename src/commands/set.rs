@@ -16,6 +16,7 @@ pub fn run(args: SetArgs) -> DotLockResult<()> {
     let SetArgs {
         name,
         value,
+        stdin,
         alg,
         provider,
         config,
@@ -49,9 +50,14 @@ pub fn run(args: SetArgs) -> DotLockResult<()> {
             &mut metadata,
         )?
     } else {
-        let value = value.ok_or_else(|| {
-            DotLockError::Io("static secrets require a VALUE argument".to_string())
-        })?;
+        // M8: the value in argv is visible in `ps`/`/proc`/shell history, so
+        // the positional form is compat-only; the recommended paths are the
+        // hidden prompt (default when VALUE is omitted) or `--stdin`.
+        let value = match value {
+            Some(value) => value,
+            None if stdin => read_value_from_stdin()?,
+            None => prompt_secret_value(&name)?,
+        };
         upsert_plain_secret(SECRETS_FILE, name, value, alg, &dek, VAULT_FILE, &mut metadata)?
     };
 
@@ -61,6 +67,38 @@ pub fn run(args: SetArgs) -> DotLockResult<()> {
         secret.name.bold()
     );
     Ok(())
+}
+
+fn read_value_from_stdin() -> DotLockResult<String> {
+    use std::io::Read;
+    let mut value = String::new();
+    std::io::stdin()
+        .read_to_string(&mut value)
+        .map_err(DotLockError::from)?;
+    let value = value.trim_end_matches(['\r', '\n']).to_string();
+    if value.is_empty() {
+        return Err(DotLockError::Io(
+            "no secret value received on stdin".to_string(),
+        ));
+    }
+    Ok(value)
+}
+
+fn prompt_secret_value(name: &str) -> DotLockResult<String> {
+    use inquire::{Password, PasswordDisplayMode};
+    let value = Password::new(&format!("Value for {name}:"))
+        .with_display_mode(PasswordDisplayMode::Masked)
+        .without_confirmation()
+        .prompt()
+        .map_err(|err| match err {
+            inquire::InquireError::OperationCanceled
+            | inquire::InquireError::OperationInterrupted => DotLockError::Aborted,
+            other => DotLockError::Io(other.to_string()),
+        })?;
+    if value.is_empty() {
+        return Err(DotLockError::Io("empty secret value".to_string()));
+    }
+    Ok(value)
 }
 
 fn parse_csv_list(value: &str) -> Vec<String> {
