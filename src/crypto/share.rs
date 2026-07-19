@@ -217,6 +217,43 @@ pub fn decrypt_private_key_pem(
         .map(|pem| pem.to_string())
 }
 
+/// Re-encrypts an (already decrypted) PKCS#8 private-key PEM under a NEW
+/// passphrase, preserving the key material exactly — the counterpart of
+/// [`decrypt_private_key_pem`] used by `dl cert passwd`. Never generates a
+/// key: the input key pair (and thus the identity fingerprint) is unchanged.
+pub fn encrypt_private_key_pem(private_key_pem: &str, passphrase: &str) -> DotLockResult<String> {
+    match parse_private_key(private_key_pem)? {
+        PrivateIdentityKey::Ed25519(signing_key) => signing_key
+            .to_pkcs8_encrypted_pem(passphrase, pkcs8::LineEnding::LF)
+            .map_err(|e| DotLockError::Crypto(format!("failed to encrypt private key: {e}")))
+            .map(|pem| pem.to_string()),
+        PrivateIdentityKey::Rsa(private_key) => {
+            let mut rng = LegacyOsRng;
+            private_key
+                .to_pkcs8_encrypted_pem(&mut rng, passphrase, rsa::pkcs8::LineEnding::LF)
+                .map_err(|e| DotLockError::Crypto(format!("failed to encrypt private key: {e}")))
+                .map(|pem| pem.to_string())
+        }
+    }
+}
+
+/// Fingerprint of the public key that corresponds to a (decrypted) identity
+/// private key. `dl cert passwd` uses it to PROVE the key being re-encoded is
+/// the same key pair recorded in `identity.toml` before touching disk.
+pub fn fingerprint_for_private_key(private_key_pem: &str) -> DotLockResult<String> {
+    let public_key = match parse_private_key(private_key_pem)? {
+        PrivateIdentityKey::Ed25519(signing_key) => {
+            PublicIdentityKey::Ed25519(Box::new(signing_key.verifying_key()))
+        }
+        PrivateIdentityKey::Rsa(private_key) => {
+            PublicIdentityKey::Rsa(Box::new(RsaPublicKey::from(&*private_key)))
+        }
+    };
+    let der = public_key.to_der()?;
+    let digest = Sha256::digest(&der);
+    Ok(hex_lower(&digest[..16]))
+}
+
 /// Identity algorithm tag for a private key PEM (Ed25519 or legacy RSA).
 /// Production code reads the tag from `identity.toml` instead (so `dl cert
 /// show` never has to decrypt the key); tests use this to assert the on-disk
@@ -477,6 +514,43 @@ mod tests {
         assert_eq!(
             recipient_alg_for_public_key_b64(&public_key_b64).expect("alg"),
             RECIPIENT_ALG_X25519
+        );
+    }
+
+    /// `dl cert passwd` core property: re-encrypting a decrypted private key
+    /// under a new passphrase (and decrypting it again) preserves the key
+    /// material exactly — same fingerprint, same wrap/unwrap capability — and
+    /// the OLD passphrase no longer opens the new encoding. Also covers the
+    /// footgun input: a PEM "encrypted" under an EMPTY passphrase decrypts
+    /// with `""` and re-encodes to the same key.
+    #[test]
+    fn encrypt_private_key_pem_preserves_the_key_pair() {
+        use super::{encrypt_private_key_pem, fingerprint_for_private_key};
+
+        let identity = generate_identity(IdentityProtection::Encrypted("")).expect("identity");
+        let plain_pem = decrypt_private_key_pem(&identity.private_key_pem, "").expect("decrypt");
+        assert_eq!(
+            fingerprint_for_private_key(&plain_pem).expect("fingerprint"),
+            identity.fingerprint
+        );
+
+        let reencrypted = encrypt_private_key_pem(&plain_pem, "N3w-Pass!").expect("encrypt");
+        assert!(reencrypted.contains("ENCRYPTED PRIVATE KEY"));
+        assert!(decrypt_private_key_pem(&reencrypted, "").is_err());
+        let roundtrip = decrypt_private_key_pem(&reencrypted, "N3w-Pass!").expect("decrypt new");
+        assert_eq!(roundtrip, plain_pem);
+        assert_eq!(
+            fingerprint_for_private_key(&roundtrip).expect("fingerprint"),
+            identity.fingerprint
+        );
+
+        // The re-encoded key is still the SAME key pair operationally: it
+        // unwraps material sealed to the original public key.
+        let dek = [4u8; 32];
+        let wrapped = wrap_dek_for_public_key(&dek, &identity.public_key_pem).expect("wrap");
+        assert_eq!(
+            unwrap_dek_with_private_key(&wrapped, &roundtrip).expect("unwrap"),
+            dek
         );
     }
 

@@ -10,7 +10,8 @@ use zeroize::Zeroizing;
 use crate::{
     crypto::share::{
         GeneratedIdentity, IDENTITY_ALG_ED25519, IDENTITY_ALG_RSA, IdentityProtection,
-        decrypt_private_key_pem, generate_identity,
+        decrypt_private_key_pem, encrypt_private_key_pem, fingerprint_for_private_key,
+        generate_identity,
     },
     domain::{error::DotLockError, model::DotLockResult},
     storage::{paths::dotlock_data_root, secure_fs},
@@ -141,17 +142,40 @@ fn prompt_identity_passphrase() -> DotLockResult<Zeroizing<String>> {
 }
 
 /// New-passphrase entry point (`dl cert init` / `dl cert migrate` without
-/// `--plain`). Accepts the same non-interactive sources as
-/// [`prompt_identity_passphrase`], so a passphrase-protected identity can be
-/// created in CI; otherwise a TTY is required for the confirmed prompt.
+/// `--plain`, and `dl cert passwd` when setting one). Accepts the same
+/// non-interactive sources as [`prompt_identity_passphrase`], so a
+/// passphrase-protected identity can be created in CI; otherwise a TTY is
+/// required for the confirmed prompt. An EMPTY passphrase is rejected from
+/// every source: `encrypted = true` under `""` protects nothing and turns
+/// every shared-vault unlock into a pointless prompt — the state `dl cert
+/// passwd` exists to repair.
 fn prompt_new_identity_passphrase() -> DotLockResult<Zeroizing<String>> {
+    // A dedicated env var that is SET but empty is an explicit (and useless)
+    // empty-passphrase request; reject it instead of silently falling through
+    // to the other sources.
+    if matches!(std::env::var("DOTLOCK_IDENTITY_PASSPHRASE"), Ok(value) if value.is_empty()) {
+        return Err(DotLockError::EmptyIdentityPassphrase);
+    }
     if let Some(passphrase) = crate::crypto::non_interactive_identity_passphrase()? {
+        if passphrase.is_empty() {
+            return Err(DotLockError::EmptyIdentityPassphrase);
+        }
         return Ok(passphrase);
     }
     crate::crypto::ensure_tty_for_prompt()?;
-    Password::new("Choose a passphrase for the local identity:")
+    let passphrase = Password::new("Choose a passphrase for the local identity:")
         .with_display_mode(PasswordDisplayMode::Masked)
         .with_help_message("this protects your local private key on disk")
+        .with_validator(|input: &str| {
+            if input.is_empty() {
+                Ok(inquire::validator::Validation::Invalid(
+                    "an empty passphrase protects nothing; enter one, or use --plain / `dl cert passwd --remove` for no passphrase"
+                        .into(),
+                ))
+            } else {
+                Ok(inquire::validator::Validation::Valid)
+            }
+        })
         .with_custom_confirmation_message("Confirm local identity passphrase:")
         .with_custom_confirmation_error_message("the passphrases don't match")
         .prompt()
@@ -160,7 +184,11 @@ fn prompt_new_identity_passphrase() -> DotLockResult<Zeroizing<String>> {
             inquire::InquireError::OperationCanceled
             | inquire::InquireError::OperationInterrupted => DotLockError::Aborted,
             other => DotLockError::Io(other.to_string()),
-        })
+        })?;
+    if passphrase.is_empty() {
+        return Err(DotLockError::EmptyIdentityPassphrase);
+    }
+    Ok(passphrase)
 }
 
 pub fn initialize_local_identity(force: bool) -> DotLockResult<LocalIdentityMetadata> {
@@ -256,6 +284,79 @@ pub fn load_local_identity() -> DotLockResult<LocalIdentity> {
     // produce signed audit entries instead of anonymous ones.
     register_session_signer(&identity);
     Ok(identity)
+}
+
+/// `dl cert passwd`: changes or removes the passphrase protecting the CURRENT
+/// local identity's private key IN PLACE. The key pair — and therefore the
+/// fingerprint every shared-vault recipient entry is keyed on — is never
+/// touched; only the on-disk PKCS#8 encoding of `identity.pem` changes
+/// (encrypted <-> plain, or encrypted under a new passphrase). Never calls
+/// `generate_identity`.
+///
+/// Current passphrase: for an `encrypted = true` identity the EMPTY
+/// passphrase is tried silently first — the exact footgun this command
+/// repairs (`cert init` used to accept pressing Enter, yielding an identity
+/// "encrypted" under `""`) — so that state is fixable with zero prompts.
+/// This weakens nothing: anyone holding the file can try `""` themselves.
+/// Otherwise the passphrase comes from the interactive prompt or the same
+/// non-interactive sources every identity unlock accepts.
+pub fn change_identity_passphrase(remove: bool) -> DotLockResult<LocalIdentityMetadata> {
+    let private_path = private_key_path()?;
+    let public_path = public_key_path()?;
+    if !private_path.exists() || !public_path.exists() {
+        return Err(DotLockError::LocalIdentityNotInitialized);
+    }
+    let metadata = load_local_identity_metadata()?;
+
+    let on_disk_pem = Zeroizing::new(secure_fs::read_to_string(&private_path)?);
+    let decrypted_pem = if metadata.encrypted {
+        match decrypt_private_key_pem(&on_disk_pem, "") {
+            Ok(pem) => Zeroizing::new(pem),
+            Err(_) => {
+                let passphrase = prompt_identity_passphrase()?;
+                Zeroizing::new(decrypt_private_key_pem(&on_disk_pem, &passphrase)?)
+            }
+        }
+    } else {
+        on_disk_pem
+    };
+
+    // Prove the key being re-encoded IS the recorded key pair before touching
+    // disk: a mismatch means identity.pem and identity.toml diverged, and
+    // rewriting would silently break shared-vault access.
+    let fingerprint = fingerprint_for_private_key(&decrypted_pem)?;
+    if fingerprint != metadata.fingerprint {
+        return Err(DotLockError::Crypto(format!(
+            "identity private key does not match the recorded fingerprint \
+             ({fingerprint} != {}); refusing to rewrite it",
+            metadata.fingerprint
+        )));
+    }
+
+    let new_private_pem = if remove {
+        decrypted_pem.clone()
+    } else {
+        let passphrase = prompt_new_identity_passphrase()?;
+        Zeroizing::new(encrypt_private_key_pem(&decrypted_pem, &passphrase)?)
+    };
+
+    secure_fs::write_string_atomic(&private_path, &new_private_pem, 0o700, 0o600)?;
+    let meta = LocalIdentityMetadata {
+        fingerprint: metadata.fingerprint,
+        encrypted: !remove,
+        alg: metadata.alg,
+    };
+    let content = toml::to_string_pretty(&meta).map_err(|e| DotLockError::Crypto(e.to_string()))?;
+    secure_fs::write_string_atomic(&metadata_path()?, &content, 0o700, 0o600)?;
+
+    // The decrypted key is already in memory; audit entries written later in
+    // this command can be signed without re-prompting.
+    register_session_signer(&LocalIdentity {
+        fingerprint: meta.fingerprint.clone(),
+        private_key_pem: decrypted_pem.to_string(),
+        public_key_pem: secure_fs::read_to_string(&public_path)?,
+    });
+    Ok(meta)
 }
 
 /// True when a `dl cert migrate` run archived a pre-migration RSA identity
@@ -694,6 +795,225 @@ mod tests {
         unsafe {
             std::env::remove_var("DOTLOCK_IDENTITY_PASSPHRASE");
             std::env::remove_var("DOTLOCK_MASTER_PASSWORD");
+            std::env::remove_var("DOTLOCK_IDENTITY_DIR");
+            if let Some(value) = saved_master {
+                std::env::set_var("DOTLOCK_MASTER_PASSWORD", value);
+            }
+        }
+    }
+
+    /// Seeds the on-disk footgun state the pre-1.1.1 `dl cert init` could
+    /// produce: `encrypted = true` with the private key "encrypted" under the
+    /// EMPTY passphrase (the user pressed Enter at the prompt).
+    fn seed_empty_passphrase_footgun() -> crate::crypto::share::GeneratedIdentity {
+        use crate::crypto::share::{IdentityProtection, generate_identity};
+
+        let generated = generate_identity(IdentityProtection::Encrypted("")).expect("identity");
+        let meta = LocalIdentityMetadata {
+            fingerprint: generated.fingerprint.clone(),
+            encrypted: true,
+            alg: crate::crypto::share::IDENTITY_ALG_ED25519.to_string(),
+        };
+        let content = toml::to_string_pretty(&meta).expect("meta");
+        secure_fs::write_string_atomic(
+            &super::metadata_path().expect("meta path"),
+            &content,
+            0o700,
+            0o600,
+        )
+        .expect("write meta");
+        secure_fs::write_string_atomic(
+            &super::private_key_path().expect("private path"),
+            &generated.private_key_pem,
+            0o700,
+            0o600,
+        )
+        .expect("write private");
+        secure_fs::write_string_atomic(
+            &super::public_key_path().expect("public path"),
+            &generated.public_key_pem,
+            0o700,
+            0o644,
+        )
+        .expect("write public");
+        generated
+    }
+
+    /// The empty-passphrase footgun, end to end at the storage layer: an
+    /// identity "encrypted" under `""` PROMPTS on every load (proved by the
+    /// NoTtyForPassword failure — a prompt would have fired), and `dl cert
+    /// passwd --remove` repairs it with ZERO prompts and ZERO sources while
+    /// preserving the key pair and fingerprint exactly.
+    #[test]
+    fn cert_passwd_remove_repairs_empty_passphrase_footgun_with_zero_prompts() {
+        use crate::crypto::share::decrypt_private_key_pem;
+        use crate::domain::error::DotLockError;
+
+        let _guard = env_lock().lock().expect("lock");
+        let dir = temp_dir();
+        let saved_master = std::env::var("DOTLOCK_MASTER_PASSWORD").ok();
+        unsafe {
+            std::env::set_var("DOTLOCK_IDENTITY_DIR", &dir);
+            std::env::remove_var("DOTLOCK_IDENTITY_PASSPHRASE");
+            std::env::remove_var("DOTLOCK_MASTER_PASSWORD");
+        }
+        crate::crypto::clear_resolved_password_for_tests();
+        super::clear_session_signer();
+
+        // No identity yet: passwd refuses with the clear error.
+        assert!(matches!(
+            super::change_identity_passphrase(true),
+            Err(DotLockError::LocalIdentityNotInitialized)
+        ));
+
+        let generated = seed_empty_passphrase_footgun();
+        let plain_pem =
+            decrypt_private_key_pem(&generated.private_key_pem, "").expect("decrypt with empty");
+
+        // The footgun state prompts: no TTY + no source fails the load.
+        let err = load_local_identity().expect_err("footgun identity must reach the prompt");
+        assert!(matches!(err, DotLockError::NoTtyForPassword));
+
+        // `cert passwd --remove` fixes it with no prompt and no source: the
+        // empty current passphrase is tried silently.
+        let meta = super::change_identity_passphrase(true).expect("remove passphrase");
+        assert!(!meta.encrypted);
+        assert_eq!(
+            meta.fingerprint, generated.fingerprint,
+            "the fingerprint must be unchanged"
+        );
+
+        // On disk: the SAME key, now plain; metadata says unencrypted.
+        let on_disk = secure_fs::read_to_string(&super::private_key_path().expect("path"))
+            .expect("read private");
+        assert_eq!(on_disk, plain_pem);
+        assert!(!on_disk.contains("ENCRYPTED PRIVATE KEY"));
+        let reloaded_meta = load_local_identity_metadata().expect("metadata");
+        assert!(!reloaded_meta.encrypted);
+        assert_eq!(reloaded_meta.fingerprint, generated.fingerprint);
+
+        // Subsequent loads no longer prompt (no session signer to mask it).
+        super::clear_session_signer();
+        let loaded = load_local_identity().expect("plain identity loads with zero prompts");
+        assert_eq!(loaded.fingerprint, generated.fingerprint);
+
+        super::clear_session_signer();
+        let _ = fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("DOTLOCK_IDENTITY_DIR");
+            if let Some(value) = saved_master {
+                std::env::set_var("DOTLOCK_MASTER_PASSWORD", value);
+            }
+        }
+    }
+
+    /// `dl cert passwd` (set a NEW passphrase): re-encrypts the SAME key in
+    /// place — fingerprint unchanged, old encoding gone, new passphrase
+    /// decrypts to the identical private key.
+    #[test]
+    fn cert_passwd_sets_new_passphrase_without_changing_the_key_pair() {
+        use crate::crypto::share::decrypt_private_key_pem;
+
+        let _guard = env_lock().lock().expect("lock");
+        let dir = temp_dir();
+        let saved_master = std::env::var("DOTLOCK_MASTER_PASSWORD").ok();
+        unsafe {
+            std::env::set_var("DOTLOCK_IDENTITY_DIR", &dir);
+            std::env::remove_var("DOTLOCK_IDENTITY_PASSPHRASE");
+            std::env::remove_var("DOTLOCK_MASTER_PASSWORD");
+        }
+        crate::crypto::clear_resolved_password_for_tests();
+        super::clear_session_signer();
+
+        let generated = seed_empty_passphrase_footgun();
+        let plain_pem =
+            decrypt_private_key_pem(&generated.private_key_pem, "").expect("decrypt with empty");
+
+        // Current passphrase: the silent empty try. New passphrase: the
+        // dedicated non-interactive source.
+        unsafe {
+            std::env::set_var("DOTLOCK_IDENTITY_PASSPHRASE", "N3w-Pass!");
+        }
+        let meta = super::change_identity_passphrase(false).expect("set new passphrase");
+        assert!(meta.encrypted);
+        assert_eq!(meta.fingerprint, generated.fingerprint);
+
+        let on_disk = secure_fs::read_to_string(&super::private_key_path().expect("path"))
+            .expect("read private");
+        assert!(on_disk.contains("ENCRYPTED PRIVATE KEY"));
+        // The old (empty) passphrase no longer opens it; the new one yields
+        // the IDENTICAL private key.
+        assert!(decrypt_private_key_pem(&on_disk, "").is_err());
+        assert_eq!(
+            decrypt_private_key_pem(&on_disk, "N3w-Pass!").expect("decrypt with new"),
+            plain_pem
+        );
+
+        // And the identity unlocks with the new passphrase.
+        super::clear_session_signer();
+        let loaded = load_local_identity().expect("unlock with the new passphrase");
+        assert_eq!(loaded.fingerprint, generated.fingerprint);
+        assert_eq!(loaded.private_key_pem, plain_pem);
+
+        super::clear_session_signer();
+        crate::crypto::clear_resolved_password_for_tests();
+        let _ = fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("DOTLOCK_IDENTITY_PASSPHRASE");
+            std::env::remove_var("DOTLOCK_IDENTITY_DIR");
+            if let Some(value) = saved_master {
+                std::env::set_var("DOTLOCK_MASTER_PASSWORD", value);
+            }
+        }
+    }
+
+    /// Fix 2: an EMPTY new identity passphrase is rejected at every entry
+    /// point that would create the footgun — `cert init` (non-plain) and
+    /// `cert passwd` when setting one — with the dedicated error; `--plain`
+    /// remains the supported no-passphrase path.
+    #[test]
+    fn new_identity_passphrase_rejects_empty_from_any_source() {
+        use crate::domain::error::DotLockError;
+
+        let _guard = env_lock().lock().expect("lock");
+        let dir = temp_dir();
+        let saved_master = std::env::var("DOTLOCK_MASTER_PASSWORD").ok();
+        unsafe {
+            std::env::set_var("DOTLOCK_IDENTITY_DIR", &dir);
+            // Set-but-empty dedicated source: the explicit footgun request.
+            std::env::set_var("DOTLOCK_IDENTITY_PASSPHRASE", "");
+            std::env::remove_var("DOTLOCK_MASTER_PASSWORD");
+        }
+        crate::crypto::clear_resolved_password_for_tests();
+        super::clear_session_signer();
+
+        let err = initialize_local_identity_with_options(false, false)
+            .expect_err("empty passphrase must be rejected at init");
+        assert!(
+            matches!(err, DotLockError::EmptyIdentityPassphrase),
+            "expected EmptyIdentityPassphrase, got: {err:?}"
+        );
+        // Nothing half-written.
+        assert!(!super::private_key_path().expect("path").exists());
+        assert!(!super::metadata_path().expect("path").exists());
+
+        // --plain still works with the empty var in the environment.
+        let meta = initialize_local_identity_with_options(false, true).expect("plain init");
+        assert!(!meta.encrypted);
+
+        // `cert passwd` setting a new passphrase hits the same rejection.
+        super::clear_session_signer();
+        let err = super::change_identity_passphrase(false)
+            .expect_err("empty passphrase must be rejected at passwd");
+        assert!(matches!(err, DotLockError::EmptyIdentityPassphrase));
+        // The identity is untouched by the failed attempt.
+        let meta = load_local_identity_metadata().expect("metadata");
+        assert!(!meta.encrypted);
+
+        super::clear_session_signer();
+        let _ = fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("DOTLOCK_IDENTITY_PASSPHRASE");
             std::env::remove_var("DOTLOCK_IDENTITY_DIR");
             if let Some(value) = saved_master {
                 std::env::set_var("DOTLOCK_MASTER_PASSWORD", value);

@@ -1336,6 +1336,170 @@ fn shared_vault_with_encrypted_identity_unlocks_non_interactively() {
         .failure();
 }
 
+/// `dl cert passwd`: changes/removes the identity passphrase IN PLACE — the
+/// key pair and fingerprint are unchanged, so the existing recipient entry
+/// keeps working. Flow: encrypted identity is a shared-vault recipient;
+/// `cert passwd --remove` (current passphrase supplied non-interactively)
+/// flips it to plain; `cert show` reports `passphrase: no`; the fingerprint
+/// is IDENTICAL; and `dl get` then unlocks with ZERO prompts and ZERO
+/// passphrase sources. Setting a NEW passphrase re-encrypts the same key and
+/// the vault unlocks with it.
+#[test]
+fn cert_passwd_removes_and_changes_passphrase_preserving_shared_access() {
+    const IDENTITY_PASSPHRASE: &str = "0ld-Pass!";
+    const NEW_PASSPHRASE: &str = "N3w-Pass!";
+
+    let env = TestEnv::new();
+    env.init_vault();
+    env.dl()
+        .args(["set", "FOO", "bar-value"])
+        .assert()
+        .success();
+
+    // Passphrase-protected identity, granted shared access.
+    env.dl()
+        .args(["cert", "init", "--password-stdin"])
+        .write_stdin(format!("{IDENTITY_PASSPHRASE}\n"))
+        .assert()
+        .success();
+    let pubkey = env.project.join("me.pub.pem");
+    env.dl()
+        .env("DOTLOCK_IDENTITY_PASSPHRASE", IDENTITY_PASSPHRASE)
+        .args(["cert", "export-pub"])
+        .arg(&pubkey)
+        .assert()
+        .success();
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .env("DOTLOCK_IDENTITY_PASSPHRASE", IDENTITY_PASSPHRASE)
+        .args(["share", "grant", "--pubkey"])
+        .arg(&pubkey)
+        .args(["--label", "me"])
+        .assert()
+        .success();
+
+    // Record the fingerprint the recipient entry is keyed on.
+    let out = env
+        .dl()
+        .args(["share", "list", "--json"])
+        .output()
+        .expect("run share list");
+    let recipients: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("share list --json must be valid JSON");
+    let fingerprint = recipients.as_array().expect("recipients")[0]["fingerprint"]
+        .as_str()
+        .expect("fingerprint string")
+        .to_string();
+
+    // The friction being fixed: with the encrypted identity, no session
+    // cache and no passphrase source, every unlock wants the passphrase.
+    env.dl().arg("lock").assert().success();
+    env.dl().args(["get", "FOO"]).assert().failure();
+
+    // `cert passwd --remove`, current passphrase fed non-interactively.
+    env.dl()
+        .env("DOTLOCK_IDENTITY_PASSPHRASE", IDENTITY_PASSPHRASE)
+        .args(["cert", "passwd", "--remove"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("identity passphrase removed"))
+        .stdout(predicate::str::contains("fingerprint unchanged"))
+        .stdout(predicate::str::contains(&fingerprint));
+
+    // Now plain — and the SAME identity: fingerprint unchanged, recipient
+    // entry untouched.
+    env.dl()
+        .args(["cert", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("passphrase: no"))
+        .stdout(predicate::str::contains(&fingerprint));
+    let vault = fs::read_to_string(env.lock_path("vault.toml")).expect("read vault.toml");
+    assert!(
+        vault.contains(&fingerprint),
+        "the recipient entry must still match the (unchanged) fingerprint:\n{vault}"
+    );
+
+    // ZERO prompts, ZERO sources: identity unlock alone returns the secret.
+    env.dl().arg("lock").assert().success();
+    env.dl()
+        .args(["get", "FOO"])
+        .assert()
+        .success()
+        .stdout("bar-value\n");
+    env.dl().args(["run", "--", "true"]).assert().success();
+
+    // Set a NEW passphrase (fed via --password-stdin; the identity is plain,
+    // so only the new-passphrase prompt consumes it) — same key pair again.
+    env.dl()
+        .args(["cert", "passwd", "--password-stdin"])
+        .write_stdin(format!("{NEW_PASSPHRASE}\n"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("identity passphrase updated"))
+        .stdout(predicate::str::contains(&fingerprint));
+    env.dl()
+        .args(["cert", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("passphrase: yes"))
+        .stdout(predicate::str::contains(&fingerprint));
+
+    // Unlocking with the new passphrase works; without a source it prompts
+    // (fails here) — and the OLD passphrase no longer decrypts the identity.
+    env.dl().arg("lock").assert().success();
+    env.dl().args(["get", "FOO"]).assert().failure();
+    env.dl()
+        .env("DOTLOCK_IDENTITY_PASSPHRASE", IDENTITY_PASSPHRASE)
+        .args(["get", "FOO"])
+        .assert()
+        .failure();
+    env.dl()
+        .env("DOTLOCK_IDENTITY_PASSPHRASE", NEW_PASSPHRASE)
+        .args(["get", "FOO"])
+        .assert()
+        .success()
+        .stdout("bar-value\n");
+}
+
+/// Fix for the empty-passphrase footgun at the source: `dl cert init`
+/// without `--plain` REJECTS an empty passphrase (here via the set-but-empty
+/// non-interactive source) with an actionable error pointing at `--plain`,
+/// and leaves no identity behind; `--plain` remains the supported
+/// no-passphrase path.
+#[test]
+fn cert_init_rejects_an_empty_identity_passphrase() {
+    let env = TestEnv::new();
+
+    env.dl()
+        .env("DOTLOCK_IDENTITY_PASSPHRASE", "")
+        .args(["cert", "init"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("empty identity passphrase"))
+        .stderr(predicate::str::contains("--plain"))
+        .stderr(predicate::str::contains("panicked").not());
+
+    // Nothing half-created: there is no identity to show.
+    env.dl()
+        .args(["cert", "show"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not initialized"));
+
+    // --plain still works, even with the empty var in the environment.
+    env.dl()
+        .env("DOTLOCK_IDENTITY_PASSPHRASE", "")
+        .args(["cert", "init", "--plain"])
+        .assert()
+        .success();
+    env.dl()
+        .args(["cert", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("passphrase: no"));
+}
+
 /// Full grant -> revoke cycle on an envelope (v5+) vault, driven end to end
 /// through the binary with two distinct identities (two DOTLOCK_HOMEs sharing
 /// one project, like two teammates' machines):

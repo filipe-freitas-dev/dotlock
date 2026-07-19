@@ -232,6 +232,15 @@ pub enum CertCommand {
     /// Show the local identity fingerprint and paths
     #[command(alias = "sh")]
     Show,
+    /// Change or remove the local identity passphrase in place (the key pair
+    /// and fingerprint are unchanged, so shared-vault access is preserved)
+    #[command(alias = "pw")]
+    Passwd {
+        /// Remove the passphrase: store the private key unencrypted
+        /// (`--plain` is accepted as an alias)
+        #[arg(long, short, alias = "plain")]
+        remove: bool,
+    },
     /// Migrate a legacy RSA identity to Ed25519/X25519 and rekey this
     /// project's recipient entry
     #[command(alias = "m")]
@@ -712,6 +721,25 @@ mod cli_tests {
                 command: CertCommand::Show
             })
         ));
+        // `dl cert passwd` (alias `pw`): --remove and its --plain alias.
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "crt", "pw"])
+                .expect("cert passwd alias")
+                .command,
+            Commands::Cert(CertArgs {
+                command: CertCommand::Passwd { remove: false }
+            })
+        ));
+        for remove_flag in ["--remove", "-r", "--plain"] {
+            assert!(matches!(
+                Cli::try_parse_from(["dl", "cert", "passwd", remove_flag])
+                    .expect("cert passwd remove")
+                    .command,
+                Commands::Cert(CertArgs {
+                    command: CertCommand::Passwd { remove: true }
+                })
+            ));
+        }
         assert!(matches!(
             Cli::try_parse_from(["dl", "shr", "al", "alice", "--list"])
                 .expect("share alias")

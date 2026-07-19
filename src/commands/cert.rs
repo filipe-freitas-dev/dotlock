@@ -8,9 +8,10 @@ use crate::{
         self,
         cache::invalidate_cache,
         identity::{
-            LocalIdentity, initialize_local_identity, initialize_local_identity_with_options,
-            load_legacy_identity_metadata, load_local_identity, load_local_identity_metadata,
-            migrate_local_identity, private_key_path, public_key_path,
+            LocalIdentity, change_identity_passphrase, initialize_local_identity,
+            initialize_local_identity_with_options, load_legacy_identity_metadata,
+            load_local_identity, load_local_identity_metadata, migrate_local_identity,
+            private_key_path, public_key_path,
         },
         project::vault_file,
         shared_access::migrate_recipient_identity,
@@ -79,6 +80,30 @@ pub fn run(command: CertCommand) -> DotLockResult<()> {
             // Step 2 (best effort, per project): rekey this project's
             // recipient entry so unlocking here never touches RSA again.
             rekey_current_project_recipient(new_identity)
+        }
+        CertCommand::Passwd { remove } => {
+            // In-place re-encoding of identity.pem: the key pair (and thus
+            // the fingerprint every shared-vault recipient entry matches on)
+            // is untouched — see `change_identity_passphrase`.
+            let meta = change_identity_passphrase(remove)?;
+            if remove {
+                println!(
+                    "{} identity passphrase removed; fingerprint unchanged ({})",
+                    "ok:".green().bold(),
+                    meta.fingerprint.bold()
+                );
+                println!(
+                    "     {} the private key is now stored unencrypted; unlocks will no longer prompt",
+                    "info:".cyan().bold()
+                );
+            } else {
+                println!(
+                    "{} identity passphrase updated; fingerprint unchanged ({})",
+                    "ok:".green().bold(),
+                    meta.fingerprint.bold()
+                );
+            }
+            Ok(())
         }
         CertCommand::Show => {
             // Metadata only: `show` must tell the user whether the private

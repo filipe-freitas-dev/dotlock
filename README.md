@@ -385,6 +385,8 @@ dl cert init --force    # replace an existing identity
 
 Each developer or CI environment does this once before requesting shared access. The passphrase prompt accepts the [non-interactive sources](#certificate-identity-passphrase-in-ci) too, so a passphrase-protected identity can be created in CI: `printf '%s\n' "$ID_PASS" | dl cert init --password-stdin`.
 
+An **empty passphrase is rejected** (interactively and from the non-interactive sources): `encrypted` under `""` protects nothing and turns every unlock into a pointless prompt. Use `--plain` if you genuinely want no passphrase — and if you already have an empty-passphrase identity from an older version, [`dl cert passwd --remove`](#change-or-remove-the-identity-passphrase--dl-cert-passwd) repairs it without prompting.
+
 ### Show or export the public key — `dl cert show` / `dl cert export-pub`
 
 ```bash
@@ -396,6 +398,17 @@ dl cert export-pub            # print it
 `cert show` reports `passphrase: yes/no` — whether the private key on disk is passphrase-encrypted (i.e. whether unlocks will ask for a passphrase) — without decrypting it, so it never prompts.
 
 Use `export-pub` when sending your public key to a vault owner.
+
+### Change or remove the identity passphrase — `dl cert passwd`
+
+```bash
+dl cert passwd            # set a new passphrase (prompts for the current one first)
+dl cert passwd --remove   # store the private key unencrypted (no more prompts)
+```
+
+Re-encodes the existing private key **in place** — the key pair is never regenerated, so the **fingerprint is unchanged** and every shared vault that lists you as a recipient keeps working; no re-grant is needed. Only the on-disk PKCS#8 encoding of `identity.pem` (and the `encrypted` flag in `identity.toml`) changes.
+
+Both the *current* and the *new* passphrase accept the [non-interactive sources](#certificate-identity-passphrase-in-ci), so the command works in CI too. An identity accidentally "encrypted" under an **empty** passphrase (older versions accepted pressing Enter at `cert init`) is detected and unlocked silently — `dl cert passwd --remove` fixes that state with zero prompts. Setting a new *empty* passphrase is rejected, same as at `cert init`. Alias: `dl crt pw`; `--plain` is accepted as an alias for `--remove`.
 
 ### Migrate a legacy RSA identity — `dl cert migrate`
 
@@ -713,6 +726,7 @@ dl config unset auto_fetch_remote
 | `dl sync` | `sy` | Fast-forward from the configured Git remote when safe |
 | `dl cert init [--force] [--plain]` | `crt i` | Create a local Ed25519 identity |
 | `dl cert show` | `crt sh` | Show local identity information |
+| `dl cert passwd [--remove]` | `crt pw` | Change or remove the identity passphrase in place (key pair and fingerprint unchanged) |
 | `dl cert migrate [--plain]` | `crt m` | Migrate a legacy RSA identity to Ed25519/X25519 and rekey this project's recipient entry |
 | `dl cert export-pub [PATH]` | `crt x` | Print or write the public key |
 | `dl share enable` | `shr en` | Enable shared mode |

@@ -87,6 +87,9 @@ pub enum DotLockError {
     #[error("invalid identity passphrase")]
     InvalidIdentityPassphrase,
 
+    #[error("an empty identity passphrase is not allowed")]
+    EmptyIdentityPassphrase,
+
     #[error("cannot resolve the home/config directory; set HOME or DOTLOCK_HOME")]
     HomeDirUnavailable,
 
@@ -176,6 +179,9 @@ impl DotLockError {
             DotLockError::InvalidIdentityPassphrase => {
                 Some("enter the passphrase used when `dl cert init` created this local identity")
             }
+            DotLockError::EmptyIdentityPassphrase => Some(
+                "an empty passphrase encrypts nothing and only adds prompts; choose a non-empty passphrase, or store the key without one via `--plain` (`dl cert init`/`dl cert migrate`) or `dl cert passwd --remove`",
+            ),
             DotLockError::HomeDirUnavailable => Some(
                 "DotLock refuses to write identities, key caches or audit logs into the current directory; export HOME (or DOTLOCK_HOME) pointing at a per-user directory",
             ),
