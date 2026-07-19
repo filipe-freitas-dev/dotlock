@@ -25,7 +25,7 @@ use crate::{
     },
     storage::{
         identity::{load_local_identity, load_local_identity_metadata},
-        project::SECRETS_FILE,
+        project::secrets_file,
         secure_fs,
         vault_file::{load_vault_metadata, record_vault_write},
         vault_txn::{TxnLock, VaultPairWrite, commit_vault_pair, lock_vault_pair},
@@ -345,7 +345,7 @@ pub fn migrate_all_secrets_to_envelope(
     vault_path: &str,
     metadata: &mut crate::crypto::VaultKeyMetadata,
 ) -> DotLockResult<()> {
-    let mut file = load_secrets_file(SECRETS_FILE)?;
+    let mut file = load_secrets_file(secrets_file())?;
     reject_limited_identity_write(metadata)?;
     let mut changed = false;
 
@@ -386,7 +386,7 @@ pub fn migrate_all_secrets_to_envelope(
 
     metadata.version = metadata.version.max(5);
     commit_secrets_and_metadata(
-        Path::new(SECRETS_FILE),
+        Path::new(&secrets_file()),
         &mut file,
         metadata,
         dek,
@@ -401,7 +401,7 @@ pub fn rotate_secret_sdks_after_acl_removal(
     vault_path: &str,
     metadata: &mut crate::crypto::VaultKeyMetadata,
 ) -> DotLockResult<()> {
-    let mut file = load_secrets_file(SECRETS_FILE)?;
+    let mut file = load_secrets_file(secrets_file())?;
     reject_limited_identity_write(metadata)?;
     let removed_index = metadata
         .recipients
@@ -481,7 +481,7 @@ pub fn rotate_secret_sdks_after_acl_removal(
     }
 
     commit_secrets_and_metadata(
-        Path::new(SECRETS_FILE),
+        Path::new(&secrets_file()),
         &mut file,
         metadata,
         dek,
@@ -613,7 +613,7 @@ pub fn repair_reseal(
 }
 
 pub fn find_secret_by_name(name: &str) -> DotLockResult<SecretRecord> {
-    let file = load_secrets_file(SECRETS_FILE)?;
+    let file = load_secrets_file(secrets_file())?;
     file.secrets
         .into_iter()
         .find(|secret| secret.name == name)
@@ -623,7 +623,7 @@ pub fn find_secret_by_name(name: &str) -> DotLockResult<SecretRecord> {
 }
 
 pub fn list_secrets() -> DotLockResult<Vec<SecretRecord>> {
-    let file = load_secrets_file(SECRETS_FILE)?;
+    let file = load_secrets_file(secrets_file())?;
     Ok(file.secrets)
 }
 
@@ -756,8 +756,9 @@ pub fn remove_secret_by_name(
 ) -> DotLockResult<()> {
     reject_limited_identity_write(metadata)?;
 
-    let _lock = lock_pair_and_refresh_metadata(Path::new(SECRETS_FILE), vault_path, metadata, dek)?;
-    let mut file = load_secrets_file(SECRETS_FILE)?;
+    let _lock =
+        lock_pair_and_refresh_metadata(Path::new(&secrets_file()), vault_path, metadata, dek)?;
+    let mut file = load_secrets_file(secrets_file())?;
     let removed_ids = file
         .secrets
         .iter()
@@ -781,7 +782,7 @@ pub fn remove_secret_by_name(
     }
 
     commit_secrets_and_metadata(
-        Path::new(SECRETS_FILE),
+        Path::new(&secrets_file()),
         &mut file,
         metadata,
         dek,

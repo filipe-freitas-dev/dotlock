@@ -8,7 +8,7 @@ use crate::{
     storage::{
         self,
         env_file::{EnvEntry, merge_exported_env_content, write_env_file},
-        project::SECRETS_FILE,
+        project::secrets_file,
         secrets_lock::{SecretKind, decrypt_secret_value, load_secrets_file},
     },
 };
@@ -59,7 +59,7 @@ fn decrypted_env_entries(
     dek: &ProjectKey,
     metadata: &VaultKeyMetadata,
 ) -> DotLockResult<Vec<EnvEntry>> {
-    let mut secrets = load_secrets_file(SECRETS_FILE)?.secrets;
+    let mut secrets = load_secrets_file(secrets_file())?.secrets;
     secrets.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut entries = Vec::with_capacity(secrets.len());

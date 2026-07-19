@@ -3,12 +3,12 @@ use colored::Colorize;
 use crate::{
     domain::model::DotLockResult,
     git::sync::{SyncStatus, sync_with_remote},
-    storage::project::{VAULT_FILE, ensure_project_initialized},
+    storage::project::{ensure_project_initialized, vault_file},
 };
 
 pub fn run() -> DotLockResult<()> {
     ensure_project_initialized()?;
-    let summary = sync_with_remote(VAULT_FILE)?;
+    let summary = sync_with_remote(&vault_file())?;
     match summary.status {
         SyncStatus::UpToDate => println!(
             "{} vault already synced with {}/{}",

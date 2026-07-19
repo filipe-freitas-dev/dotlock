@@ -7,7 +7,7 @@ use crate::{
     storage::{
         self,
         cache::invalidate_cache,
-        project::{SECRETS_FILE, VAULT_FILE, ensure_project_initialized},
+        project::{ensure_project_initialized, secrets_file, vault_file},
         secrets_lock::{
             load_secrets_file, migrate_all_secrets_to_envelope,
             rotate_secret_sdks_after_acl_removal,
@@ -30,7 +30,7 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
                 access,
             } = ctx;
             let dek = access.require_full()?;
-            let changed = enable_shared_access(VAULT_FILE, &mut metadata, &dek)?;
+            let changed = enable_shared_access(&vault_file(), &mut metadata, &dek)?;
             if changed {
                 println!("{} shared access enabled", "ok:".green().bold());
             } else {
@@ -49,7 +49,7 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
                 access,
             } = ctx;
             let dek = access.require_full()?;
-            migrate_all_secrets_to_envelope(&dek, VAULT_FILE, &mut metadata)?;
+            migrate_all_secrets_to_envelope(&dek, &vault_file(), &mut metadata)?;
             let public_key_pem = load_public_key_from_file(&pubkey)?;
             let allowed_ids = allow.as_deref().map(resolve_secret_ids_csv).transpose()?;
             // Grants must be signed by an authorized signer (H3): the
@@ -58,7 +58,7 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
             // legacy unsigned recipients on pre-signed-grant vaults).
             let signer = storage::identity::load_local_identity()?;
             let recipient = shared_access::grant_recipient_with_secret_ids(
-                VAULT_FILE,
+                &vault_file(),
                 &mut metadata,
                 &public_key_pem,
                 &label,
@@ -82,8 +82,8 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
             } = ctx;
             let dek = access.require_full()?;
             let outcome = revoke_recipient_and_rotate(
-                VAULT_FILE,
-                SECRETS_FILE,
+                &vault_file(),
+                &secrets_file(),
                 &mut metadata,
                 &query,
                 &dek,
@@ -112,7 +112,7 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
         } => {
             ensure_project_initialized()?;
             if list {
-                let ids = list_recipient_acl(VAULT_FILE, &query)?;
+                let ids = list_recipient_acl(&vault_file(), &query)?;
                 for name in secret_names_for_ids(&ids)? {
                     println!("{name}");
                 }
@@ -125,12 +125,12 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
                 access,
             } = ctx;
             let dek = access.require_full()?;
-            migrate_all_secrets_to_envelope(&dek, VAULT_FILE, &mut metadata)?;
+            migrate_all_secrets_to_envelope(&dek, &vault_file(), &mut metadata)?;
 
             if let Some(add) = add {
                 let ids = resolve_secret_ids_csv(&add)?;
                 let added =
-                    add_recipient_secret_ids(VAULT_FILE, &mut metadata, &query, &ids, &dek)?;
+                    add_recipient_secret_ids(&vault_file(), &mut metadata, &query, &ids, &dek)?;
                 println!(
                     "{} added {} secret{} to {}",
                     "ok:".green().bold(),
@@ -147,7 +147,7 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
                     &ids,
                     &query,
                     &dek,
-                    VAULT_FILE,
+                    &vault_file(),
                     &mut metadata,
                 )?;
                 println!(
@@ -166,7 +166,7 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
         }
         ShareCommand::List => {
             ensure_project_initialized()?;
-            let mut recipients = list_recipients(VAULT_FILE)?;
+            let mut recipients = list_recipients(&vault_file())?;
             recipients.sort_by(|a, b| a.label.cmp(&b.label));
             if crate::cli::global::json_output() {
                 // FG1 schema: `[{"label", "fingerprint", "full_access",
@@ -193,7 +193,7 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
 }
 
 fn resolve_secret_ids_csv(value: &str) -> DotLockResult<Vec<String>> {
-    let file = load_secrets_file(SECRETS_FILE)?;
+    let file = load_secrets_file(secrets_file())?;
     value
         .split(',')
         .map(str::trim)
@@ -211,7 +211,7 @@ fn resolve_secret_ids_csv(value: &str) -> DotLockResult<Vec<String>> {
 }
 
 fn secret_names_for_ids(ids: &[String]) -> DotLockResult<Vec<String>> {
-    let file = load_secrets_file(SECRETS_FILE)?;
+    let file = load_secrets_file(secrets_file())?;
     let mut names = ids
         .iter()
         .filter_map(|id| {

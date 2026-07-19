@@ -18,7 +18,7 @@ use crate::{
     domain::{error::DotLockError, model::DotLockResult},
     storage::{
         pending_merge::{confirmation_is_yes, ensure_no_pending_merge},
-        project::{DOTLOCK_DIR, SECRETS_FILE, VAULT_FILE, ensure_project_initialized},
+        project::{ensure_project_initialized, env_lock_dir, secrets_file, vault_file},
         secrets_lock::{
             decrypt_record_with_key, load_secrets_file, repair_reseal, resolve_record_key,
         },
@@ -47,8 +47,10 @@ enum HashDiagnosis {
 
 pub fn run(args: RepairArgs) -> DotLockResult<()> {
     ensure_project_initialized()?;
-    let vault_path = std::path::Path::new(VAULT_FILE);
-    let secrets_path = std::path::Path::new(SECRETS_FILE);
+    let vault_file = vault_file();
+    let secrets_file = secrets_file();
+    let vault_path = std::path::Path::new(&vault_file);
+    let secrets_path = std::path::Path::new(&secrets_file);
 
     // Step 1: an interrupted transaction may BE the whole problem.
     match recover_pending(vault_path, secrets_path)? {
@@ -63,11 +65,11 @@ pub fn run(args: RepairArgs) -> DotLockResult<()> {
     }
     // A merged-but-unreconciled vault has its own flow; repair must not
     // become a way to skip the reconcile review.
-    ensure_no_pending_merge(std::path::Path::new(DOTLOCK_DIR))?;
+    ensure_no_pending_merge(std::path::Path::new(&env_lock_dir()))?;
 
     // Step 2: metadata. An unreadable vault.toml is out of scope — without
     // the wrapped DEK there is nothing to repair against.
-    let metadata = load_vault_metadata(VAULT_FILE).map_err(|_| {
+    let metadata = load_vault_metadata(&vault_file).map_err(|_| {
         DotLockError::Io(
             "`.lock/vault.toml` is unreadable or corrupted; repair cannot proceed without it. \
              Restore it from git history (`git checkout <rev> -- .lock/vault.toml`) and re-run \
@@ -184,7 +186,7 @@ pub fn run(args: RepairArgs) -> DotLockResult<()> {
     // Step 5: recompute + reseal through the transactional funnel (recomputes
     // the metadata MAC and advances the epoch, M2/M3).
     let mut metadata = metadata;
-    repair_reseal(secrets_path, VAULT_FILE, &mut metadata, &dek, &prune_ids)?;
+    repair_reseal(secrets_path, &vault_file, &mut metadata, &dek, &prune_ids)?;
 
     if let Err(err) = record_repair(hash_needs_reseal, &prune_ids, &irrecoverable_names) {
         eprintln!(

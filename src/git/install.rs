@@ -10,6 +10,9 @@ use crate::domain::{error::DotLockError, model::DotLockResult};
 const ATTRIBUTES: &[&str] = &[
     ".lock/secrets.lock merge=dotlock",
     ".lock/vault.toml merge=dotlock",
+    // FG3: env-scoped vault pairs under `.lock/envs/<env>/`.
+    ".lock/envs/*/secrets.lock merge=dotlock",
+    ".lock/envs/*/vault.toml merge=dotlock",
 ];
 
 pub fn install_merge_driver_if_in_git_repo() -> DotLockResult<bool> {
@@ -67,7 +70,10 @@ fn install_gitattributes() -> DotLockResult<()> {
 }
 
 fn configure_merge_driver() -> DotLockResult<()> {
-    run_git_config(["merge.dotlock.driver", "dl _git-merge %A %B %O"])?;
+    // `%P` (the worktree pathname of the result) routes env-scoped pairs
+    // (FG3); the argument is optional in `dl _git-merge`, so clones still
+    // carrying the pre-FG3 3-arg config keep merging the default env.
+    run_git_config(["merge.dotlock.driver", "dl _git-merge %A %B %O %P"])?;
     run_git_config(["merge.dotlock.name", "DotLock vault merge driver"])
 }
 

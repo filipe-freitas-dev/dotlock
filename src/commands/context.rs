@@ -10,7 +10,7 @@ use crate::{
     domain::{keys::ProjectKey, model::DotLockResult},
     storage::{
         cache::invalidate_cache,
-        project::{SECRETS_FILE, VAULT_FILE, ensure_project_initialized},
+        project::{ensure_project_initialized, secrets_file, vault_file},
         unlock_file::{
             UnlockAccess, prepare_vault_access, unlock_vault_prepared,
             unlock_vault_with_master_password_prepared,
@@ -35,7 +35,7 @@ impl VaultContext {
     /// like the old per-helper flow but with a single metadata load.
     pub fn unlock() -> DotLockResult<Self> {
         ensure_project_initialized()?;
-        let metadata = prepare_vault_access(VAULT_FILE)?;
+        let metadata = prepare_vault_access(&vault_file())?;
         let access = unlock_vault_prepared(&metadata)?;
         Ok(Self { metadata, access })
     }
@@ -45,7 +45,7 @@ impl VaultContext {
     /// returns the proven passphrase alongside the context.
     pub fn unlock_with_master_password() -> DotLockResult<(Self, zeroize::Zeroizing<String>)> {
         ensure_project_initialized()?;
-        let metadata = prepare_vault_access(VAULT_FILE)?;
+        let metadata = prepare_vault_access(&vault_file())?;
         let (dek, passphrase) = unlock_vault_with_master_password_prepared(&metadata)?;
         Ok((
             Self {
@@ -100,8 +100,8 @@ pub fn rotate_project_key(
     // inside the same transactional commit.
     seal_vault_metadata(metadata, &new_dek)?;
     commit_vault_pair(
-        std::path::Path::new(VAULT_FILE),
-        std::path::Path::new(SECRETS_FILE),
+        std::path::Path::new(&vault_file()),
+        std::path::Path::new(&secrets_file()),
         VaultPairWrite {
             metadata,
             secrets_lock_bytes: None,

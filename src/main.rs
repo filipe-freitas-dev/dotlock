@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use crate::{
-    cli::args::{AuditArgs, Cli, Commands, ConfigArgs, GitArgs, ProviderArgs, ShareArgs},
+    cli::args::{AuditArgs, Cli, Commands, ConfigArgs, EnvArgs, GitArgs, ProviderArgs, ShareArgs},
     domain::{error::DotLockError, model::DotLockResult},
     utils::report_error,
 };
@@ -41,6 +41,9 @@ fn main() -> ExitCode {
 }
 
 fn dispatch(cli: Cli) -> DotLockResult<()> {
+    // FG3 global: resolve (and validate) the environment selection once,
+    // before any command touches a vault path.
+    storage::project::init_env_selection(cli.env)?;
     match cli.command {
         Commands::Init => commands::init::run(),
         Commands::Set(args) => commands::set::run(args),
@@ -58,6 +61,7 @@ fn dispatch(cli: Cli) -> DotLockResult<()> {
         Commands::Audit(AuditArgs { command }) => commands::audit::run(command),
         Commands::Git(GitArgs { command }) => commands::git::run(command),
         Commands::GitMerge(args) => commands::git::run_merge(args),
+        Commands::Env(EnvArgs { command }) => commands::env::run(command),
         Commands::Config(ConfigArgs { command }) => commands::config::run(command),
         Commands::Provider(ProviderArgs { command }) => commands::provider::run(command),
         Commands::Sync => commands::sync::run(),

@@ -7,7 +7,7 @@ use crate::{
     providers::resolve_provider,
     storage::{
         env_file::parse_env_file,
-        project::SECRETS_FILE,
+        project::secrets_file,
         secrets_lock::{SecretKind, decrypt_secret_value, load_secrets_file},
     },
 };
@@ -34,7 +34,7 @@ pub fn run_with_secrets(
         return Err(DotLockError::MissingCommand);
     }
 
-    let file = load_secrets_file(SECRETS_FILE)?;
+    let file = load_secrets_file(secrets_file())?;
 
     // `--env-file` entries first, vault secrets afterwards: with
     // `Command::envs` the LAST occurrence of a name wins, so a vault secret

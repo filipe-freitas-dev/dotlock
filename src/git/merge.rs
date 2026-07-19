@@ -8,7 +8,7 @@ use crate::{
     domain::{error::DotLockError, model::DotLockResult},
     storage::{
         pending_merge::{PendingMergeMarker, load_marker, save_marker},
-        project::{DOTLOCK_DIR, SECRETS_FILE, VAULT_FILE},
+        project,
         secrets_lock::{DEFAULT_SECRET_ALG, SecretRecord, SecretsFile, load_secrets_file},
         secure_fs,
         vault_file::load_vault_metadata,
@@ -17,20 +17,61 @@ use crate::{
 };
 
 /// Git invokes the driver once per conflicted file, in index (byte-sorted path)
-/// order, so `.lock/secrets.lock` always merges before `.lock/vault.toml`.
+/// order, so `.lock/secrets.lock` always merges before `.lock/vault.toml`
+/// (and each `.lock/envs/<env>/` pair keeps the same order within itself).
 /// The secrets merge records its outcome (merged ids, per-id winner side and a
 /// name-level diff) in the pending-merge marker; the vault merge then unions
 /// the SDK wrappings aligned with those winners and enforces the invariant
 /// that every merged secret keeps a wrapping. The driver NEVER touches the
 /// integrity hash — re-signing is deferred to the interactive `dl reconcile`.
-pub fn run_merge_driver(ours: &Path, theirs: &Path, base: &Path) -> DotLockResult<()> {
-    // Resolve any interrupted vault-pair transaction before merging on top of it.
-    recover_pending(Path::new(VAULT_FILE), Path::new(SECRETS_FILE))?;
-    let lock_dir = Path::new(DOTLOCK_DIR);
-    match merge_target(ours) {
+///
+/// `merged_path` is git's `%P` placeholder (the worktree pathname of the
+/// result): it routes env-scoped pairs (FG3) to their own lock dir and
+/// pending-merge marker. Clones configured by pre-FG3 versions pass only
+/// three arguments, so `None` keeps the historical default-environment
+/// behavior.
+pub fn run_merge_driver(
+    ours: &Path,
+    theirs: &Path,
+    base: &Path,
+    merged_path: Option<&Path>,
+) -> DotLockResult<()> {
+    let env = env_from_merged_path(merged_path)?;
+    let lock_dir = project::env_lock_dir_for(env.as_deref());
+    let lock_dir = Path::new(&lock_dir);
+    // Resolve any interrupted vault-pair transaction (of THIS environment)
+    // before merging on top of it.
+    recover_pending(
+        Path::new(&project::vault_file_for(env.as_deref())),
+        Path::new(&project::secrets_file_for(env.as_deref())),
+    )?;
+    match merge_target(merged_path.unwrap_or(ours)) {
         MergeTarget::Secrets => merge_secrets_lock(ours, theirs, base, lock_dir),
         MergeTarget::Vault => merge_vault_metadata(ours, theirs, base, lock_dir),
     }
+}
+
+/// Extracts the environment from the merged file's worktree path:
+/// `.lock/envs/<env>/...` → `Some(env)`, `.lock/...` → `None`. The env
+/// component is validated (it names a directory) so a crafted path can never
+/// route the marker outside `.lock/envs/`.
+fn env_from_merged_path(merged_path: Option<&Path>) -> DotLockResult<Option<String>> {
+    let Some(path) = merged_path else {
+        return Ok(None);
+    };
+    let mut components = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str());
+    if components.next() != Some(project::DOTLOCK_DIR) || components.next() != Some("envs") {
+        return Ok(None);
+    }
+    let Some(env) = components.next() else {
+        return Ok(None);
+    };
+    // The env component becomes a directory under `.lock/envs/`, so it must
+    // pass the same validation as `dl env add` (no traversal, no dot-names).
+    project::validate_env_name(env)?;
+    Ok(Some(env.to_string()))
 }
 
 enum MergeTarget {
@@ -1149,6 +1190,31 @@ mod driver_tests {
         assert!(load_marker(&dir).expect("marker").is_none());
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// FG3: the `%P` worktree path routes env-scoped pairs to their own lock
+    /// dir; default-env paths and missing `%P` (pre-FG3 clone config) keep
+    /// the historical `.lock/` routing, and a crafted env component fails
+    /// validation instead of escaping `.lock/envs/`.
+    #[test]
+    fn merged_path_resolves_the_environment_safely() {
+        let env = |p: &str| super::env_from_merged_path(Some(Path::new(p)));
+        assert_eq!(super::env_from_merged_path(None).expect("none"), None);
+        assert_eq!(env(".lock/vault.toml").expect("default"), None);
+        assert_eq!(env(".lock/secrets.lock").expect("default"), None);
+        assert_eq!(
+            env(".lock/envs/staging/vault.toml").expect("staging"),
+            Some("staging".to_string())
+        );
+        assert_eq!(
+            env(".lock/envs/prod-eu/secrets.lock").expect("prod-eu"),
+            Some("prod-eu".to_string())
+        );
+        assert_eq!(env("other/path.txt").expect("outside"), None);
+        assert!(matches!(
+            env(".lock/envs/.hidden/vault.toml"),
+            Err(DotLockError::InvalidEnvironmentName { .. })
+        ));
     }
 
     /// `run_merge_driver` resolves interrupted vault-pair transactions before

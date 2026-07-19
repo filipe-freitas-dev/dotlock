@@ -6,7 +6,7 @@ use crate::{
     domain::{error::DotLockError, model::DotLockResult},
     providers::{attest_provider, describe_provider},
     storage::{
-        project::{SECRETS_FILE, VAULT_FILE},
+        project::{secrets_file, vault_file},
         secrets_lock::{DynamicSecretMetadata, upsert_dynamic_secret, upsert_plain_secret},
     },
     utils::normalize_var_name,
@@ -36,7 +36,7 @@ pub fn run(args: SetArgs) -> DotLockResult<()> {
             .unwrap_or_else(|| serde_json::json!({}));
         let bootstrap = parse_csv_list(bootstrap.as_deref().unwrap_or(""));
         upsert_dynamic_secret(
-            SECRETS_FILE,
+            secrets_file(),
             name,
             DynamicSecretMetadata {
                 provider,
@@ -46,7 +46,7 @@ pub fn run(args: SetArgs) -> DotLockResult<()> {
                 provider_sha256: Some(attestation.sha256),
             },
             &dek,
-            VAULT_FILE,
+            &vault_file(),
             &mut metadata,
         )?
     } else {
@@ -59,12 +59,12 @@ pub fn run(args: SetArgs) -> DotLockResult<()> {
             None => prompt_secret_value(&name)?,
         };
         upsert_plain_secret(
-            SECRETS_FILE,
+            secrets_file(),
             name,
             value,
             alg,
             &dek,
-            VAULT_FILE,
+            &vault_file(),
             &mut metadata,
         )?
     };

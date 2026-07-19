@@ -6,7 +6,7 @@ use crate::{
     domain::model::DotLockResult,
     storage::{
         config::{config_lines, set_config_value, unset_config_value},
-        project::{VAULT_FILE, ensure_project_initialized},
+        project::{ensure_project_initialized, vault_file},
         vault_file::load_vault_metadata,
     },
 };
@@ -15,7 +15,7 @@ pub fn run(command: ConfigCommand) -> DotLockResult<()> {
     ensure_project_initialized()?;
     match command {
         ConfigCommand::Show => {
-            let metadata = load_vault_metadata(VAULT_FILE)?;
+            let metadata = load_vault_metadata(vault_file())?;
             for line in config_lines(&metadata.config) {
                 println!("{line}");
             }
@@ -31,7 +31,7 @@ pub fn run(command: ConfigCommand) -> DotLockResult<()> {
             } = ctx;
             let dek = access.require_full()?;
             set_config_value(
-                std::path::Path::new(VAULT_FILE),
+                std::path::Path::new(&vault_file()),
                 &mut metadata,
                 &key,
                 &value,
@@ -47,7 +47,12 @@ pub fn run(command: ConfigCommand) -> DotLockResult<()> {
                 access,
             } = ctx;
             let dek = access.require_full()?;
-            unset_config_value(std::path::Path::new(VAULT_FILE), &mut metadata, &key, &dek)?;
+            unset_config_value(
+                std::path::Path::new(&vault_file()),
+                &mut metadata,
+                &key,
+                &dek,
+            )?;
             println!("{} config {} reset", "ok:".green().bold(), key.bold());
             Ok(())
         }

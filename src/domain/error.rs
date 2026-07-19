@@ -17,6 +17,17 @@ pub enum DotLockError {
     #[error("a DotLock vault already exists in `.lock/`")]
     ProjectAlreadyInitialized,
 
+    #[error("environment `{name}` is not initialized in this project")]
+    EnvironmentNotInitialized { name: String },
+
+    #[error("environment `{name}` already exists")]
+    EnvironmentAlreadyExists { name: String },
+
+    #[error(
+        "environment name `{name}` is invalid (use up to 32 ASCII letters, digits, `-` or `_`, starting with a letter or digit)"
+    )]
+    InvalidEnvironmentName { name: String },
+
     #[error(
         "vault is in a legacy format (missing vault UUID, secret UUIDs, or the integrity hash)"
     )]
@@ -106,6 +117,15 @@ impl DotLockError {
             }
             DotLockError::ProjectAlreadyInitialized => {
                 Some("use `set/get/list/unset`, or remove `.lock/` to start over")
+            }
+            DotLockError::EnvironmentNotInitialized { .. } => {
+                Some("create it with `dl env add <name>`, or list existing ones with `dl env list`")
+            }
+            DotLockError::EnvironmentAlreadyExists { .. } => {
+                Some("select it with `--env <name>` or `dl env use <name>`")
+            }
+            DotLockError::InvalidEnvironmentName { .. } => {
+                Some("environment names become directory names under `.lock/envs/`")
             }
             DotLockError::LegacyVaultFormat => {
                 Some("delete the `.lock/` directory and run `dl init` to create a fresh vault")

@@ -6,6 +6,7 @@ pub mod audit;
 pub mod cert;
 pub mod config;
 pub mod context;
+pub mod env;
 pub mod exec;
 pub mod export;
 pub mod get;

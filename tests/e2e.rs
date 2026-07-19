@@ -781,3 +781,157 @@ fn tampered_secrets_file_is_refused() {
         .stdout(predicate::str::contains("bar-value").not())
         .stderr(predicate::str::contains("error:"));
 }
+
+/// FG3: multi-environment support. `dl env add` creates an INDEPENDENT
+/// vault pair under `.lock/envs/<name>/` (own salt/KEK/DEK, own master
+/// password), `--env`/`DOTLOCK_ENV`/`dl env use` select which pair every
+/// command operates on, and the pre-FG3 files in `.lock/` remain the default
+/// environment untouched — a secret set in staging is invisible to the
+/// default env and undecryptable with the default env's password.
+#[test]
+fn environments_are_isolated_and_selectable() {
+    const STAGING_PASSWORD: &str = "Sta9ing!Passw0rd";
+    let env = TestEnv::new();
+    env.init_vault();
+
+    // A secret that must stay visible only in the default environment.
+    env.dl()
+        .args(["set", "ONLY_DEFAULT", "default-value"])
+        .assert()
+        .success();
+
+    // Create staging with its OWN master password (FG2 stdin bootstrap).
+    env.dl()
+        .args(["env", "add", "staging", "--password-stdin"])
+        .write_stdin(format!("{STAGING_PASSWORD}\n"))
+        .assert()
+        .success();
+    assert!(env.project.join(".lock/envs/staging/vault.toml").exists());
+    assert!(env.project.join(".lock/envs/staging/secrets.lock").exists());
+    // Backward compat: the default pair stays exactly where it was.
+    assert!(env.lock_path("vault.toml").exists());
+    assert!(env.lock_path("secrets.lock").exists());
+
+    // Adding the same environment twice fails cleanly.
+    env.dl()
+        .args(["env", "add", "staging"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already exists"));
+    // Env names are path components; traversal-looking names are rejected.
+    env.dl()
+        .args(["env", "add", "../evil"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid"));
+
+    // Write into staging via the global --env flag (FG2 env var unlock, so
+    // the test never depends on the 15s session cache).
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", STAGING_PASSWORD)
+        .args(["--env", "staging", "set", "API_KEY", "staging-value"])
+        .assert()
+        .success();
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", STAGING_PASSWORD)
+        .args(["--env", "staging", "get", "API_KEY"])
+        .assert()
+        .success()
+        .stdout("staging-value\n");
+
+    // Isolation both ways: the default env cannot see staging's secret...
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["get", "API_KEY"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found"));
+    // ...and staging cannot see the default env's secret.
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", STAGING_PASSWORD)
+        .args(["--env", "staging", "get", "ONLY_DEFAULT"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found"));
+
+    // Crypto isolation: the default env's master password cannot unlock
+    // staging's vault (independent salt + KEK derivation + DEK).
+    env.dl()
+        .args(["--env", "staging", "lock"])
+        .assert()
+        .success();
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["--env", "staging", "get", "API_KEY"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid master password"));
+
+    // DOTLOCK_ENV selects the environment without the flag.
+    env.dl()
+        .env("DOTLOCK_ENV", "staging")
+        .env("DOTLOCK_MASTER_PASSWORD", STAGING_PASSWORD)
+        .args(["get", "API_KEY"])
+        .assert()
+        .success()
+        .stdout("staging-value\n");
+
+    // `dl env list --json` (FG1) reports both, default active by default.
+    let out = env
+        .dl()
+        .args(["env", "list", "--json"])
+        .output()
+        .expect("run env list");
+    assert!(out.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("env list emits valid JSON");
+    let names: Vec<&str> = parsed
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|item| item["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(names, vec!["default", "staging"]);
+    assert_eq!(parsed[0]["active"], serde_json::json!(true));
+    assert_eq!(parsed[1]["active"], serde_json::json!(false));
+
+    // `dl env use staging` persists the selection in the non-secret
+    // `.lock/env` file; plain commands now hit staging, and `--env default`
+    // still forces the legacy pair.
+    env.dl().args(["env", "use", "staging"]).assert().success();
+    assert_eq!(
+        fs::read_to_string(env.lock_path("env"))
+            .expect("selection file")
+            .trim(),
+        "staging"
+    );
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", STAGING_PASSWORD)
+        .args(["get", "API_KEY"])
+        .assert()
+        .success()
+        .stdout("staging-value\n");
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["--env", "default", "get", "ONLY_DEFAULT"])
+        .assert()
+        .success()
+        .stdout("default-value\n");
+
+    // Selecting an environment that was never created fails actionably.
+    env.dl()
+        .args(["--env", "missing", "list"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not initialized"))
+        .stderr(predicate::str::contains("dl env add"));
+
+    // `dl env use default` reverts the persisted selection.
+    env.dl().args(["env", "use", "default"]).assert().success();
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["get", "ONLY_DEFAULT"])
+        .assert()
+        .success()
+        .stdout("default-value\n");
+}

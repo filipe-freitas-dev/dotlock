@@ -20,5 +20,5 @@ pub fn run(command: GitCommand) -> DotLockResult<()> {
 }
 
 pub fn run_merge(args: GitMergeArgs) -> DotLockResult<()> {
-    run_merge_driver(&args.ours, &args.theirs, &args.base)
+    run_merge_driver(&args.ours, &args.theirs, &args.base, args.path.as_deref())
 }

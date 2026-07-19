@@ -31,7 +31,6 @@ const WRAP_KEY_FILE: &str = "session.key";
 /// can never keep a cached project key around for an hour.
 const DEFAULT_TTL_SECS: u64 = 15;
 const MAX_TTL_SECS: u64 = 300;
-const VAULT_FILE: &str = ".lock/vault.toml";
 const WRAP_KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
 
@@ -103,7 +102,7 @@ fn wrap_key_path() -> DotLockResult<PathBuf> {
 /// the metadata best-effort ONCE (an unreadable vault keeps the historical
 /// "unknown" session / non-shared defaults).
 fn load_metadata_best_effort() -> Option<VaultKeyMetadata> {
-    load_vault_metadata(VAULT_FILE).ok()
+    load_vault_metadata(crate::storage::project::vault_file()).ok()
 }
 
 fn session_name(metadata: Option<&VaultKeyMetadata>) -> String {

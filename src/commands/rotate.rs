@@ -11,7 +11,7 @@ use crate::{
     },
     domain::{error::DotLockError, model::DotLockResult},
     storage::{
-        project::{SECRETS_FILE, VAULT_FILE, ensure_project_initialized},
+        project::{ensure_project_initialized, secrets_file, vault_file},
         secrets_lock::current_unix_timestamp,
         vault_file::{load_vault_metadata, record_vault_write, rotation_due},
         vault_txn::{VaultPairWrite, commit_vault_pair},
@@ -41,8 +41,8 @@ pub fn run(args: RotateArgs) -> DotLockResult<()> {
             record_vault_write(&mut metadata);
             seal_vault_metadata(&mut metadata, &dek)?;
             commit_vault_pair(
-                std::path::Path::new(VAULT_FILE),
-                std::path::Path::new(SECRETS_FILE),
+                std::path::Path::new(&vault_file()),
+                std::path::Path::new(&secrets_file()),
                 VaultPairWrite {
                     metadata: &metadata,
                     secrets_lock_bytes: None,
@@ -82,7 +82,7 @@ pub fn run(args: RotateArgs) -> DotLockResult<()> {
 /// due exits 0 without ever prompting for the master password.
 fn run_if_due() -> DotLockResult<()> {
     ensure_project_initialized()?;
-    let metadata = load_vault_metadata(VAULT_FILE)?;
+    let metadata = load_vault_metadata(vault_file())?;
     let Some(reason) = rotation_due(&metadata, current_unix_timestamp()) else {
         println!(
             "{} rotation not due (policies: rotate_max_age_days = {}, auto_ratchet_after_writes = {})",

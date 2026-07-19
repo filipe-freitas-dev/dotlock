@@ -9,7 +9,7 @@ use crate::{
     },
     storage::{
         env_file::parse_env_file,
-        project::{SECRETS_FILE, VAULT_FILE},
+        project::{secrets_file, vault_file},
         secrets_lock::{PlainSecretEntry, upsert_many},
     },
     utils::normalize_var_name,
@@ -47,7 +47,7 @@ pub fn run(args: MigrateArgs) -> DotLockResult<()> {
     }
 
     let total = prepared.len();
-    let summary = upsert_many(SECRETS_FILE, prepared, &dek, VAULT_FILE, &mut metadata)?;
+    let summary = upsert_many(secrets_file(), prepared, &dek, &vault_file(), &mut metadata)?;
 
     println!(
         "{} imported {} from {}",

@@ -8,7 +8,7 @@ use crate::{
         pending_merge::{
             confirmation_is_yes, load_marker, reconcile_pending_merge, verify_marker_matches_files,
         },
-        project::{DOTLOCK_DIR, SECRETS_FILE, VAULT_FILE, ensure_project_initialized},
+        project::{ensure_project_initialized, env_lock_dir, secrets_file, vault_file},
         unlock_file::unlock_full_for_reconcile,
         vault_txn::recover_pending,
     },
@@ -16,9 +16,12 @@ use crate::{
 
 pub fn run() -> DotLockResult<()> {
     ensure_project_initialized()?;
-    let vault_path = std::path::Path::new(VAULT_FILE);
-    let secrets_path = std::path::Path::new(SECRETS_FILE);
-    let lock_dir = std::path::Path::new(DOTLOCK_DIR);
+    let vault_file = vault_file();
+    let secrets_file = secrets_file();
+    let env_lock_dir = env_lock_dir();
+    let vault_path = std::path::Path::new(&vault_file);
+    let secrets_path = std::path::Path::new(&secrets_file);
+    let lock_dir = std::path::Path::new(&env_lock_dir);
     recover_pending(vault_path, secrets_path)?;
 
     let Some(marker) = load_marker(lock_dir)? else {
@@ -46,7 +49,7 @@ pub fn run() -> DotLockResult<()> {
         return Err(DotLockError::Aborted);
     }
 
-    let dek = unlock_full_for_reconcile(VAULT_FILE)?;
+    let dek = unlock_full_for_reconcile(&vault_file)?;
     reconcile_pending_merge(vault_path, secrets_path, lock_dir, &dek)?;
     storage::cache::write_cached_dek(&dek)?;
     println!(

@@ -19,7 +19,7 @@ use crate::{
         epoch_anchor,
         identity::{load_local_identity, load_local_identity_metadata},
         pending_merge::ensure_no_pending_merge,
-        project::SECRETS_FILE,
+        project::secrets_file,
         vault_file::load_vault_metadata,
         vault_txn::recover_pending,
     },
@@ -69,7 +69,7 @@ impl UnlockAccess {
 /// `TamperedSecretsFile`.
 fn recover_pending_before_access(vault_path: &str) -> DotLockResult<()> {
     let vault = std::path::Path::new(vault_path);
-    recover_pending(vault, std::path::Path::new(SECRETS_FILE))?;
+    recover_pending(vault, std::path::Path::new(&secrets_file()))?;
     let lock_dir = match vault.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => std::path::Path::new("."),
@@ -98,7 +98,7 @@ pub fn prepare_vault_access(path: &str) -> DotLockResult<crate::crypto::VaultKey
 pub fn unlock_full_for_reconcile(path: &str) -> DotLockResult<ProjectKey> {
     recover_pending(
         std::path::Path::new(path),
-        std::path::Path::new(SECRETS_FILE),
+        std::path::Path::new(&secrets_file()),
     )?;
     let metadata = load_vault_metadata(path)?;
 
@@ -259,7 +259,7 @@ fn verify_metadata_and_secrets(
 ) -> DotLockResult<()> {
     verify_metadata_mac(metadata, dek)?;
     enforce_epoch_anchor(metadata)?;
-    verify_secrets_integrity(SECRETS_FILE, metadata, dek)
+    verify_secrets_integrity(secrets_file(), metadata, dek)
 }
 
 fn unlock_vault_with_dek(
@@ -298,7 +298,7 @@ fn try_unlock_vault_with_local_identity(
         })?;
     let identity = load_local_identity()?;
     if recipient.wrapped_dek_b64.is_empty() && !recipient.wrapped_sdks.is_empty() {
-        verify_public_secrets_hash(SECRETS_FILE, metadata)?;
+        verify_public_secrets_hash(secrets_file(), metadata)?;
         record_unlock_best_effort("identity", metadata);
         return Ok(UnlockAccess::Limited);
     }

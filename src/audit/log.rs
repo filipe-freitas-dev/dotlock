@@ -96,7 +96,9 @@ fn store_high_water_mark(log_path: &Path, count: u64, head_hash: &str) -> DotLoc
 }
 
 pub fn audit_log_path() -> DotLockResult<PathBuf> {
-    let metadata = load_vault_metadata(".lock/vault.toml")?;
+    // Env-aware (FG3): each environment's vault has its own project_uuid, so
+    // every environment gets its own audit log directory.
+    let metadata = load_vault_metadata(crate::storage::project::vault_file())?;
     Ok(audit_root()?.join(metadata.project_uuid).join(AUDIT_FILE))
 }
 

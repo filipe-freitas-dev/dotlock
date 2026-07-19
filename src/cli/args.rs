@@ -24,6 +24,13 @@ pub struct Cli {
     /// `provider list`) (FG1).
     #[arg(long, global = true)]
     pub json: bool,
+    /// Operate on this environment's vault (FG3). Each environment is an
+    /// independent vault pair: the default one lives in `.lock/`, named ones
+    /// under `.lock/envs/<NAME>/` (create with `dl env add`). Falls back to
+    /// DOTLOCK_ENV, then to the selection persisted by `dl env use`;
+    /// `--env default` always forces the default environment.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub env: Option<String>,
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -87,6 +94,9 @@ pub enum Commands {
     /// Manage Git integration
     #[command(alias = "gt")]
     Git(GitArgs),
+    /// Manage project environments (dev/staging/prod) (FG3)
+    #[command(alias = "ev")]
+    Env(EnvArgs),
     /// Manage project configuration
     #[command(alias = "c")]
     Config(ConfigArgs),
@@ -362,6 +372,31 @@ pub struct GitMergeArgs {
     pub ours: PathBuf,
     pub theirs: PathBuf,
     pub base: PathBuf,
+    /// Worktree pathname of the merge result (`%P`), used to route
+    /// env-scoped vault pairs (FG3). Optional so clones configured by older
+    /// DotLock versions (3-arg driver) keep merging the default environment.
+    pub path: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct EnvArgs {
+    #[command(subcommand)]
+    pub command: EnvCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum EnvCommand {
+    /// List this project's environments
+    #[command(alias = "l")]
+    List,
+    /// Create a new environment with its own independent vault pair
+    /// (fresh salt/KEK/DEK; prompts for that environment's master password)
+    #[command(alias = "a")]
+    Add { name: String },
+    /// Persist NAME as this checkout's default environment (in the
+    /// non-secret `.lock/env` file); `dl env use default` reverts
+    #[command(alias = "u")]
+    Use { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -423,6 +458,65 @@ mod cli_tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_global_env_flag_and_env_subcommand() {
+        use super::{EnvArgs, EnvCommand};
+
+        // FG3: --env is global (before or after the subcommand).
+        let cli = Cli::try_parse_from(["dl", "--env", "staging", "get", "FOO"]).expect("--env get");
+        assert_eq!(cli.env.as_deref(), Some("staging"));
+        let cli = Cli::try_parse_from(["dl", "list", "--env", "prod"]).expect("list --env");
+        assert_eq!(cli.env.as_deref(), Some("prod"));
+        let cli = Cli::try_parse_from(["dl", "list"]).expect("list");
+        assert!(cli.env.is_none());
+
+        // `dl env` management subcommands and aliases.
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "env", "add", "staging"])
+                .expect("env add")
+                .command,
+            Commands::Env(EnvArgs {
+                command: EnvCommand::Add { ref name }
+            }) if name == "staging"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "ev", "l"])
+                .expect("env list alias")
+                .command,
+            Commands::Env(EnvArgs {
+                command: EnvCommand::List
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "ev", "u", "default"])
+                .expect("env use alias")
+                .command,
+            Commands::Env(EnvArgs {
+                command: EnvCommand::Use { ref name }
+            }) if name == "default"
+        ));
+
+        // The hidden merge driver accepts the optional 4th `%P` argument
+        // (and still parses without it for pre-FG3 clone configs).
+        let cli = Cli::try_parse_from(["dl", "_git-merge", "a", "b", "o"]).expect("3-arg merge");
+        assert!(matches!(cli.command, Commands::GitMerge(ref args) if args.path.is_none()));
+        let cli = Cli::try_parse_from([
+            "dl",
+            "_git-merge",
+            "a",
+            "b",
+            "o",
+            ".lock/envs/staging/vault.toml",
+        ])
+        .expect("4-arg merge");
+        assert!(matches!(
+            cli.command,
+            Commands::GitMerge(ref args)
+                if args.path.as_deref()
+                    == Some(std::path::Path::new(".lock/envs/staging/vault.toml"))
+        ));
     }
 
     #[test]
