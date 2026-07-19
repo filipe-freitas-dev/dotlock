@@ -67,10 +67,13 @@ fn decrypted_env_entries(
         if !matches!(secret.kind, SecretKind::Static) {
             continue;
         }
-        let value = decrypt_secret_value(&secret, dek, metadata)?;
+        // The exported value intentionally ends up in a plaintext `.env`
+        // file; `mem::take` moves it out of the `Zeroizing` buffer without
+        // an extra unzeroized heap copy.
+        let mut value = decrypt_secret_value(&secret, dek, metadata)?;
         entries.push(EnvEntry {
             key: secret.name,
-            value,
+            value: std::mem::take(&mut *value),
         });
     }
 

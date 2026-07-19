@@ -4,6 +4,7 @@ use std::{
 };
 
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::{
     crypto::{
@@ -81,16 +82,14 @@ fn migrate_legacy_secret_timestamps(file: &mut SecretsFile) {
 /// `id`/`name`/`updated_at`/`version` (a record whose plaintext ordering
 /// metadata was forged — e.g. a replayed ciphertext with an inflated
 /// timestamp — fails here); `version == 0` records are legacy pre-AAD data.
-pub fn decrypt_record_with_key(secret: &SecretRecord, key: &SecretKey) -> DotLockResult<String> {
+pub fn decrypt_record_with_key(
+    secret: &SecretRecord,
+    key: &SecretKey,
+) -> DotLockResult<Zeroizing<String>> {
     if secret.version == 0 {
-        return decryption_process(secret.data.clone(), secret_algorithm(secret)?, key);
+        return decryption_process(&secret.data, secret_algorithm(secret)?, key);
     }
-    decryption_process_with_aad(
-        secret.data.clone(),
-        secret_algorithm(secret)?,
-        key,
-        &secret.aad(),
-    )
+    decryption_process_with_aad(&secret.data, secret_algorithm(secret)?, key, &secret.aad())
     .map_err(|_| {
         DotLockError::Crypto(format!(
             "secret `{}` failed authentication: its ciphertext does not match the claimed \
@@ -176,7 +175,7 @@ fn upsert_record(
     file: &mut SecretsFile,
     metadata: &mut crate::crypto::VaultKeyMetadata,
     name: String,
-    plaintext: String,
+    plaintext: Zeroizing<String>,
     alg: Alg,
     kind: SecretKind,
     dek: &ProjectKey,
@@ -205,7 +204,7 @@ fn upsert_record(
     // Bind identity + ordering metadata into the AEAD tag (H2/M4): the fields
     // authenticated here are exactly the ones written to the record below.
     let aad = secret_record_aad(&record_id, &name, now, next_version);
-    let encrypted = encryption_process_with_aad(name, plaintext, alg, &sdk, &aad)?;
+    let encrypted = encryption_process_with_aad(name, &plaintext, alg, &sdk, &aad)?;
     let data =
         String::from_utf8(encrypted.data).map_err(|err| DotLockError::Crypto(err.to_string()))?;
 
@@ -315,7 +314,7 @@ pub fn upsert_plain_secret<P: AsRef<Path>>(
         &mut file,
         metadata,
         name,
-        value,
+        Zeroizing::new(value),
         alg,
         SecretKind::Static,
         dek,
@@ -362,7 +361,7 @@ pub fn migrate_all_secrets_to_envelope(
         let aad = secret_record_aad(&secret.id, &secret.name, now, next_version);
         let encrypted = encryption_process_with_aad(
             secret.name.clone(),
-            value,
+            &value,
             secret_algorithm(secret)?,
             &sdk,
             &aad,
@@ -438,7 +437,7 @@ pub fn rotate_secret_sdks_after_acl_removal(
         let aad = secret_record_aad(&secret.id, &secret.name, now, next_version);
         let encrypted = encryption_process_with_aad(
             secret.name.clone(),
-            value,
+            &value,
             secret_algorithm(secret)?,
             &new_sdk,
             &aad,
@@ -493,7 +492,7 @@ pub fn decrypt_secret_value(
     secret: &SecretRecord,
     dek: &ProjectKey,
     metadata: &crate::crypto::VaultKeyMetadata,
-) -> DotLockResult<String> {
+) -> DotLockResult<Zeroizing<String>> {
     let key = if metadata.access_mode == AccessMode::Shared {
         match secret_sdk_from_local_identity(metadata, secret)? {
             Some(sdk) => sdk,
@@ -660,7 +659,7 @@ pub fn upsert_many<P: AsRef<Path>>(
             &mut file,
             metadata,
             entry.name,
-            entry.value,
+            Zeroizing::new(entry.value),
             entry.alg,
             SecretKind::Static,
             dek,
@@ -692,8 +691,9 @@ pub fn upsert_dynamic_secret<P: AsRef<Path>>(
     metadata.version = metadata.version.max(5);
     reject_limited_identity_write(metadata)?;
 
-    let dynamic_json =
-        serde_json::to_string(&dynamic).map_err(|err| DotLockError::Crypto(err.to_string()))?;
+    let dynamic_json = Zeroizing::new(
+        serde_json::to_string(&dynamic).map_err(|err| DotLockError::Crypto(err.to_string()))?,
+    );
     let kind = SecretKind::Dynamic {
         provider: None,
         config: None,
@@ -722,8 +722,10 @@ pub fn decrypt_dynamic_metadata(
 ) -> DotLockResult<DynamicSecretMetadata> {
     let plaintext = decrypt_secret_value(secret, dek, metadata)?;
     if !plaintext.trim().is_empty() {
-        return serde_json::from_str::<DynamicSecretMetadata>(&plaintext).map_err(|err| {
-            DotLockError::Crypto(format!("invalid dynamic secret metadata: {err}"))
+        // L3: the serde error is deliberately NOT interpolated — it can quote
+        // a snippet of the DECRYPTED plaintext into a user-facing message.
+        return serde_json::from_str::<DynamicSecretMetadata>(&plaintext).map_err(|_| {
+            DotLockError::Crypto("invalid dynamic secret metadata".to_string())
         });
     }
 
@@ -885,7 +887,7 @@ mod tests {
         // envelope-encrypted under its own SDK.
         assert!(
             decryption_process(
-                file.secrets[0].data.clone(),
+                &file.secrets[0].data,
                 Alg::XChaCha20Poly1305,
                 &SecretKey::from_legacy_project_key(&dek)
             )
@@ -951,7 +953,7 @@ mod tests {
             );
             let value = super::decrypt_secret_value(secret, &dek, &metadata)
                 .unwrap_or_else(|err| panic!("secret {name} undecryptable: {err}"));
-            assert_eq!(value, format!("{name}-value"));
+            assert_eq!(value.as_str(), format!("{name}-value"));
         }
         // The committed metadata must pass its own integrity checks.
         crate::crypto::integrity::verify_metadata_mac(&metadata, &dek).expect("metadata MAC");
@@ -1013,7 +1015,7 @@ mod tests {
         assert!(metadata.recipients[0].wrapped_sdks.contains_key(&record.id));
         assert!(
             decryption_process(
-                record.data.clone(),
+                &record.data,
                 Alg::XChaCha20Poly1305,
                 &SecretKey::from_legacy_project_key(&dek)
             )
@@ -1169,7 +1171,7 @@ mod tests {
         // pre-AAD format).
         let encrypted = crate::crypto::secret_cipher::encryption_process_with_aad(
             "FOO".to_string(),
-            "legacy-value".to_string(),
+            "legacy-value",
             crate::domain::model::Alg::XChaCha20Poly1305,
             &key,
             &[],
@@ -1186,7 +1188,9 @@ mod tests {
         };
 
         assert_eq!(
-            super::decrypt_record_with_key(&record, &key).expect("legacy decrypt"),
+            super::decrypt_record_with_key(&record, &key)
+                .expect("legacy decrypt")
+                .as_str(),
             "legacy-value"
         );
 
@@ -1197,6 +1201,44 @@ mod tests {
         let err = super::decrypt_record_with_key(&forged, &key)
             .expect_err("forged version must fail authentication");
         assert!(err.to_string().contains("failed authentication"));
+    }
+
+    /// L3: when the DECRYPTED payload of a dynamic secret is not valid JSON,
+    /// the error is generic — the serde error (which can quote a snippet of
+    /// the decrypted plaintext) must never reach a user-facing message.
+    #[test]
+    fn invalid_dynamic_metadata_error_does_not_echo_decrypted_plaintext() {
+        let dir = temp_dir("dynamic-parse-error");
+        let secrets_path = dir.join("secrets.lock");
+        let vault_path = dir.join("vault.toml");
+        let dek = ProjectKey::new([8u8; 32]);
+        save_vault_metadata(&vault_path, &metadata()).expect("save vault");
+
+        // A record whose decrypted payload is NOT valid DynamicSecretMetadata.
+        let leaked_marker = "TOP-SECRET-NOT-JSON";
+        upsert_plain_secret(
+            &secrets_path,
+            "BROKEN_DYNAMIC".to_string(),
+            leaked_marker.to_string(),
+            Alg::XChaCha20Poly1305,
+            &dek,
+            vault_path.to_str().expect("vault path"),
+            &mut load_vault_metadata(&vault_path).expect("load vault metadata"),
+        )
+        .expect("upsert");
+
+        let file = load_secrets_file(&secrets_path).expect("load secrets");
+        let vault_metadata = load_vault_metadata(&vault_path).expect("load vault");
+        let err = super::decrypt_dynamic_metadata(&file.secrets[0], &dek, &vault_metadata)
+            .expect_err("non-JSON payload must fail to parse");
+        let message = err.to_string();
+        assert!(
+            !message.contains(leaked_marker),
+            "error message echoes decrypted plaintext: {message}"
+        );
+        assert!(message.contains("invalid dynamic secret metadata"));
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1301,7 +1343,9 @@ mod tests {
         verify_metadata_mac(&metadata, &dek).expect("MAC verifies after repair");
         verify_secrets_integrity(&secrets_path, &metadata, &dek).expect("integrity after repair");
         assert_eq!(
-            super::decrypt_secret_value(&file.secrets[0], &dek, &metadata).expect("decrypt keep"),
+            super::decrypt_secret_value(&file.secrets[0], &dek, &metadata)
+                .expect("decrypt keep")
+                .as_str(),
             "keep-value"
         );
 

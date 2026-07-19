@@ -32,7 +32,7 @@ pub fn run(args: GetArgs) -> DotLockResult<()> {
             serde_json::json!({
                 "name": secret.name,
                 "id": secret.id,
-                "value": value,
+                "value": value.as_str(),
             })
         );
         return Ok(());

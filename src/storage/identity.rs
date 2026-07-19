@@ -5,6 +5,7 @@ use std::{
 
 use inquire::{Password, PasswordDisplayMode};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::{
     crypto::share::{
@@ -86,12 +87,13 @@ pub(crate) fn clear_session_signer() {
     }
 }
 
-fn prompt_identity_passphrase() -> DotLockResult<String> {
+fn prompt_identity_passphrase() -> DotLockResult<Zeroizing<String>> {
     Password::new("Local identity passphrase:")
         .with_display_mode(PasswordDisplayMode::Masked)
         .with_help_message("used to decrypt your local shared-access key")
         .without_confirmation()
         .prompt()
+        .map(Zeroizing::new)
         .map_err(|err| match err {
             inquire::InquireError::OperationCanceled
             | inquire::InquireError::OperationInterrupted => DotLockError::Aborted,
@@ -99,13 +101,14 @@ fn prompt_identity_passphrase() -> DotLockResult<String> {
         })
 }
 
-fn prompt_new_identity_passphrase() -> DotLockResult<String> {
+fn prompt_new_identity_passphrase() -> DotLockResult<Zeroizing<String>> {
     Password::new("Choose a passphrase for the local identity:")
         .with_display_mode(PasswordDisplayMode::Masked)
         .with_help_message("this protects your local private key on disk")
         .with_custom_confirmation_message("Confirm local identity passphrase:")
         .with_custom_confirmation_error_message("the passphrases don't match")
         .prompt()
+        .map(Zeroizing::new)
         .map_err(|err| match err {
             inquire::InquireError::OperationCanceled
             | inquire::InquireError::OperationInterrupted => DotLockError::Aborted,

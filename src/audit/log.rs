@@ -159,6 +159,9 @@ pub fn append_entry(action: &str, payload: Value) -> DotLockResult<()> {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     }
     writeln!(file, "{line}").map_err(DotLockError::from)?;
+    // L4: fsync the appended entry so a crash right after the write cannot
+    // lose (or leave torn on some filesystems) the last audit line.
+    file.sync_all().map_err(DotLockError::from)?;
     store_high_water_mark(&path, count, &entry_hash)?;
     Ok(())
 }
@@ -226,22 +229,43 @@ pub fn read_all_entries(path: &Path) -> DotLockResult<Vec<AuditEntry>> {
     Ok(entries)
 }
 
+/// Parses the JSONL audit log with tail-resilience (L4): a malformed FINAL
+/// line is treated as an interrupted append (crash mid-write) — it is dropped
+/// with a warning and every prior valid entry is returned, so one torn line
+/// can never make the whole log (and further appends, which need
+/// `read_all_entries`) unreadable. A malformed line in the MIDDLE of the file
+/// is real corruption/tampering and stays a hard error; the hash-chain verify
+/// distinguishes honest truncation from splicing.
 fn read_entries_from_reader<R: Read>(path: &Path, reader: R) -> DotLockResult<Vec<AuditEntry>> {
     let reader = BufReader::new(reader);
+    let mut lines = Vec::new();
+    for line in reader.lines() {
+        lines.push(line.map_err(DotLockError::from)?);
+    }
+    let last_content_index = lines.iter().rposition(|line| !line.trim().is_empty());
+
     let mut entries = Vec::new();
-    for (index, line) in reader.lines().enumerate() {
-        let line = line.map_err(DotLockError::from)?;
+    for (index, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let entry = serde_json::from_str::<AuditEntry>(&line).map_err(|e| {
-            DotLockError::Crypto(format!(
-                "failed to parse audit line {} in {}: {e}",
-                index + 1,
-                path.display()
-            ))
-        })?;
-        entries.push(entry);
+        match serde_json::from_str::<AuditEntry>(line) {
+            Ok(entry) => entries.push(entry),
+            Err(_) if Some(index) == last_content_index => {
+                eprintln!(
+                    "warn: dropping malformed final audit line {} in {} (interrupted write)",
+                    index + 1,
+                    path.display()
+                );
+            }
+            Err(e) => {
+                return Err(DotLockError::Crypto(format!(
+                    "failed to parse audit line {} in {}: {e}",
+                    index + 1,
+                    path.display()
+                )));
+            }
+        }
     }
     Ok(entries)
 }
@@ -500,6 +524,68 @@ mod tests {
             secure_fs,
         },
     };
+
+    fn sample_entry_line(ts: u64, prev_hash: &str) -> (String, String) {
+        let payload = json!({"cmd":["step"]});
+        let entry_hash = compute_entry_hash(ts, "run", &payload, prev_hash).expect("hash");
+        let entry = super::AuditEntry {
+            v: 1,
+            ts,
+            action: "run".to_string(),
+            payload,
+            prev_hash: prev_hash.to_string(),
+            entry_hash: entry_hash.clone(),
+            signer_fingerprint: "anonymous".to_string(),
+            signature: String::new(),
+        };
+        (serde_json::to_string(&entry).expect("json"), entry_hash)
+    }
+
+    /// L4: a torn trailing line (crash mid-append) must not make the whole
+    /// log unreadable — prior entries stay readable, so appends can continue.
+    #[test]
+    fn torn_trailing_line_is_dropped_and_prior_entries_survive() {
+        let (first, first_hash) = sample_entry_line(1000, super::ZERO_HASH);
+        let (second, _) = sample_entry_line(1001, &first_hash);
+        let torn = &second[..second.len() / 2];
+        let content = format!("{first}\n{torn}");
+
+        let entries = super::read_entries_from_reader(
+            std::path::Path::new("torn.log"),
+            std::io::Cursor::new(content.into_bytes()),
+        )
+        .expect("tail-torn log must stay readable");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ts, 1000);
+    }
+
+    /// L4: a malformed line in the MIDDLE is real corruption/tampering and
+    /// must stay a hard error, never be silently dropped.
+    #[test]
+    fn corrupted_middle_line_is_a_hard_error() {
+        let (first, first_hash) = sample_entry_line(1000, super::ZERO_HASH);
+        let (second, _) = sample_entry_line(1001, &first_hash);
+        let content = format!("{first}\nnot-json-at-all\n{second}\n");
+
+        let err = super::read_entries_from_reader(
+            std::path::Path::new("corrupt.log"),
+            std::io::Cursor::new(content.into_bytes()),
+        )
+        .expect_err("mid-file corruption must fail");
+        assert!(err.to_string().contains("failed to parse audit line 2"));
+    }
+
+    /// L4: a torn line that is also the ONLY line yields an empty (readable)
+    /// log rather than an error.
+    #[test]
+    fn torn_only_line_yields_empty_log() {
+        let entries = super::read_entries_from_reader(
+            std::path::Path::new("only-torn.log"),
+            std::io::Cursor::new(b"{\"v\":1,\"ts\":10".to_vec()),
+        )
+        .expect("single torn line tolerated");
+        assert!(entries.is_empty());
+    }
 
     #[test]
     fn entry_hash_changes_when_payload_changes() {

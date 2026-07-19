@@ -1,5 +1,7 @@
 use std::{path::Path, process::Command, time::Instant};
 
+use zeroize::Zeroizing;
+
 use crate::{
     audit::{record_dynamic_resolve, record_run},
     crypto::VaultKeyMetadata,
@@ -38,8 +40,13 @@ pub fn run_with_secrets(
 
     // `--env-file` entries first, vault secrets afterwards: with
     // `Command::envs` the LAST occurrence of a name wins, so a vault secret
-    // always overrides a plaintext env-file value of the same name.
-    let mut envs = extra_env;
+    // always overrides a plaintext env-file value of the same name. Values
+    // live in `Zeroizing` buffers (L1) that are wiped when this function
+    // returns; the child process receives its own copy of the environment.
+    let mut envs: Vec<(String, Zeroizing<String>)> = extra_env
+        .into_iter()
+        .map(|(name, value)| (name, Zeroizing::new(value)))
+        .collect();
     let extra_count = envs.len();
 
     for secret in &file.secrets {
@@ -66,7 +73,7 @@ pub fn run_with_secrets(
 
     let status = Command::new(program)
         .args(args)
-        .envs(envs)
+        .envs(envs.iter().map(|(name, value)| (name.as_str(), value.as_str())))
         .status()
         .map_err(|e| DotLockError::Io(e.to_string()))?;
 
@@ -84,7 +91,7 @@ pub fn secret_value_for_runtime(
     dek: &ProjectKey,
     all_secrets: &[crate::storage::secrets_lock::SecretRecord],
     metadata: &VaultKeyMetadata,
-) -> DotLockResult<Option<String>> {
+) -> DotLockResult<Option<Zeroizing<String>>> {
     match &secret.kind {
         SecretKind::Static => match decrypt_secret_value(secret, dek, metadata) {
             Ok(value) => Ok(Some(value)),
@@ -110,7 +117,7 @@ pub fn resolve_dynamic_secret(
     dek: &ProjectKey,
     all_secrets: &[crate::storage::secrets_lock::SecretRecord],
     metadata: &VaultKeyMetadata,
-) -> DotLockResult<String> {
+) -> DotLockResult<Zeroizing<String>> {
     let mut bootstrap_values = serde_json::Map::new();
     for bootstrap_name in &dynamic.bootstrap {
         let bootstrap_secret = all_secrets
@@ -124,9 +131,13 @@ pub fn resolve_dynamic_secret(
                 "bootstrap secret `{bootstrap_name}` must be static"
             )));
         }
+        // The bootstrap plaintext has to live inside the JSON payload handed
+        // to the provider; `mem::take` moves it out of the `Zeroizing` buffer
+        // without an extra unzeroized copy.
+        let mut value = decrypt_secret_value(bootstrap_secret, dek, metadata)?;
         bootstrap_values.insert(
             bootstrap_name.clone(),
-            serde_json::Value::String(decrypt_secret_value(bootstrap_secret, dek, metadata)?),
+            serde_json::Value::String(std::mem::take(&mut *value)),
         );
     }
 
@@ -153,5 +164,6 @@ pub fn resolve_dynamic_secret(
     ) {
         eprintln!("warn: audit log write failed: {err}");
     }
-    resolved
+    // Minted values are secrets too (L1): keep them in a Zeroizing buffer.
+    resolved.map(Zeroizing::new)
 }

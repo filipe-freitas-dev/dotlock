@@ -642,7 +642,8 @@ mod tests {
             .expect("unwrap SDK under new DEK");
         assert_eq!(
             crate::storage::secrets_lock::decrypt_record_with_key(record_a, &sdk_a)
-                .expect("decrypt A"),
+                .expect("decrypt A")
+                .as_str(),
             "1"
         );
 

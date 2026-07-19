@@ -8,6 +8,7 @@ use chacha20poly1305::{
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
 use crate::{
@@ -106,7 +107,9 @@ pub fn verify_secrets_integrity<P: AsRef<Path>>(
     let stored = decrypt_hash(&nonce, &ciphertext, dek)?;
     let current = compute_file_sha256(secrets_path)?;
 
-    if stored != current {
+    // L8: constant-time comparison. These are public (non-secret) hashes, so
+    // there is no real timing oracle — this is defense-in-depth rigor.
+    if stored.ct_ne(&current).into() {
         return Err(DotLockError::TamperedSecretsFile);
     }
     Ok(())
@@ -126,7 +129,8 @@ pub fn verify_public_secrets_hash<P: AsRef<Path>>(
         .try_into()
         .map_err(|_| DotLockError::LegacyVaultFormat)?;
     let current = compute_file_sha256(secrets_path)?;
-    if stored != current {
+    // L8: constant-time for rigor; the values compared are public hashes.
+    if stored.ct_ne(&current).into() {
         return Err(DotLockError::TamperedSecretsFile);
     }
     Ok(())

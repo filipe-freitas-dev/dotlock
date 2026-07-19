@@ -1,5 +1,7 @@
 use std::fs;
 
+use subtle::ConstantTimeEq;
+
 use crate::{
     audit::log::{
         AuditEntry, AuditHighWaterMark, audit_log_path, compute_entry_hash, hwm_material,
@@ -11,6 +13,14 @@ use crate::{
 };
 
 const ZERO_HASH: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+/// L8: constant-time string-hash comparison. The compared values are public
+/// (non-secret) chain hashes, so there is no real timing oracle; this is
+/// defense-in-depth rigor per REVIEW. `ct_eq` on differing lengths is an
+/// immediate (public) mismatch, which leaks only the length — also public.
+fn hashes_match(a: &str, b: &str) -> bool {
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
 
 pub struct VerifyContext<'a> {
     /// Strict is the DEFAULT: anonymous/unsigned entries (and an unsigned
@@ -29,7 +39,7 @@ pub fn verify_entries(entries: &[AuditEntry], ctx: &VerifyContext<'_>) -> DotLoc
 
     for (index, entry) in entries.iter().enumerate() {
         let line = index + 1;
-        if entry.prev_hash != prev_hash {
+        if !hashes_match(&entry.prev_hash, &prev_hash) {
             return Err(DotLockError::Crypto(format!(
                 "audit verify failed at line {line}: prev_hash mismatch"
             )));
@@ -37,7 +47,7 @@ pub fn verify_entries(entries: &[AuditEntry], ctx: &VerifyContext<'_>) -> DotLoc
 
         let expected =
             compute_entry_hash(entry.ts, &entry.action, &entry.payload, &entry.prev_hash)?;
-        if entry.entry_hash != expected {
+        if !hashes_match(&entry.entry_hash, &expected) {
             return Err(DotLockError::Crypto(format!(
                 "audit verify failed at line {line}: hash mismatch"
             )));
@@ -97,7 +107,7 @@ fn verify_high_water_mark(entries: &[AuditEntry], ctx: &VerifyContext<'_>) -> Do
 
     if hwm.count > 0 {
         let at_mark = &entries[hwm.count as usize - 1];
-        if at_mark.entry_hash != hwm.head_hash {
+        if !hashes_match(&at_mark.entry_hash, &hwm.head_hash) {
             return Err(DotLockError::Crypto(format!(
                 "audit verify failed: entry {} does not match the recorded high-water mark head hash",
                 hwm.count

@@ -788,6 +788,7 @@ mod driver_tests {
         let sdk = sdk::unwrap_sdk_with_project_key(wrapped, &dek()).expect("unwrap sdk");
         decrypt_record_with_key(secret, &sdk)
             .unwrap_or_else(|err| panic!("secret {name} undecryptable after merge: {err}"))
+            .to_string()
     }
 
     /// base has A; ours adds B; theirs adds C. Everything created through the
