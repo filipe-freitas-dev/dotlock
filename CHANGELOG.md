@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-07-19
+
+### Added
+
+- `dl cert passwd` (alias `dl crt pw`) — change or remove the local identity's
+  passphrase in place. The key pair and fingerprint are preserved, so access to
+  shared vaults is kept. Use `--remove` to drop the passphrase (for example, to
+  fix an identity accidentally created with a blank passphrase), or run it
+  without the flag to set a new one.
+
+### Changed
+
+- `dl cert init` and `dl cert migrate` now reject an empty identity passphrase
+  (use `--plain` for an unencrypted identity). This prevents accidentally
+  creating a passphrase-encrypted identity with a blank passphrase that then
+  prompts on every unlock.
+
 ## [1.1.0] - 2026-07-19
 
 ### Added
