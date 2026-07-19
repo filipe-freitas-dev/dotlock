@@ -614,8 +614,8 @@ Aliases: `dl c show`, `dl c set`, `dl c unset`.
 | `dl init` | `i` | Initialize `.lock/` in the current project |
 | `dl set [--alg xcha] NAME VALUE` | `s` | Store or update a static secret |
 | `dl set NAME --provider PROVIDER [--config JSON] [--bootstrap A,B]` | `s` | Store a dynamic secret definition |
-| `dl get NAME` | `g` | Print a secret value |
-| `dl unset NAME` | `u` | Remove a secret |
+| `dl get NAME [--reveal]` | `g` | Print a secret value (masked on a TTY unless `--reveal`; piped output is always the bare value) |
+| `dl unset NAME [--yes]` | `u` | Remove a secret (asks for confirmation; `--yes`/`-y` skips it) |
 | `dl list` | `l` | List stored secrets without plaintext |
 | `dl run CMD [args...]` | `r` | Run a command with decrypted secrets in its environment |
 | `dl lock` | `k` | Drop the cached project key |
@@ -630,11 +630,15 @@ Aliases: `dl c show`, `dl c set`, `dl c unset`.
 | `dl share allow QUERY --list` | `shr allow`, `shr al` | List recipient ACL |
 | `dl share allow QUERY --add A,B` | `shr allow`, `shr al` | Add secrets to recipient ACL |
 | `dl share allow QUERY --remove A,B` | `shr allow`, `shr al` | Remove secrets from recipient ACL and rotate affected SDKs |
-| `dl share revoke QUERY` | `shr revoke`, `shr rev` | Revoke a recipient |
+| `dl share revoke QUERY [--yes]` | `shr revoke`, `shr rev` | Revoke a recipient and rotate the project key (asks for confirmation; `--yes` skips it) |
 | `dl share list` | `shr list`, `shr l` | List recipients |
-| `dl rotate kek` | `rot kek`, `rot k` | Rotate key wrapping material |
-| `dl rotate master-password` | `rot master-password`, `rot mp` | Change master password |
-| `dl rotate project-key` | `rot project-key`, `rot pk` | Rotate project key |
+| `dl rotate kek [--yes]` | `rot kek`, `rot k` | Rotate key wrapping material (asks for confirmation; `--yes` skips it) |
+| `dl rotate master-password [--yes]` | `rot master-password`, `rot mp` | Change master password (asks for confirmation; `--yes` skips it) |
+| `dl rotate project-key [--yes]` | `rot project-key`, `rot pk` | Rotate project key (asks for confirmation; `--yes` skips it) |
+| `dl env list` | `ev l` | List this project's environments |
+| `dl env add NAME` | `ev a` | Create an environment with its own vault pair |
+| `dl env use NAME` | `ev u` | Persist NAME as this checkout's default environment |
+| `dl env remove NAME [--yes]` | `ev rm` | PERMANENTLY delete an environment's vault pair (asks for confirmation; `--yes` skips it) |
 | `dl audit show [--verbose] [--since YYYY-MM-DD] [--action ACTION]` | `a show`, `audit s` | Show audit entries |
 | `dl audit verify [--lax]` | `a verify`, `audit v` | Verify audit log (strict by default) |
 | `dl audit path` | `a path`, `audit p` | Print audit log path |
@@ -728,8 +732,10 @@ Full-access recipients receive wrapped access to the project key and per-secret 
 
 ## Security Notes
 
-- `dl get` prints plaintext. Prefer `dl run` when a command can consume secrets directly.
-- Do not commit plaintext `.env` files after migrating to DotLock.
+- `dl get` prints plaintext. Prefer `dl run` when a command can consume secrets directly. On an interactive terminal the value is masked by default (pass `--reveal` to show it); piped output (`dl get NAME | pbcopy`) always prints the bare value.
+- Destructive operations (`dl unset`, `dl rotate *`, `dl share revoke`, `dl env remove`) ask for an interactive confirmation. Pass `--yes`/`-y` in scripts and CI — without a TTY and without `--yes` they fail fast instead of hanging.
+- Do not commit plaintext `.env` files after migrating to DotLock. `dl export` warns when the exported file is not covered by `.gitignore` inside a git repository and offers to add it.
+- Known dependency advisories (RSA "Marvin" RUSTSEC-2023-0071 and monitored transitive crates) are documented, with rationale and migration plan, in [docs/adr/0001-crypto-dependencies.md](./docs/adr/0001-crypto-dependencies.md); CI enforces `cargo audit`/`cargo deny` so only the documented advisories are accepted.
 - Commit `.lock/vault.toml` and `.lock/secrets.lock` if your team shares the encrypted vault through Git.
 - Use `dl sync` to refresh the vault safely from Git. It aborts on local vault changes or branch divergence instead of discarding data.
 - Keep local identity private keys protected. Use `dl cert init --plain` only for controlled automation or ephemeral environments.

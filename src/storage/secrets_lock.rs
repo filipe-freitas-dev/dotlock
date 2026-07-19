@@ -90,13 +90,13 @@ pub fn decrypt_record_with_key(
         return decryption_process(&secret.data, secret_algorithm(secret)?, key);
     }
     decryption_process_with_aad(&secret.data, secret_algorithm(secret)?, key, &secret.aad())
-    .map_err(|_| {
-        DotLockError::Crypto(format!(
-            "secret `{}` failed authentication: its ciphertext does not match the claimed \
+        .map_err(|_| {
+            DotLockError::Crypto(format!(
+                "secret `{}` failed authentication: its ciphertext does not match the claimed \
              id/name/updated_at/version (possible replay or forged metadata)",
-            secret.name
-        ))
-    })
+                secret.name
+            ))
+        })
 }
 
 fn migrate_legacy_secret_algorithms(file: &mut SecretsFile) -> DotLockResult<()> {
@@ -724,9 +724,8 @@ pub fn decrypt_dynamic_metadata(
     if !plaintext.trim().is_empty() {
         // L3: the serde error is deliberately NOT interpolated — it can quote
         // a snippet of the DECRYPTED plaintext into a user-facing message.
-        return serde_json::from_str::<DynamicSecretMetadata>(&plaintext).map_err(|_| {
-            DotLockError::Crypto("invalid dynamic secret metadata".to_string())
-        });
+        return serde_json::from_str::<DynamicSecretMetadata>(&plaintext)
+            .map_err(|_| DotLockError::Crypto("invalid dynamic secret metadata".to_string()));
     }
 
     match &secret.kind {

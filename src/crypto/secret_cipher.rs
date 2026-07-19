@@ -133,9 +133,14 @@ mod tests {
     #[test]
     fn decrypted_plaintext_is_returned_in_a_zeroizing_buffer() {
         let key = SecretKey::new([7u8; 32]);
-        let encrypted =
-            encryption_process_with_aad("FOO".to_string(), "s3cret", Alg::XChaCha20Poly1305, &key, &[])
-                .expect("encrypt");
+        let encrypted = encryption_process_with_aad(
+            "FOO".to_string(),
+            "s3cret",
+            Alg::XChaCha20Poly1305,
+            &key,
+            &[],
+        )
+        .expect("encrypt");
         let data = String::from_utf8(encrypted.data).expect("utf8");
 
         let plaintext: zeroize::Zeroizing<String> =
@@ -149,14 +154,16 @@ mod tests {
     fn non_utf8_plaintext_error_does_not_echo_decrypted_bytes() {
         let key = SecretKey::new([7u8; 32]);
         // Encrypt raw non-utf8 bytes by driving the cipher directly.
+        use base64::{Engine, engine::general_purpose};
         use chacha20poly1305::{
             XChaCha20Poly1305,
             aead::{Aead, AeadCore, KeyInit, OsRng},
         };
-        use base64::{Engine, engine::general_purpose};
         let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let ciphertext = cipher.encrypt(&nonce, &[0xff, 0xfe, 0x80][..]).expect("encrypt");
+        let ciphertext = cipher
+            .encrypt(&nonce, &[0xff, 0xfe, 0x80][..])
+            .expect("encrypt");
         let mut blob = nonce.to_vec();
         blob.extend_from_slice(&ciphertext);
         let data = general_purpose::STANDARD.encode(blob);

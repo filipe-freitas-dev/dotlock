@@ -297,9 +297,10 @@ fn secret_lifecycle_set_get_list_export_run_unset() {
         "exported file must contain the secret: {exported}"
     );
 
-    // unset: the secret disappears.
+    // unset: the secret disappears (`--yes` skips the L5 confirmation, which
+    // otherwise fails fast without a TTY — covered by its own test below).
     env.dl()
-        .args(["unset", "FOO"])
+        .args(["unset", "--yes", "FOO"])
         .assert()
         .success()
         .stdout(predicate::str::contains("secret FOO removed"));
@@ -934,4 +935,241 @@ fn environments_are_isolated_and_selectable() {
         .assert()
         .success()
         .stdout("default-value\n");
+}
+
+/// L5: destructive operations require an explicit confirmation. Without a
+/// TTY and without `--yes` they must FAIL FAST with an actionable error (not
+/// hang waiting for input), and nothing may have been modified.
+#[test]
+fn destructive_ops_require_yes_without_a_tty() {
+    let env = TestEnv::new();
+    env.init_vault();
+    env.dl()
+        .args(["set", "FOO", "bar-value"])
+        .assert()
+        .success();
+
+    // unset without --yes: refuses, names the flag, leaves the secret intact.
+    env.dl()
+        .args(["unset", "FOO"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("confirmation required"))
+        .stderr(predicate::str::contains("--yes"));
+    env.dl()
+        .args(["get", "FOO"])
+        .assert()
+        .success()
+        .stdout("bar-value\n");
+
+    // rotate (explicit subcommands) without --yes: same refusal, BEFORE any
+    // password prompt (no DOTLOCK_MASTER_PASSWORD is needed to see it fail).
+    for rotate in ["project-key", "kek", "master-password"] {
+        env.dl()
+            .args(["rotate", rotate])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("confirmation required"))
+            .stderr(predicate::str::contains("--yes"));
+    }
+
+    // share revoke without --yes: refused as well (before recipient lookup).
+    env.dl()
+        .args(["share", "revoke", "anyone"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("confirmation required"));
+
+    // With --yes the same operations proceed: rotate really rotates and the
+    // secret stays readable under the new project key.
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["rotate", "project-key", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rotated"));
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["get", "FOO"])
+        .assert()
+        .success()
+        .stdout("bar-value\n");
+    env.dl()
+        .args(["unset", "--yes", "FOO"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("secret FOO removed"));
+
+    // `rotate --if-due` stays exempt (cron/CI is its whole purpose): with
+    // nothing due it exits 0 without --yes and without prompting.
+    env.dl()
+        .args(["rotate", "--if-due"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rotation not due"));
+}
+
+/// L5 (FG3 follow-up): `dl env remove` permanently deletes a named
+/// environment's vault pair, refuses the default environment, and is gated
+/// by the same --yes / TTY confirmation as the other destructive commands.
+#[test]
+fn env_remove_deletes_named_environment_and_refuses_default() {
+    let env = TestEnv::new();
+    env.init_vault();
+
+    env.dl()
+        .args(["env", "add", "staging", "--password-stdin"])
+        .write_stdin(format!("{MASTER_PASSWORD}\n"))
+        .assert()
+        .success();
+    let staging_dir = env.lock_path("envs").join("staging");
+    assert!(staging_dir.join("vault.toml").exists());
+
+    // Without --yes and without a TTY: fail fast, environment untouched.
+    env.dl()
+        .args(["env", "remove", "staging"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("confirmation required"))
+        .stderr(predicate::str::contains("--yes"));
+    assert!(staging_dir.join("vault.toml").exists());
+
+    // The default environment can never be removed, even with --yes.
+    env.dl()
+        .args(["env", "remove", "default", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "default environment cannot be removed",
+        ));
+    assert!(env.lock_path("vault.toml").exists());
+
+    // Removing a non-existent environment fails actionably.
+    env.dl()
+        .args(["env", "remove", "missing", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not initialized"));
+
+    // With --yes: the warning names the environment and the pair is gone.
+    env.dl()
+        .args(["env", "remove", "staging", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "permanently deletes environment staging",
+        ))
+        .stdout(predicate::str::contains("environment staging removed"));
+    assert!(!staging_dir.exists());
+    env.dl()
+        .args(["env", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("staging").not());
+}
+
+/// L5: removing the persisted-selected environment resets the selection file
+/// so later commands fall back to `default` instead of erroring.
+#[test]
+fn env_remove_resets_persisted_selection() {
+    let env = TestEnv::new();
+    env.init_vault();
+    env.dl()
+        .args(["env", "add", "staging", "--password-stdin"])
+        .write_stdin(format!("{MASTER_PASSWORD}\n"))
+        .assert()
+        .success();
+    env.dl().args(["env", "use", "staging"]).assert().success();
+    assert!(env.lock_path("env").exists());
+
+    env.dl()
+        .args(["env", "remove", "staging", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("selection reset"));
+    assert!(
+        !env.lock_path("env").exists(),
+        "the dangling selection file must be removed"
+    );
+    env.dl()
+        .args(["env", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default"));
+}
+
+/// L6: `dl export` writes plaintext secrets, so it must say so — and inside
+/// a git repo it must warn loudly when the exported file is not gitignored
+/// (without a TTY it never blocks on the append-to-gitignore offer).
+#[test]
+fn export_warns_about_plaintext_and_missing_gitignore_coverage() {
+    let env = TestEnv::new();
+    env.init_vault();
+    env.dl()
+        .args(["set", "FOO", "bar-value"])
+        .assert()
+        .success();
+
+    // Outside a git repo: the plaintext note appears, but no gitignore talk.
+    env.dl()
+        .args(["export", ".env.plain"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("PLAINTEXT secrets"))
+        .stderr(predicate::str::contains("gitignore").not());
+
+    // Inside a git repo with no coverage: loud warning + non-TTY hint, and
+    // .gitignore is NOT modified behind the user's back.
+    let git_init = std::process::Command::new("git")
+        .arg("init")
+        .current_dir(&env.project)
+        .output()
+        .expect("git init");
+    assert!(git_init.status.success());
+    env.dl()
+        .args(["export", ".env.out"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("PLAINTEXT secrets"))
+        .stderr(predicate::str::contains("NOT covered by .gitignore"))
+        .stderr(predicate::str::contains(
+            "add `.env.out` to your .gitignore",
+        ));
+    assert!(
+        !env.project.join(".gitignore").exists(),
+        "export must not silently create/modify .gitignore without a TTY confirmation"
+    );
+
+    // Once the file IS gitignored, only the generic plaintext note remains.
+    fs::write(env.project.join(".gitignore"), ".env.covered\n").expect("write .gitignore");
+    env.dl()
+        .args(["export", ".env.covered"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("PLAINTEXT secrets"))
+        .stderr(predicate::str::contains("NOT covered").not());
+}
+
+/// L7: piped `dl get` output is EXACTLY the bare value (load-bearing for
+/// `dl get X | pbcopy`) — with and without `--reveal`, which only affects an
+/// interactive terminal.
+#[test]
+fn get_piped_output_stays_bare_with_and_without_reveal() {
+    let env = TestEnv::new();
+    env.init_vault();
+    env.dl()
+        .args(["set", "FOO", "bar-value"])
+        .assert()
+        .success();
+
+    env.dl()
+        .args(["get", "FOO"])
+        .assert()
+        .success()
+        .stdout("bar-value\n");
+    env.dl()
+        .args(["get", "FOO", "--reveal"])
+        .assert()
+        .success()
+        .stdout("bar-value\n");
 }

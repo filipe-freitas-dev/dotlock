@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt + clippy + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy (zero warnings)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: tests (unit + e2e)
+        run: cargo test
+
+  supply-chain:
+    name: audit + deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      # RUSTSEC-2023-0071 (rsa "Marvin" timing side-channel, no upstream fix)
+      # is a documented, accepted risk — rationale and planned X25519
+      # migration in docs/adr/0001-crypto-dependencies.md. Any OTHER advisory
+      # fails the build.
+      - name: cargo audit
+        run: cargo audit --ignore RUSTSEC-2023-0071
+      - name: cargo deny (advisories + licenses)
+        run: cargo deny check advisories licenses

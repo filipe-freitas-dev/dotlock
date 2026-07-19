@@ -3,6 +3,7 @@ use colored::Colorize;
 use crate::{
     cli::{
         args::{RotateArgs, RotateCommand},
+        confirm::confirm_destructive,
         present::print_ratchet_summary,
     },
     commands::context::{VaultContext, rotate_project_key},
@@ -28,8 +29,17 @@ pub fn run(args: RotateArgs) -> DotLockResult<()> {
                 .to_string(),
         ));
     };
+    // L5: rotations are irreversible (the old wrapping material is gone once
+    // committed) — gate on --yes / TTY confirmation BEFORE any unlock prompt.
+    // `--if-due` is exempt: it exists for cron/CI, where the policy check
+    // itself is the operator's standing consent.
+    ensure_project_initialized()?;
     match command {
-        RotateCommand::MasterPassword => {
+        RotateCommand::MasterPassword { yes } => {
+            confirm_destructive(
+                "rotate the master password (the current password will stop unlocking this vault)",
+                yes,
+            )?;
             let (ctx, _passphrase) = VaultContext::unlock_with_master_password()?;
             let VaultContext {
                 mut metadata,
@@ -51,7 +61,11 @@ pub fn run(args: RotateArgs) -> DotLockResult<()> {
             println!("{} master password rotated", "ok:".green().bold());
             Ok(())
         }
-        RotateCommand::Kek => {
+        RotateCommand::Kek { yes } => {
+            confirm_destructive(
+                "rotate the project key (DEK) and rewrap every secret data key",
+                yes,
+            )?;
             let (ctx, passphrase) = VaultContext::unlock_with_master_password()?;
             let VaultContext {
                 mut metadata,
@@ -62,7 +76,11 @@ pub fn run(args: RotateArgs) -> DotLockResult<()> {
             print_ratchet_summary(&summary);
             Ok(())
         }
-        RotateCommand::ProjectKey => {
+        RotateCommand::ProjectKey { yes } => {
+            confirm_destructive(
+                "rotate the project key (DEK) and rewrap every secret data key",
+                yes,
+            )?;
             let (ctx, passphrase) = VaultContext::unlock_with_master_password()?;
             let VaultContext {
                 mut metadata,

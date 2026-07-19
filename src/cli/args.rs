@@ -143,11 +143,20 @@ pub struct SetArgs {
 #[derive(Args, Debug)]
 pub struct GetArgs {
     pub name: String,
+    /// Show the secret value on an interactive terminal (L7). On a TTY the
+    /// value is masked by default to keep it out of the scrollback; piped
+    /// output (`dl get X | pbcopy`) always prints the bare value and never
+    /// needs this flag.
+    #[arg(long)]
+    pub reveal: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct UnsetArgs {
     pub name: String,
+    /// Skip the interactive confirmation (for scripting/CI) (L5).
+    #[arg(long, short)]
+    pub yes: bool,
 }
 
 #[derive(Args, Debug)]
@@ -249,9 +258,14 @@ pub enum ShareCommand {
         #[arg(long)]
         allow: Option<String>,
     },
-    /// Revoke project access from a recipient
+    /// Revoke project access from a recipient (rotates the project key)
     #[command(alias = "rev")]
-    Revoke { query: String },
+    Revoke {
+        query: String,
+        /// Skip the interactive confirmation (for scripting/CI) (L5).
+        #[arg(long, short)]
+        yes: bool,
+    },
     /// Manage a recipient's per-secret access list
     #[command(alias = "al")]
     Allow {
@@ -397,6 +411,16 @@ pub enum EnvCommand {
     /// non-secret `.lock/env` file); `dl env use default` reverts
     #[command(alias = "u")]
     Use { name: String },
+    /// PERMANENTLY delete an environment's vault pair under
+    /// `.lock/envs/<NAME>/` — every secret stored in that environment is
+    /// lost (the default environment cannot be removed) (L5)
+    #[command(alias = "rm")]
+    Remove {
+        name: String,
+        /// Skip the interactive confirmation (for scripting/CI) (L5).
+        #[arg(long, short)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -405,14 +429,26 @@ pub enum RotateCommand {
     /// (historical name; does the same as `project-key` — the KEK only ever
     /// wraps the DEK and is re-derived from the master password)
     #[command(alias = "k")]
-    Kek,
+    Kek {
+        /// Skip the interactive confirmation (for scripting/CI) (L5).
+        #[arg(long, short)]
+        yes: bool,
+    },
     /// Change the master password wrapping the project key
     #[command(alias = "mp")]
-    MasterPassword,
+    MasterPassword {
+        /// Skip the interactive confirmation (for scripting/CI) (L5).
+        #[arg(long, short)]
+        yes: bool,
+    },
     /// Generate a new project key (DEK) and rewrap the secret data keys
     /// (secret ciphertexts are unchanged; only their wrappings move)
     #[command(alias = "pk")]
-    ProjectKey,
+    ProjectKey {
+        /// Skip the interactive confirmation (for scripting/CI) (L5).
+        #[arg(long, short)]
+        yes: bool,
+    },
 }
 
 #[cfg(test)]
@@ -538,9 +574,84 @@ mod cli_tests {
                 .expect("rotate alias")
                 .command,
             Commands::Rotate(RotateArgs {
-                command: Some(RotateCommand::Kek),
+                command: Some(RotateCommand::Kek { yes: false }),
                 if_due: false
             })
+        ));
+    }
+
+    #[test]
+    fn parses_destructive_yes_flags_and_get_reveal() {
+        use super::{EnvArgs, EnvCommand, GetArgs, UnsetArgs};
+
+        // L5: --yes/-y on every destructive command.
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "unset", "FOO", "--yes"])
+                .expect("unset --yes")
+                .command,
+            Commands::Unset(UnsetArgs { ref name, yes: true }) if name == "FOO"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "unset", "FOO"])
+                .expect("unset")
+                .command,
+            Commands::Unset(UnsetArgs { yes: false, .. })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "rotate", "project-key", "-y"])
+                .expect("rotate -y")
+                .command,
+            Commands::Rotate(RotateArgs {
+                command: Some(RotateCommand::ProjectKey { yes: true }),
+                if_due: false
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "rotate", "master-password", "--yes"])
+                .expect("rotate mp --yes")
+                .command,
+            Commands::Rotate(RotateArgs {
+                command: Some(RotateCommand::MasterPassword { yes: true }),
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "share", "revoke", "alice", "--yes"])
+                .expect("revoke --yes")
+                .command,
+            Commands::Share(ShareArgs {
+                command: ShareCommand::Revoke { ref query, yes: true }
+            }) if query == "alice"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "env", "remove", "staging", "--yes"])
+                .expect("env remove --yes")
+                .command,
+            Commands::Env(EnvArgs {
+                command: EnvCommand::Remove { ref name, yes: true }
+            }) if name == "staging"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "ev", "rm", "staging"])
+                .expect("env rm alias")
+                .command,
+            Commands::Env(EnvArgs {
+                command: EnvCommand::Remove { yes: false, .. }
+            })
+        ));
+
+        // L7: `dl get --reveal` (masked-by-default only applies on a TTY).
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "get", "FOO", "--reveal"])
+                .expect("get --reveal")
+                .command,
+            Commands::Get(GetArgs { ref name, reveal: true }) if name == "FOO"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["dl", "get", "FOO"])
+                .expect("get")
+                .command,
+            Commands::Get(GetArgs { reveal: false, .. })
         ));
     }
 

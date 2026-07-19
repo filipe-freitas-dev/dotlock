@@ -1,3 +1,5 @@
+use std::{io::IsTerminal, path::Path};
+
 use colored::Colorize;
 
 use crate::{
@@ -5,6 +7,7 @@ use crate::{
     commands::context::VaultContext,
     crypto::VaultKeyMetadata,
     domain::{keys::ProjectKey, model::DotLockResult},
+    git::install::{append_gitignore_line, is_git_repo, is_path_gitignored},
     storage::{
         self,
         env_file::{EnvEntry, merge_exported_env_content, write_env_file},
@@ -52,7 +55,70 @@ pub fn run(args: ExportArgs) -> DotLockResult<()> {
         "info:".cyan().bold(),
         merged.skipped.to_string().bold()
     );
+    warn_plaintext_export(&path);
     Ok(())
+}
+
+/// L6: post-export `.env` hygiene. The export itself already succeeded, so
+/// every git probe here is best-effort — a failing `git` must never turn a
+/// successful export into an error. Always states that the file holds
+/// PLAINTEXT secrets; when the file sits in a git repo and is NOT gitignored,
+/// warns loudly and (on a TTY) offers to append it to `.gitignore`.
+fn warn_plaintext_export(path: &Path) {
+    let display = path.display().to_string();
+    eprintln!(
+        "{} {} contains PLAINTEXT secrets — keep it out of version control and backups",
+        "warn:".yellow().bold(),
+        display.bold()
+    );
+
+    if !is_git_repo().unwrap_or(false) {
+        return;
+    }
+    if is_path_gitignored(path).unwrap_or(false) {
+        return;
+    }
+
+    eprintln!(
+        "{} {} is NOT covered by .gitignore — committing it would publish every exported \
+         secret in plaintext",
+        "warn:".yellow().bold(),
+        display.bold()
+    );
+
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "     {} add `{}` to your .gitignore",
+            "hint:".cyan().bold(),
+            display
+        );
+        return;
+    }
+
+    let add = inquire::Confirm::new(&format!("add {display} to .gitignore now?"))
+        .with_default(true)
+        .prompt()
+        .unwrap_or(false);
+    if !add {
+        eprintln!(
+            "     {} remember to add `{}` to your .gitignore",
+            "hint:".cyan().bold(),
+            display
+        );
+        return;
+    }
+    match append_gitignore_line(&display) {
+        Ok(()) => println!(
+            "{} added {} to .gitignore",
+            "ok:".green().bold(),
+            display.bold()
+        ),
+        Err(err) => eprintln!(
+            "{} could not update .gitignore ({err}); add `{}` manually",
+            "warn:".yellow().bold(),
+            display
+        ),
+    }
 }
 
 fn decrypted_env_entries(

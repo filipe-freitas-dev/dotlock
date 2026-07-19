@@ -9,7 +9,7 @@ use std::path::Path;
 use colored::Colorize;
 
 use crate::{
-    cli::global::json_output,
+    cli::{confirm::confirm_destructive, global::json_output},
     domain::{error::DotLockError, model::DotLockResult},
     git::install::install_merge_driver_if_in_git_repo,
     storage::{init_project::init_vault_pair, project, secure_fs},
@@ -23,6 +23,7 @@ pub fn run(command: EnvCommand) -> DotLockResult<()> {
         EnvCommand::List => list(),
         EnvCommand::Add { name } => add(&name),
         EnvCommand::Use { name } => use_env(&name),
+        EnvCommand::Remove { name, yes } => remove(&name, yes),
     }
 }
 
@@ -131,6 +132,56 @@ fn add(name: &str) -> DotLockResult<()> {
     // idempotent; also refreshes the driver command to the %P form).
     let _ = install_merge_driver_if_in_git_repo()?;
 
+    Ok(())
+}
+
+/// `dl env remove <name>` (L5, deferred from FG3): permanently deletes an
+/// environment's entire vault pair under `.lock/envs/<name>/`. The default
+/// environment can never be removed (its vault IS the project root).
+fn remove(name: &str, yes: bool) -> DotLockResult<()> {
+    ensure_base_project_initialized()?;
+    project::validate_env_name(name)?;
+    if name == project::DEFAULT_ENV_NAME {
+        return Err(DotLockError::Io(
+            "the default environment cannot be removed; it is the project's root vault \
+             (remove the whole project by deleting `.lock/`)"
+                .to_string(),
+        ));
+    }
+    if !Path::new(&project::vault_file_for(Some(name))).exists() {
+        return Err(DotLockError::EnvironmentNotInitialized {
+            name: name.to_string(),
+        });
+    }
+
+    println!(
+        "{} this permanently deletes environment {} — every secret stored in it is lost \
+         (its vault pair under {} is removed)",
+        "warn:".yellow().bold(),
+        name.bold(),
+        project::env_lock_dir_for(Some(name)).bold()
+    );
+    confirm_destructive(&format!("permanently delete environment {name}"), yes)?;
+
+    std::fs::remove_dir_all(project::env_lock_dir_for(Some(name))).map_err(DotLockError::from)?;
+
+    // If the removed environment was the persisted default selection, drop
+    // the selection file so the checkout falls back to `default` instead of
+    // erroring on a dangling name.
+    if project::persisted_default_env().as_deref() == Some(name) {
+        std::fs::remove_file(project::ENV_SELECTION_FILE).map_err(DotLockError::from)?;
+        println!(
+            "{} persisted selection reset to {} (it pointed at the removed environment)",
+            "info:".cyan().bold(),
+            project::DEFAULT_ENV_NAME.bold()
+        );
+    }
+
+    println!(
+        "{} environment {} removed",
+        "ok:".green().bold(),
+        name.bold()
+    );
     Ok(())
 }
 

@@ -73,7 +73,10 @@ pub fn run_with_secrets(
 
     let status = Command::new(program)
         .args(args)
-        .envs(envs.iter().map(|(name, value)| (name.as_str(), value.as_str())))
+        .envs(
+            envs.iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        )
         .status()
         .map_err(|e| DotLockError::Io(e.to_string()))?;
 

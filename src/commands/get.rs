@@ -38,6 +38,6 @@ pub fn run(args: GetArgs) -> DotLockResult<()> {
         return Ok(());
     }
 
-    print_get_result(&secret.name, &secret.id, &value);
+    print_get_result(&secret.name, &secret.id, &value, args.reveal);
     Ok(())
 }

@@ -1,0 +1,49 @@
+# cargo-deny configuration (Phase 5 dependency hygiene).
+# Run locally with: cargo deny check advisories licenses
+# Rationale for every acknowledged advisory: docs/adr/0001-crypto-dependencies.md
+
+[graph]
+all-features = true
+
+[advisories]
+# Any advisory NOT listed here fails the check — new/unexpected advisories
+# are denied by default.
+ignore = [
+    # rsa 0.9.x "Marvin" timing side-channel; no upstream fix available.
+    # Used only for local identity key wrapping/signing in share mode, where
+    # there is no remote timing oracle (short-lived CLI process, one unwrap
+    # per unlock). Accepted with a planned migration to X25519 (crypto_box)
+    # as its own milestone — see docs/adr/0001-crypto-dependencies.md.
+    { id = "RUSTSEC-2023-0071", reason = "no upstream fix; local-CLI-only RSA decryption, no remote timing oracle; migration to X25519 tracked in ADR 0001" },
+]
+# Unmaintained TRANSITIVE crates (e.g. `fxhash` via `inquire`,
+# RUSTSEC-2025-0057) are monitored, not fatal — we cannot fix them without
+# forking the parent; a DIRECT unmaintained dependency still fails the check.
+# Monitored in ADR 0001.
+unmaintained = "workspace"
+# `spin 0.9.8` is a yanked transitive dependency (yanked != vulnerable; the
+# lockfile still resolves it). Warn instead of deny until the parent crates
+# move off it — monitored in ADR 0001; flip to "deny" afterwards.
+yanked = "warn"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # `colored` is MPL-2.0 (file-level copyleft only; used unmodified as a
+    # library dependency, which imposes no obligations on this binary).
+    "MPL-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

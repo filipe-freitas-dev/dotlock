@@ -98,6 +98,9 @@ pub enum DotLockError {
 
     #[error("aborted by user")]
     Aborted,
+
+    #[error("confirmation required to {action}")]
+    ConfirmationRequired { action: String },
 }
 
 impl DotLockError {
@@ -177,6 +180,9 @@ impl DotLockError {
                 "DotLock refuses to write identities, key caches or audit logs into the current directory; export HOME (or DOTLOCK_HOME) pointing at a per-user directory",
             ),
             DotLockError::Aborted => None,
+            DotLockError::ConfirmationRequired { .. } => Some(
+                "stdin is not a TTY, so the interactive confirmation cannot run; re-run with --yes/-y to confirm explicitly",
+            ),
             DotLockError::CommandFailed { .. } => None,
             DotLockError::Crypto(_) | DotLockError::Io(_) => None,
         }

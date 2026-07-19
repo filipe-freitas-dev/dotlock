@@ -1,7 +1,7 @@
 use colored::Colorize;
 
 use crate::{
-    cli::{args::ShareCommand, present::print_ratchet_summary},
+    cli::{args::ShareCommand, confirm::confirm_destructive, present::print_ratchet_summary},
     commands::context::VaultContext,
     domain::{error::DotLockError, model::DotLockResult},
     storage::{
@@ -74,7 +74,15 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
             );
             Ok(())
         }
-        ShareCommand::Revoke { query } => {
+        ShareCommand::Revoke { query, yes } => {
+            // L5: revocation removes the recipient AND rotates the project
+            // key — irreversible for the whole team, so gate it before any
+            // unlock prompt.
+            ensure_project_initialized()?;
+            confirm_destructive(
+                &format!("revoke access for `{query}` and rotate the project key"),
+                yes,
+            )?;
             let (ctx, passphrase) = VaultContext::unlock_with_master_password()?;
             let VaultContext {
                 mut metadata,

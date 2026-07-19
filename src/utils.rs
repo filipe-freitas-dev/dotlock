@@ -41,8 +41,27 @@ pub fn normalize_var_name(name: &str) -> DotLockResult<String> {
     Ok(name.to_ascii_uppercase())
 }
 
-pub fn print_get_result(name: &str, id: &str, value: &str) {
+/// L7: fixed-width placeholder shown instead of the value on a TTY without
+/// `--reveal`. Constant length so it leaks neither the value nor its size.
+const TTY_VALUE_MASK: &str = "••••••••";
+
+/// L7: the lines rendered inside the TTY box. Masked unless `--reveal` was
+/// passed; NEVER used for piped output, which always prints the bare value.
+fn tty_value_lines(value: &str, reveal: bool) -> Vec<&str> {
+    if !reveal {
+        return vec![TTY_VALUE_MASK];
+    }
+    if value.is_empty() {
+        vec![""]
+    } else {
+        value.lines().collect()
+    }
+}
+
+pub fn print_get_result(name: &str, id: &str, value: &str, reveal: bool) {
     if !std::io::stdout().is_terminal() {
+        // Load-bearing since Phase 0/1: piped output is the bare value only
+        // (`dl get X | pbcopy`), regardless of --reveal.
         println!("{}", value);
         return;
     }
@@ -50,11 +69,7 @@ pub fn print_get_result(name: &str, id: &str, value: &str) {
     let short = short_uuid(id);
     let title = name.to_string();
     let id_line = format!("id: {}", short);
-    let value_lines: Vec<&str> = if value.is_empty() {
-        vec![""]
-    } else {
-        value.lines().collect()
-    };
+    let value_lines = tty_value_lines(value, reveal);
 
     let center = |s: &str, w: usize| {
         let len = s.chars().count();
@@ -116,11 +131,21 @@ pub fn print_get_result(name: &str, id: &str, value: &str) {
         "┘".dimmed()
     );
     println!();
-    println!(
-        "  {} pipe to a command to read the value (e.g. `dl get {} | pbcopy`)",
-        "hint:".cyan().bold(),
-        name
-    );
+    if reveal {
+        println!(
+            "  {} pipe to a command to read the value (e.g. `dl get {} | pbcopy`)",
+            "hint:".cyan().bold(),
+            name
+        );
+    } else {
+        println!(
+            "  {} value masked on a terminal (L7); pass {} to show it here, or pipe it \
+             (e.g. `dl get {} | pbcopy`)",
+            "hint:".cyan().bold(),
+            "--reveal".bold(),
+            name
+        );
+    }
     println!();
 }
 
@@ -221,5 +246,29 @@ pub fn report_error(err: &DotLockError) {
     eprintln!("{} {}", "error:".red().bold(), err);
     if let Some(hint) = err.hint() {
         eprintln!("{} {}", "hint: ".cyan().bold(), hint);
+    }
+}
+
+#[cfg(test)]
+mod tty_mask_tests {
+    use super::{TTY_VALUE_MASK, tty_value_lines};
+
+    #[test]
+    fn tty_display_is_masked_by_default_and_leaks_no_length() {
+        // L7: without --reveal the TTY box shows only the fixed-width mask —
+        // identical for every value, so neither content nor length leaks.
+        assert_eq!(tty_value_lines("hunter2", false), vec![TTY_VALUE_MASK]);
+        assert_eq!(
+            tty_value_lines("a-much-longer-multi\nline\nsecret", false),
+            vec![TTY_VALUE_MASK]
+        );
+        assert_eq!(tty_value_lines("", false), vec![TTY_VALUE_MASK]);
+    }
+
+    #[test]
+    fn tty_display_shows_the_value_lines_with_reveal() {
+        assert_eq!(tty_value_lines("hunter2", true), vec!["hunter2"]);
+        assert_eq!(tty_value_lines("a\nb", true), vec!["a", "b"]);
+        assert_eq!(tty_value_lines("", true), vec![""]);
     }
 }

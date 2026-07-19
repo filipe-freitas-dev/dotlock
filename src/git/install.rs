@@ -25,13 +25,55 @@ pub fn install_merge_driver_if_in_git_repo() -> DotLockResult<bool> {
     Ok(true)
 }
 
-fn is_git_repo() -> DotLockResult<bool> {
+pub fn is_git_repo() -> DotLockResult<bool> {
     let output = Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
         .map_err(|err| DotLockError::Io(err.to_string()))?;
 
     Ok(output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true")
+}
+
+/// True when git already ignores `path` (L6). `git check-ignore -q` exits 0
+/// for ignored paths, 1 for tracked/unignored ones and 128 on error; only a
+/// clean 0 counts as "safe".
+pub fn is_path_gitignored(path: &Path) -> DotLockResult<bool> {
+    let output = Command::new("git")
+        .args(["check-ignore", "-q", "--"])
+        .arg(path)
+        .output()
+        .map_err(|err| DotLockError::Io(err.to_string()))?;
+
+    Ok(output.status.success())
+}
+
+/// Appends `line` to the repository's `.gitignore` (creating it if needed),
+/// mirroring the `.gitattributes` handling above. No-op when the exact line
+/// is already present.
+pub fn append_gitignore_line(line: &str) -> DotLockResult<()> {
+    let path = Path::new(".gitignore");
+    let existing = if path.exists() {
+        fs::read_to_string(path).map_err(DotLockError::from)?
+    } else {
+        String::new()
+    };
+
+    if existing.lines().any(|existing| existing.trim() == line) {
+        return Ok(());
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(DotLockError::from)?;
+
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        writeln!(file).map_err(DotLockError::from)?;
+    }
+    writeln!(file, "{line}").map_err(DotLockError::from)?;
+
+    Ok(())
 }
 
 fn install_gitattributes() -> DotLockResult<()> {
