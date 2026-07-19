@@ -9,7 +9,7 @@
 //! `DOTLOCK_MASTER_PASSWORD` or `--password-file`.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -43,10 +43,17 @@ impl TestEnv {
 
     /// A `dl` command scoped to this environment.
     fn dl(&self) -> Command {
+        self.dl_as(&self.home)
+    }
+
+    /// A `dl` command running in the same project but with an explicit
+    /// DOTLOCK_HOME — a separate home means a separate identity and a
+    /// separate session cache, i.e. a different teammate's machine.
+    fn dl_as(&self, home: &Path) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_dl"));
         cmd.current_dir(&self.project)
-            .env("DOTLOCK_HOME", &self.home)
-            .env("HOME", &self.home)
+            .env("DOTLOCK_HOME", home)
+            .env("HOME", home)
             .env("NO_COLOR", "1");
         cmd
     }
@@ -1234,4 +1241,147 @@ fn fresh_shared_setup_uses_modern_crypto_with_zero_rsa() {
         .assert()
         .success()
         .stdout("bar-value\n");
+}
+
+/// Full grant -> revoke cycle on an envelope (v5+) vault, driven end to end
+/// through the binary with two distinct identities (two DOTLOCK_HOMEs sharing
+/// one project, like two teammates' machines):
+///
+/// 1. the peer identity, once granted, reads secrets with no master password
+///    and no session cache — pure identity unlock;
+/// 2. `dl share revoke` succeeds and rotates the project key;
+/// 3. the OWNER still reads every secret afterwards via their own (rewrapped)
+///    identity — the rotation must not brick the vault;
+/// 4. the revoked peer can no longer unlock: its identity read fails and its
+///    wrapped key material is gone from `vault.toml`.
+#[test]
+fn share_revoke_cycle_locks_out_revoked_recipient_end_to_end() {
+    let env = TestEnv::new();
+    env.init_vault();
+    env.dl()
+        .args(["set", "API_KEY", "owner-secret-1"])
+        .assert()
+        .success();
+    env.dl()
+        .args(["set", "DB_URL", "postgres://owner"])
+        .assert()
+        .success();
+
+    // Owner identity: signs grants (H3) and, once granted itself, proves the
+    // vault stays readable after the revoke rotation without any password.
+    env.dl()
+        .args(["cert", "init", "--plain"])
+        .assert()
+        .success();
+    let owner_pub = env.project.join("owner.pub.pem");
+    env.dl()
+        .args(["cert", "export-pub"])
+        .arg(&owner_pub)
+        .assert()
+        .success();
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["share", "grant", "--pubkey"])
+        .arg(&owner_pub)
+        .args(["--label", "owner"])
+        .assert()
+        .success();
+
+    // Peer identity: a second DOTLOCK_HOME with its own identity.pem and its
+    // own (empty) session cache.
+    let peer_home = env.home.parent().expect("temp root").join("peer-home");
+    fs::create_dir(&peer_home).expect("create peer home");
+    env.dl_as(&peer_home)
+        .args(["cert", "init", "--plain"])
+        .assert()
+        .success();
+    let peer_pub = env.project.join("peer.pub.pem");
+    env.dl_as(&peer_home)
+        .args(["cert", "export-pub"])
+        .arg(&peer_pub)
+        .assert()
+        .success();
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["share", "grant", "--pubkey"])
+        .arg(&peer_pub)
+        .args(["--label", "peer"])
+        .assert()
+        .success();
+
+    // The grant migrated the vault to the envelope layout and recorded both
+    // modern recipients; remember the peer's fingerprint so its removal can
+    // be asserted precisely after the revoke.
+    let out = env
+        .dl()
+        .args(["share", "list", "--json"])
+        .output()
+        .expect("run share list");
+    let recipients: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("share list --json must be valid JSON");
+    let peer_fingerprint = recipients
+        .as_array()
+        .expect("array of recipients")
+        .iter()
+        .find(|item| item["label"] == "peer")
+        .expect("peer recipient listed")["fingerprint"]
+        .as_str()
+        .expect("fingerprint string")
+        .to_string();
+    let vault = fs::read_to_string(env.lock_path("vault.toml")).expect("read vault.toml");
+    assert!(
+        vault.contains(&peer_fingerprint),
+        "peer's wrapped material must be recorded before the revoke:\n{vault}"
+    );
+
+    // The peer reads secrets through the binary with no master password and
+    // no cached session key: identity unlock alone grants access.
+    env.dl_as(&peer_home)
+        .args(["get", "API_KEY"])
+        .assert()
+        .success()
+        .stdout("owner-secret-1\n");
+
+    // Revoke the peer through the binary; the project key is rotated.
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["share", "revoke", "peer", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("project key rotated"));
+
+    // The peer's wrapped key material is genuinely gone from vault.toml;
+    // the owner's rewrapped grant remains.
+    let vault = fs::read_to_string(env.lock_path("vault.toml")).expect("read vault.toml");
+    assert!(
+        !vault.contains(&peer_fingerprint),
+        "revoke must remove every trace of the peer's wrapped material:\n{vault}"
+    );
+    assert!(
+        vault.contains("label = \"owner\""),
+        "the owner recipient must survive the revoke:\n{vault}"
+    );
+
+    // Vault not bricked: with the session cache invalidated by the revoke and
+    // no password in the environment, the owner still reads both secrets via
+    // their own identity, whose DEK wrapping was rotated to the new key.
+    env.dl().arg("lock").assert().success();
+    env.dl()
+        .args(["get", "API_KEY"])
+        .assert()
+        .success()
+        .stdout("owner-secret-1\n");
+    env.dl()
+        .args(["get", "DB_URL"])
+        .assert()
+        .success()
+        .stdout("postgres://owner\n");
+
+    // The revoked peer is locked out: with its session cache dropped, its
+    // identity can no longer unwrap the rotated project key.
+    env.dl_as(&peer_home).arg("lock").assert().success();
+    env.dl_as(&peer_home)
+        .args(["get", "API_KEY"])
+        .assert()
+        .failure();
 }

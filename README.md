@@ -745,7 +745,9 @@ Full-access recipients receive wrapped access to the project key and per-secret 
 
 ### Windows
 
-File-permission hardening (0600 key/vault files, 0700 private directories, `O_NOFOLLOW` symlink-safe opens) is implemented for Unix only. On Windows, files created by DotLock inherit the parent directory's default ACLs and symlink checks fall back to a check-then-open pattern; restrictive owner-only DACLs are not yet applied. Until that lands, treat the profile directory (`%USERPROFILE%\.dotlock`) and project `.lock/` directories as protected only by your account's default ACLs, and avoid shared/multi-user Windows machines for sensitive vaults.
+File-permission hardening is implemented on both families. On Unix, key/vault files are created 0600 and private directories 0700 (mode applied at open/mkdir time), with `O_NOFOLLOW` symlink-safe opens. On Windows, DotLock applies a restrictive DACL to every sensitive file and directory it creates (vault/secrets files, identities, session cache, audit log): a single access-control entry granting full control to the current user only, with inheritance from the parent severed (`PROTECTED_DACL_SECURITY_INFORMATION`), so no other account — including other members of local groups — retains access through inherited ACEs. Private directories get an inheritable owner-only ACE so files born inside them (e.g. transaction journal files) start owner-only. If applying the DACL fails, the operation errors out rather than silently leaving a permissive file behind.
+
+Residual differences on Windows: there is no `O_NOFOLLOW` equivalent in the portable open path, so symlink rejection falls back to a check-then-open pattern (a narrow race window that requires a local attacker who can already write inside your protected directories), and files that existed before this hardening keep whatever ACLs they had until rewritten. Administrators can always take ownership of any file; that is inherent to the platform.
 
 ## License
 

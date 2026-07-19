@@ -144,9 +144,6 @@ pub fn append_entry(action: &str, payload: Value) -> DotLockResult<()> {
     let line = serde_json::to_string(&entry).map_err(|e| DotLockError::Crypto(e.to_string()))?;
     let mut options = OpenOptions::new();
     options.create(true).append(true);
-    // M9 (documented gap): on Windows there is no 0600 equivalent here; the
-    // log inherits the parent directory's default ACLs. Restrictive DACL
-    // support is tracked in README "Security Notes > Windows".
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -158,6 +155,10 @@ pub fn append_entry(action: &str, payload: Value) -> DotLockResult<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     }
+    // M9: the Windows counterpart of the 0600 mode above — an owner-only DACL
+    // applied right after the open, before any entry is appended.
+    #[cfg(windows)]
+    secure_fs::restrict_to_owner(&path, false)?;
     writeln!(file, "{line}").map_err(DotLockError::from)?;
     // L4: fsync the appended entry so a crash right after the write cannot
     // lose (or leave torn on some filesystems) the last audit line.
@@ -184,6 +185,8 @@ impl AuditLock {
             }
             match options.open(&path) {
                 Ok(mut file) => {
+                    #[cfg(windows)]
+                    secure_fs::restrict_to_owner(&path, false)?;
                     writeln!(file, "{}", now_secs()).map_err(DotLockError::from)?;
                     return Ok(Self { path });
                 }
