@@ -313,6 +313,12 @@ pub fn commit_vault_pair(
     // Step 5: transaction complete; drop the journal.
     remove_if_exists(&journal_path)?;
     fsync_dir(&dir)?;
+
+    // M3: the committed epoch is now the newest state this machine produced;
+    // anchor it (best effort — per-user state may be unavailable, e.g. no
+    // HOME, and that must never fail an already-durable commit).
+    let _ =
+        crate::storage::epoch_anchor::advance_epoch(&metadata.project_uuid, metadata.vault_epoch);
     Ok(())
 }
 
@@ -455,6 +461,8 @@ mod tests {
             secrets_hash_nonce_b64: "hash_nonce".to_string(),
             secrets_hash_b64: "hash".to_string(),
             secrets_hash_sha256_b64: "hash_plain".to_string(),
+            vault_epoch: 0,
+            metadata_mac_b64: String::new(),
         }
     }
 

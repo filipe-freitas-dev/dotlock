@@ -276,6 +276,79 @@ fn pending_merge_marker_blocks_access_until_reconciled() {
 /// must never decrypt silently — the session cache is invalidated and the
 /// command fails.
 #[test]
+fn tampered_vault_metadata_is_refused() {
+    let env = TestEnv::new();
+    if !env.init_vault() {
+        return;
+    }
+
+    env.dl()
+        .args(["set", "FOO", "bar-value"])
+        .assert()
+        .success();
+
+    // M2: rewrite a MAC-covered scalar field without resealing. The write
+    // counter is chosen because it does not alter cache/session resolution,
+    // so the failure is unambiguously the metadata authentication check.
+    let vault = env.lock_path("vault.toml");
+    let content = fs::read_to_string(&vault).expect("read vault.toml");
+    let tampered = content.replace("kek_writes_since_rotate = 1", "kek_writes_since_rotate = 9");
+    assert_ne!(content, tampered, "fixture must actually change the field");
+    fs::write(&vault, &tampered).expect("write tampered vault.toml");
+
+    env.dl()
+        .args(["get", "FOO"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("bar-value").not())
+        .stderr(predicate::str::contains("failed authentication"));
+}
+
+#[test]
+fn restored_older_vault_pair_is_refused_as_rollback() {
+    let env = TestEnv::new();
+    if !env.init_vault() {
+        return;
+    }
+
+    env.dl()
+        .args(["set", "FOO", "old-value"])
+        .assert()
+        .success();
+
+    // Snapshot a legitimate (MAC-valid) older vault state...
+    let vault = env.lock_path("vault.toml");
+    let secrets = env.lock_path("secrets.lock");
+    let old_vault = fs::read(&vault).expect("read vault.toml");
+    let old_secrets = fs::read(&secrets).expect("read secrets.lock");
+
+    env.dl()
+        .args(["set", "FOO", "new-value"])
+        .assert()
+        .success();
+
+    // ...then restore it wholesale, as a rollback attacker would.
+    fs::write(&vault, &old_vault).expect("restore vault.toml");
+    fs::write(&secrets, &old_secrets).expect("restore secrets.lock");
+
+    // M3: the per-user epoch anchor has already seen the newer epoch.
+    env.dl()
+        .args(["get", "FOO"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("old-value").not())
+        .stderr(predicate::str::contains("rollback"));
+
+    // The user (not a repo-writing attacker) can accept it explicitly.
+    env.dl()
+        .env("DOTLOCK_ALLOW_VAULT_ROLLBACK", "1")
+        .args(["get", "FOO"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("old-value"));
+}
+
+#[test]
 fn tampered_secrets_file_is_refused() {
     let env = TestEnv::new();
     if !env.init_vault() {

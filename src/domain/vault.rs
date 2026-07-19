@@ -114,9 +114,143 @@ pub struct VaultKeyMetadata {
     pub secrets_hash_b64: String,
     #[serde(default)]
     pub secrets_hash_sha256_b64: String,
+
+    /// Monotonic write counter (M3): bumped by every sealed metadata write.
+    /// Covered by `metadata_mac_b64`; unlock refuses to move backward past the
+    /// newest epoch persisted in the per-user anchor outside the repo.
+    #[serde(default)]
+    pub vault_epoch: u64,
+    /// HMAC-SHA256 over [`VaultKeyMetadata::canonical_mac_input`] under a
+    /// subkey derived from the project key (M2). Empty on pre-v7 vaults —
+    /// tolerated on unlock (legacy) and set on the first full-access write. A
+    /// PRESENT-but-wrong MAC hard-fails with `MetadataTampered`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub metadata_mac_b64: String,
+}
+
+fn push_part(buf: &mut Vec<u8>, part: &[u8]) {
+    buf.extend_from_slice(&(part.len() as u64).to_le_bytes());
+    buf.extend_from_slice(part);
+}
+
+fn push_str(buf: &mut Vec<u8>, value: &str) {
+    push_part(buf, value.as_bytes());
+}
+
+fn push_u64(buf: &mut Vec<u8>, value: u64) {
+    push_str(buf, &value.to_string());
+}
+
+fn push_bool(buf: &mut Vec<u8>, value: bool) {
+    push_str(buf, if value { "1" } else { "0" });
+}
+
+fn push_opt_u64(buf: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            push_str(buf, "1");
+            push_u64(buf, value);
+        }
+        None => push_str(buf, "0"),
+    }
+}
+
+fn push_opt_str(buf: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            push_str(buf, "1");
+            push_str(buf, value);
+        }
+        None => push_str(buf, "0"),
+    }
+}
+
+fn push_sorted_map(buf: &mut Vec<u8>, map: &HashMap<String, String>) {
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+    push_u64(buf, keys.len() as u64);
+    for key in keys {
+        push_str(buf, key);
+        push_str(buf, &map[key]);
+    }
 }
 
 impl VaultKeyMetadata {
+    /// Canonical byte encoding of every security-relevant metadata field (M2)
+    /// — everything persisted in `vault.toml` EXCEPT `metadata_mac_b64`
+    /// itself. Length-prefixed (like `recipient_grant_payload`) so no field
+    /// combination is ambiguous; maps are emitted sorted by key so the
+    /// encoding is independent of `HashMap` iteration order. The field order
+    /// below is part of the on-disk format and MUST stay stable:
+    ///
+    /// domain, version, project_uuid, project, environment, kdf, salt_b64,
+    /// memory_kib, iterations, parallelism, kek_version,
+    /// kek_writes_since_rotate, vault_epoch, wrapped_dek_nonce_b64,
+    /// wrapped_dek_b64, wrapped_sdks_under_dek (count + sorted pairs),
+    /// access_mode, recipients (count + each: id, label, alg, fingerprint,
+    /// public_key_b64, wrapped_dek_b64, wrapped_sdks, full_access,
+    /// grant_signature_b64, grant_signer_fingerprint), authorized_signers
+    /// (count + each: fingerprint, public_key_b64, label), config (5 fields),
+    /// secrets_hash_nonce_b64, secrets_hash_b64, secrets_hash_sha256_b64.
+    pub fn canonical_mac_input(&self) -> Vec<u8> {
+        const DOMAIN: &[u8] = b"dotlock/metadata-mac/v1";
+        let mut buf = Vec::new();
+        push_part(&mut buf, DOMAIN);
+        push_u64(&mut buf, u64::from(self.version));
+        push_str(&mut buf, &self.project_uuid);
+        push_str(&mut buf, &self.project);
+        push_str(&mut buf, &self.environment);
+        push_str(&mut buf, &self.kdf);
+        push_str(&mut buf, &self.salt_b64);
+        push_u64(&mut buf, u64::from(self.memory_kib));
+        push_u64(&mut buf, u64::from(self.iterations));
+        push_u64(&mut buf, u64::from(self.parallelism));
+        push_u64(&mut buf, u64::from(self.kek_version));
+        push_u64(&mut buf, u64::from(self.kek_writes_since_rotate));
+        push_u64(&mut buf, self.vault_epoch);
+        push_str(&mut buf, &self.wrapped_dek_nonce_b64);
+        push_str(&mut buf, &self.wrapped_dek_b64);
+        push_sorted_map(&mut buf, &self.wrapped_sdks_under_dek);
+        push_str(
+            &mut buf,
+            match self.access_mode {
+                AccessMode::MasterPassword => "master_password",
+                AccessMode::Shared => "shared",
+            },
+        );
+        push_u64(&mut buf, self.recipients.len() as u64);
+        for recipient in &self.recipients {
+            push_str(&mut buf, &recipient.id);
+            push_str(&mut buf, &recipient.label);
+            push_str(&mut buf, &recipient.alg);
+            push_str(&mut buf, &recipient.public_key_fingerprint);
+            push_str(&mut buf, &recipient.public_key_b64);
+            push_str(&mut buf, &recipient.wrapped_dek_b64);
+            push_sorted_map(&mut buf, &recipient.wrapped_sdks);
+            push_bool(&mut buf, recipient.full_access);
+            push_str(&mut buf, &recipient.grant_signature_b64);
+            push_str(&mut buf, &recipient.grant_signer_fingerprint);
+        }
+        push_u64(&mut buf, self.authorized_signers.len() as u64);
+        for signer in &self.authorized_signers {
+            push_str(&mut buf, &signer.fingerprint);
+            push_str(&mut buf, &signer.public_key_b64);
+            push_str(&mut buf, &signer.label);
+        }
+        push_bool(&mut buf, self.config.auto_fetch_on_run);
+        push_opt_u64(&mut buf, self.config.auto_fetch_timeout_secs);
+        push_opt_str(&mut buf, self.config.auto_fetch_remote.as_deref());
+        push_opt_u64(
+            &mut buf,
+            self.config.auto_ratchet_after_writes.map(u64::from),
+        );
+        push_opt_u64(&mut buf, self.config.dynamic_resolve_timeout_secs);
+        push_str(&mut buf, &self.secrets_hash_nonce_b64);
+        push_str(&mut buf, &self.secrets_hash_b64);
+        push_str(&mut buf, &self.secrets_hash_sha256_b64);
+        buf
+    }
+
     /// Pure business rule: on a shared vault, a limited recipient (one with
     /// no `wrapped_dek_b64`, i.e. no project key) must never write. Callers
     /// resolve the local identity's fingerprint; this decides.
@@ -234,6 +368,104 @@ secret-id = "wrapped-sdk-b64"
             metadata.wrapped_sdks_under_dek
         );
         assert_eq!(reparsed.version, metadata.version);
+    }
+
+    /// M2/M3 compatibility proof: a pre-v7 vault.toml (no `vault_epoch`, no
+    /// `metadata_mac_b64`) parses with safe defaults, still round-trips, and
+    /// the empty MAC is never written to disk — so an old vault keeps
+    /// unlocking (legacy) and only gains the new fields when a full-access
+    /// write seals it.
+    #[test]
+    fn pre_m2_m3_vault_fixture_round_trips_with_default_epoch_and_no_mac() {
+        let pre_m2_m3_vault_toml = r#"
+version = 6
+project_uuid = "project"
+project = "dotlock"
+environment = "dev"
+kdf = "argon2id"
+salt_b64 = "salt"
+memory_kib = 1
+iterations = 1
+parallelism = 1
+kek_version = 2
+kek_writes_since_rotate = 4
+wrapped_dek_nonce_b64 = "nonce"
+wrapped_dek_b64 = "wrapped"
+secrets_hash_nonce_b64 = "hash_nonce"
+secrets_hash_b64 = "hash"
+secrets_hash_sha256_b64 = "hash_plain"
+
+[wrapped_sdks_under_kek]
+secret-id = "wrapped-sdk-b64"
+"#;
+        let metadata =
+            toml::from_str::<VaultKeyMetadata>(pre_m2_m3_vault_toml).expect("pre-M2/M3 vault");
+        assert_eq!(metadata.vault_epoch, 0);
+        assert!(metadata.metadata_mac_b64.is_empty());
+
+        let serialized = toml::to_string_pretty(&metadata).expect("serialize");
+        assert!(
+            !serialized.contains("metadata_mac_b64"),
+            "an empty MAC must never be written:\n{serialized}"
+        );
+
+        let reparsed = toml::from_str::<VaultKeyMetadata>(&serialized).expect("reparse");
+        assert_eq!(reparsed.version, metadata.version);
+        assert_eq!(reparsed.kek_version, metadata.kek_version);
+        assert_eq!(reparsed.vault_epoch, 0);
+        assert!(reparsed.metadata_mac_b64.is_empty());
+        assert_eq!(
+            reparsed.wrapped_sdks_under_dek,
+            metadata.wrapped_sdks_under_dek
+        );
+    }
+
+    /// The canonical MAC input must change whenever a covered field changes
+    /// (otherwise the MAC would not detect that tampering).
+    #[test]
+    fn canonical_mac_input_covers_security_relevant_fields() {
+        let base = toml::from_str::<VaultKeyMetadata>(
+            r#"
+version = 7
+project_uuid = "project"
+project = "dotlock"
+environment = "dev"
+kdf = "argon2id"
+salt_b64 = "salt"
+memory_kib = 1
+iterations = 1
+parallelism = 1
+kek_version = 1
+wrapped_dek_nonce_b64 = "nonce"
+wrapped_dek_b64 = "wrapped"
+secrets_hash_nonce_b64 = "hash_nonce"
+secrets_hash_b64 = "hash"
+secrets_hash_sha256_b64 = "hash_plain"
+"#,
+        )
+        .expect("metadata");
+        let reference = base.canonical_mac_input();
+
+        let mut changed = base.clone();
+        changed.access_mode = super::AccessMode::Shared;
+        assert_ne!(changed.canonical_mac_input(), reference);
+
+        let mut changed = base.clone();
+        changed.kek_version = 9;
+        assert_ne!(changed.canonical_mac_input(), reference);
+
+        let mut changed = base.clone();
+        changed.vault_epoch = 9;
+        assert_ne!(changed.canonical_mac_input(), reference);
+
+        let mut changed = base.clone();
+        changed.secrets_hash_sha256_b64 = "forged".to_string();
+        assert_ne!(changed.canonical_mac_input(), reference);
+
+        // The MAC field itself is NOT covered (it cannot authenticate itself).
+        let mut changed = base.clone();
+        changed.metadata_mac_b64 = "whatever".to_string();
+        assert_eq!(changed.canonical_mac_input(), reference);
     }
 
     #[test]

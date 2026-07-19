@@ -6,6 +6,7 @@ use crate::{
     crypto::{
         AccessMode, AuthorizedSigner, VaultKeyMetadata, VaultRecipient,
         dek::generate_dek,
+        integrity::seal_vault_metadata,
         share::{
             RECIPIENT_ALG, encode_public_key_b64, fingerprint_public_key, sign_recipient_grant,
             verify_recipient_grant, wrap_dek_for_public_key, wrap_dek_for_public_key_b64,
@@ -17,11 +18,36 @@ use crate::{
         identity::LocalIdentity,
         vault_file::{
             RatchetSummary, load_vault_metadata, record_vault_write, rotate_project_key_wrapping,
-            save_vault_metadata,
         },
         vault_txn::{VaultPairWrite, commit_vault_pair},
     },
 };
+
+/// Metadata-only write funnel for shared-access mutations: records the write,
+/// reseals the metadata MAC/epoch under `dek` (M2+M3), and commits through
+/// the same transactional path as every other vault mutation.
+fn seal_and_commit_metadata(
+    vault_path: &str,
+    metadata: &mut VaultKeyMetadata,
+    dek: &ProjectKey,
+) -> DotLockResult<()> {
+    record_vault_write(metadata);
+    seal_vault_metadata(metadata, dek)?;
+    let vault = Path::new(vault_path);
+    let secrets = vault
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.join("secrets.lock"))
+        .unwrap_or_else(|| std::path::PathBuf::from("secrets.lock"));
+    commit_vault_pair(
+        vault,
+        &secrets,
+        VaultPairWrite {
+            metadata,
+            secrets_lock_bytes: None,
+        },
+    )
+}
 
 /// Canonical payload signed by an authorized signer to authorize a recipient
 /// grant (H3): binds the recipient's identity to this project and to the
@@ -130,14 +156,17 @@ pub fn bless_recipient_grants(
     Ok(blessed)
 }
 
-pub fn enable_shared_access(vault_path: &str) -> DotLockResult<bool> {
-    let mut metadata = load_vault_metadata(vault_path)?;
+/// Flips the vault into shared mode. `access_mode` is covered by the metadata
+/// MAC (M2), so this now requires a proven project key: callers must unlock
+/// with full access first.
+pub fn enable_shared_access(
+    vault_path: &str,
+    metadata: &mut VaultKeyMetadata,
+    dek: &ProjectKey,
+) -> DotLockResult<bool> {
     let changed = metadata.access_mode != AccessMode::Shared;
     metadata.access_mode = AccessMode::Shared;
-    if changed {
-        record_vault_write(&mut metadata);
-    }
-    save_vault_metadata(vault_path, &metadata)?;
+    seal_and_commit_metadata(vault_path, metadata, dek)?;
     Ok(changed)
 }
 
@@ -228,8 +257,7 @@ pub fn grant_recipient_with_secret_ids(
         if let Some(signer) = signer {
             bless_recipient_grants(metadata, signer)?;
         }
-        record_vault_write(metadata);
-        save_vault_metadata(vault_path, metadata)?;
+        seal_and_commit_metadata(vault_path, metadata, dek)?;
         return Ok(recipient);
     }
 
@@ -249,8 +277,7 @@ pub fn grant_recipient_with_secret_ids(
     if let Some(signer) = signer {
         bless_recipient_grants(metadata, signer)?;
     }
-    record_vault_write(metadata);
-    save_vault_metadata(vault_path, metadata)?;
+    seal_and_commit_metadata(vault_path, metadata, dek)?;
 
     Ok(recipient)
 }
@@ -335,6 +362,9 @@ pub fn revoke_recipient_and_rotate(
     // same metadata object.
     let summary = rotate_project_key_wrapping(metadata, current_dek, &new_dek)?;
     update_master_password_metadata(metadata, &new_dek, passphrase)?;
+    // Reseal under the NEW project key so the MAC and the bumped epoch land
+    // in the same transactional commit as the rewrap (M2+M3).
+    seal_vault_metadata(metadata, &new_dek)?;
 
     commit_vault_pair(
         Path::new(vault_path),
@@ -405,8 +435,7 @@ pub fn add_recipient_secret_ids(
         added += 1;
     }
     recipient.full_access = false;
-    record_vault_write(metadata);
-    save_vault_metadata(vault_path, metadata)?;
+    seal_and_commit_metadata(vault_path, metadata, dek)?;
     Ok(added)
 }
 
@@ -466,6 +495,8 @@ mod tests {
             secrets_hash_nonce_b64: "hash_nonce".to_string(),
             secrets_hash_b64: "hash".to_string(),
             secrets_hash_sha256_b64: "hash_plain".to_string(),
+            vault_epoch: 0,
+            metadata_mac_b64: String::new(),
         }
     }
 
@@ -648,8 +679,14 @@ mod tests {
                 .decode(&metadata.wrapped_dek_b64)
                 .expect("wrapped dek b64"),
         };
-        let unlocked_dek = unwrap_dek(&kek, &wrapped, &metadata.project, &metadata.environment)
-            .expect("owner password unlock");
+        let unlocked_dek = unwrap_dek(
+            &kek,
+            &wrapped,
+            &metadata.project,
+            &metadata.environment,
+            metadata.kek_version,
+        )
+        .expect("owner password unlock");
         assert_eq!(unlocked_dek.as_bytes(), outcome.new_dek.as_bytes());
 
         // (5) integrity verifies under the new DEK and rejects the old one.

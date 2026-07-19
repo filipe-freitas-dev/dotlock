@@ -10,7 +10,7 @@ use crate::{
         AccessMode,
         integrity::{
             build_encrypted_hash_fields, build_encrypted_hash_fields_from_bytes, bytes_sha256_b64,
-            file_sha256_b64,
+            file_sha256_b64, seal_vault_metadata,
         },
         sdk,
         secret_cipher::{
@@ -136,6 +136,7 @@ fn commit_secrets_and_metadata(
     metadata.secrets_hash_b64 = hash_b64;
     metadata.secrets_hash_sha256_b64 = bytes_sha256_b64(bytes);
     record_vault_write(metadata);
+    seal_vault_metadata(metadata, dek)?;
     commit_vault_pair(
         Path::new(vault_path),
         secrets_path,
@@ -157,6 +158,7 @@ pub fn refresh_vault_hash(
     metadata.secrets_hash_b64 = hash_b64;
     metadata.secrets_hash_sha256_b64 = file_sha256_b64(secrets_path)?;
     record_vault_write(&mut metadata);
+    seal_vault_metadata(&mut metadata, dek)?;
     commit_vault_pair(
         Path::new(vault_path),
         secrets_path,
@@ -757,6 +759,8 @@ mod tests {
             secrets_hash_nonce_b64: "hash_nonce".to_string(),
             secrets_hash_b64: "hash".to_string(),
             secrets_hash_sha256_b64: "hash_plain".to_string(),
+            vault_epoch: 0,
+            metadata_mac_b64: String::new(),
         }
     }
 
@@ -781,7 +785,8 @@ mod tests {
         let file = load_secrets_file(&secrets_path).expect("load secrets");
         let metadata = load_vault_metadata(&vault_path).expect("load metadata");
 
-        assert_eq!(metadata.version, 5);
+        // Sealed writes upgrade the vault format to v7 (M2/M3).
+        assert_eq!(metadata.version, 7);
         assert_eq!(record.alg, None);
         assert_eq!(file.secrets[0].alg, None);
         let serialized = fs::read_to_string(&secrets_path).expect("read secrets");

@@ -25,6 +25,14 @@ pub enum DotLockError {
     #[error("`.lock/secrets.lock` was modified outside of DotLock")]
     TamperedSecretsFile,
 
+    #[error("`.lock/vault.toml` metadata failed authentication (modified outside of DotLock)")]
+    MetadataTampered,
+
+    #[error(
+        "vault epoch {found} is older than the newest state seen on this machine ({last_seen}); refusing a potential rollback"
+    )]
+    VaultRolledBack { found: u64, last_seen: u64 },
+
     #[error("secret `{id}` has no key wrapping in `vault.toml` (`wrapped_sdks_under_kek`)")]
     MissingSecretKeyWrapping { id: String },
 
@@ -97,6 +105,12 @@ impl DotLockError {
                 Some("delete the `.lock/` directory and run `dl init` to create a fresh vault")
             }
             DotLockError::SecretNotFound { .. } => Some("list available secrets with `dl list`"),
+            DotLockError::MetadataTampered => Some(
+                "someone modified `.lock/vault.toml` outside DotLock; restore `.lock/` from a trusted backup or git revision",
+            ),
+            DotLockError::VaultRolledBack { .. } => Some(
+                "the repo holds an older vault state than this machine has already seen; if this checkout of an older revision is intentional, re-run with DOTLOCK_ALLOW_VAULT_ROLLBACK=1",
+            ),
             DotLockError::TamperedSecretsFile => Some(
                 "someone modified `.lock/secrets.lock` outside DotLock; restore from a trusted backup or start over with `dl init`",
             ),

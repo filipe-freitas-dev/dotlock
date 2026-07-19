@@ -7,7 +7,7 @@ use crate::{
     crypto::{
         AccessMode,
         dek::{WrappedDek, unwrap_dek},
-        integrity::{verify_public_secrets_hash, verify_secrets_integrity},
+        integrity::{verify_metadata_mac, verify_public_secrets_hash, verify_secrets_integrity},
         kdf::{KdfParams, derive_master_key},
         kek::derive_kek,
         prompt_unlock_password,
@@ -16,6 +16,7 @@ use crate::{
     domain::{error::DotLockError, keys::ProjectKey, model::DotLockResult},
     storage::{
         cache::{invalidate_cache, read_cached_dek_for, write_cached_dek_for},
+        epoch_anchor,
         identity::{load_local_identity, load_local_identity_metadata},
         pending_merge::ensure_no_pending_merge,
         project::SECRETS_FILE,
@@ -87,9 +88,13 @@ pub fn prepare_vault_access(path: &str) -> DotLockResult<crate::crypto::VaultKey
 
 /// Unlock used exclusively by `dl reconcile`: obtains the real project key
 /// WITHOUT the integrity check (after a merge the stored hash is stale by
-/// construction). The caller must verify the pending-merge marker against the
-/// files first. Key correctness is still guaranteed: both the identity unwrap
-/// and the password unwrap fail on wrong credentials.
+/// construction) and WITHOUT the metadata-MAC/epoch checks (merged metadata
+/// was assembled by the merge driver, not by a key holder — the pending-merge
+/// marker plus per-record AEAD checks gate it instead, and the reconcile
+/// rewrite reseals the MAC and bumps the epoch). The caller must verify the
+/// pending-merge marker against the files first. Key correctness is still
+/// guaranteed: both the identity unwrap and the password unwrap fail on wrong
+/// credentials.
 pub fn unlock_full_for_reconcile(path: &str) -> DotLockResult<ProjectKey> {
     recover_pending(
         std::path::Path::new(path),
@@ -162,18 +167,70 @@ fn unwrap_dek_with_passphrase(
         ciphertext: wrapped_dek,
     };
 
-    let dek = unwrap_dek(&kek, &wrapped, &metadata.project, &metadata.environment)
-        .map_err(|_| DotLockError::InvalidMasterPassword)?;
+    let dek = unwrap_dek(
+        &kek,
+        &wrapped,
+        &metadata.project,
+        &metadata.environment,
+        metadata.kek_version,
+    )
+    .map_err(|_| DotLockError::InvalidMasterPassword)?;
 
     kek.zeroize();
     Ok(dek)
+}
+
+/// M3 rollback gate: refuses a vault whose monotonic epoch is older than the
+/// newest one this machine has already seen (anchor kept OUTSIDE the repo),
+/// then advances the anchor. `DOTLOCK_ALLOW_VAULT_ROLLBACK=1` lets the USER
+/// explicitly accept a checkout of an older revision; an attacker with mere
+/// repo write access cannot set the victim's environment. Runs even for
+/// legacy vaults without a MAC, so stripping the MAC/epoch fields cannot
+/// bypass it once a newer epoch was anchored.
+fn enforce_epoch_anchor(metadata: &crate::crypto::VaultKeyMetadata) -> DotLockResult<()> {
+    if let Some(last_seen) = epoch_anchor::last_seen_epoch(&metadata.project_uuid)
+        && metadata.vault_epoch < last_seen
+    {
+        let user_accepted = std::env::var("DOTLOCK_ALLOW_VAULT_ROLLBACK")
+            .map(|value| value == "1")
+            .unwrap_or(false);
+        if !user_accepted {
+            return Err(DotLockError::VaultRolledBack {
+                found: metadata.vault_epoch,
+                last_seen,
+            });
+        }
+        eprintln!(
+            "{} accepting vault epoch {} older than last seen {} (DOTLOCK_ALLOW_VAULT_ROLLBACK=1)",
+            "warn:".yellow().bold(),
+            metadata.vault_epoch,
+            last_seen
+        );
+        return Ok(());
+    }
+    // Best-effort: the anchor lives in per-user state; its absence (e.g. no
+    // HOME) must not block an otherwise valid unlock.
+    let _ = epoch_anchor::advance_epoch(&metadata.project_uuid, metadata.vault_epoch);
+    Ok(())
+}
+
+/// Full-access trust chain (M2+M3), in order: authenticate the metadata MAC
+/// (covers every scalar field, the recipient set and the epoch), enforce the
+/// rollback anchor, then verify the secrets integrity hash.
+fn verify_metadata_and_secrets(
+    metadata: &crate::crypto::VaultKeyMetadata,
+    dek: &ProjectKey,
+) -> DotLockResult<()> {
+    verify_metadata_mac(metadata, dek)?;
+    enforce_epoch_anchor(metadata)?;
+    verify_secrets_integrity(SECRETS_FILE, metadata, dek)
 }
 
 fn unlock_vault_with_dek(
     metadata: &crate::crypto::VaultKeyMetadata,
     dek: ProjectKey,
 ) -> DotLockResult<ProjectKey> {
-    verify_secrets_integrity(SECRETS_FILE, metadata, &dek)?;
+    verify_metadata_and_secrets(metadata, &dek)?;
     write_cached_dek_for(metadata, &dek)?;
     Ok(dek)
 }
@@ -266,15 +323,21 @@ pub fn unlock_vault_prepared(
     metadata: &crate::crypto::VaultKeyMetadata,
 ) -> DotLockResult<UnlockAccess> {
     if let Some(dek) = read_cached_dek_for(metadata) {
-        match verify_secrets_integrity(SECRETS_FILE, metadata, &dek) {
+        match verify_metadata_and_secrets(metadata, &dek) {
             Ok(()) => {
                 write_cached_dek_for(metadata, &dek)?;
                 record_unlock_best_effort("cache", metadata);
                 return Ok(UnlockAccess::Full(dek));
             }
-            Err(DotLockError::TamperedSecretsFile) => {
+            Err(err @ (DotLockError::TamperedSecretsFile | DotLockError::MetadataTampered)) => {
                 let _ = invalidate_cache();
-                return Err(DotLockError::TamperedSecretsFile);
+                return Err(err);
+            }
+            // A rollback refusal is not a key problem: the cached project key
+            // is still correct, and the user may legitimately accept the
+            // older state (DOTLOCK_ALLOW_VAULT_ROLLBACK=1) on the next run.
+            Err(err @ DotLockError::VaultRolledBack { .. }) => {
+                return Err(err);
             }
             Err(_) => {
                 let _ = invalidate_cache();
@@ -285,8 +348,12 @@ pub fn unlock_vault_prepared(
     if metadata.access_mode == AccessMode::Shared {
         match try_unlock_vault_with_local_identity(metadata) {
             Ok(access) => return Ok(access),
-            Err(DotLockError::TamperedSecretsFile) => {
-                return Err(DotLockError::TamperedSecretsFile);
+            Err(
+                err @ (DotLockError::TamperedSecretsFile
+                | DotLockError::MetadataTampered
+                | DotLockError::VaultRolledBack { .. }),
+            ) => {
+                return Err(err);
             }
             Err(_) => {}
         }

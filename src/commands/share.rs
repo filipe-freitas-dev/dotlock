@@ -21,8 +21,15 @@ use crate::{
 pub fn run(command: ShareCommand) -> DotLockResult<()> {
     match command {
         ShareCommand::Enable => {
-            ensure_project_initialized()?;
-            let changed = enable_shared_access(VAULT_FILE)?;
+            // `access_mode` is covered by the metadata MAC (M2): flipping it
+            // now requires proving full access so the vault can be resealed.
+            let ctx = VaultContext::unlock()?;
+            let VaultContext {
+                mut metadata,
+                access,
+            } = ctx;
+            let dek = access.require_full()?;
+            let changed = enable_shared_access(VAULT_FILE, &mut metadata, &dek)?;
             if changed {
                 println!("{} shared access enabled", "ok:".green().bold());
             } else {

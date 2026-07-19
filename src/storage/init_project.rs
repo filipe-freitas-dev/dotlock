@@ -3,7 +3,7 @@ use colored::Colorize;
 use crate::{
     crypto::{
         initialize_vault_keys,
-        integrity::{build_encrypted_hash_fields, file_sha256_b64},
+        integrity::{build_encrypted_hash_fields, file_sha256_b64, seal_vault_metadata},
     },
     domain::model::DotLockResult,
     git::install::install_merge_driver_if_in_git_repo,
@@ -30,6 +30,8 @@ pub fn init_project() -> DotLockResult<()> {
     vault.metadata.secrets_hash_nonce_b64 = nonce_b64;
     vault.metadata.secrets_hash_b64 = hash_b64;
     vault.metadata.secrets_hash_sha256_b64 = file_sha256_b64(SECRETS_FILE)?;
+    // Fresh vaults are born sealed: v7 format, epoch 1, metadata MAC set.
+    seal_vault_metadata(&mut vault.metadata, &vault.dek)?;
 
     save_vault_metadata(VAULT_FILE, &vault.metadata)?;
 

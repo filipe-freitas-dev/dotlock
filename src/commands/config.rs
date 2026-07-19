@@ -2,6 +2,7 @@ use colored::Colorize;
 
 use crate::{
     cli::args::ConfigCommand,
+    commands::context::VaultContext,
     domain::model::DotLockResult,
     storage::{
         config::{config_lines, set_config_value, unset_config_value},
@@ -21,12 +22,32 @@ pub fn run(command: ConfigCommand) -> DotLockResult<()> {
             Ok(())
         }
         ConfigCommand::Set { key, value } => {
-            set_config_value(std::path::Path::new(VAULT_FILE), &key, &value)?;
+            // Config fields are covered by the metadata MAC (M2), so writing
+            // them requires full access and reseals the vault.
+            let ctx = VaultContext::unlock()?;
+            let VaultContext {
+                mut metadata,
+                access,
+            } = ctx;
+            let dek = access.require_full()?;
+            set_config_value(
+                std::path::Path::new(VAULT_FILE),
+                &mut metadata,
+                &key,
+                &value,
+                &dek,
+            )?;
             println!("{} config {} updated", "ok:".green().bold(), key.bold());
             Ok(())
         }
         ConfigCommand::Unset { key } => {
-            unset_config_value(std::path::Path::new(VAULT_FILE), &key)?;
+            let ctx = VaultContext::unlock()?;
+            let VaultContext {
+                mut metadata,
+                access,
+            } = ctx;
+            let dek = access.require_full()?;
+            unset_config_value(std::path::Path::new(VAULT_FILE), &mut metadata, &key, &dek)?;
             println!("{} config {} reset", "ok:".green().bold(), key.bold());
             Ok(())
         }

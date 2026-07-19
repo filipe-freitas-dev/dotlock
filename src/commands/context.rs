@@ -3,7 +3,10 @@ use colored::Colorize;
 use crate::{
     audit::record_ratchet,
     cli::present::print_ratchet_summary,
-    crypto::{VaultKeyMetadata, dek::generate_dek, update_master_password_metadata},
+    crypto::{
+        VaultKeyMetadata, dek::generate_dek, integrity::seal_vault_metadata,
+        update_master_password_metadata,
+    },
     domain::{keys::ProjectKey, model::DotLockResult},
     storage::{
         cache::invalidate_cache,
@@ -91,6 +94,10 @@ pub fn rotate_project_key(
     // (secrets.lock is unchanged by rotation). `dl rotate` rotates the DEK.
     let summary = rotate_project_key_wrapping(metadata, current_dek, &new_dek)?;
     update_master_password_metadata(metadata, &new_dek, passphrase)?;
+    // M2+M3: the rotation bumps `kek_version`; sealing bumps the monotonic
+    // epoch and recomputes the metadata MAC under the NEW project key, all
+    // inside the same transactional commit.
+    seal_vault_metadata(metadata, &new_dek)?;
     commit_vault_pair(
         std::path::Path::new(VAULT_FILE),
         std::path::Path::new(SECRETS_FILE),

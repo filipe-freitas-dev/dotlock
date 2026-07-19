@@ -223,6 +223,7 @@ fn merge_vault_metadata(
     base: &Path,
     lock_dir: &Path,
 ) -> DotLockResult<()> {
+    let ours_original = secure_fs::read_to_string(ours)?;
     let ours_metadata = load_vault_metadata(ours)?;
     let theirs_metadata = load_vault_metadata(theirs)?;
     let base_metadata = load_vault_metadata(base).ok();
@@ -254,8 +255,18 @@ fn merge_vault_metadata(
         }
     }
 
-    let content =
+    let mut content =
         toml::to_string_pretty(&merged).map_err(|err| DotLockError::Crypto(err.to_string()))?;
+    if content != ours_original {
+        // The merge driver holds no key, so changed metadata cannot keep ours'
+        // MAC — it would fail authentication as if tampered. Clearing it marks
+        // the merged vault for resealing on the next full-access write (same
+        // policy as a pre-v7 vault); the epoch — max of both sides — and the
+        // H3 grant-signature checks above still gate what got absorbed.
+        merged.metadata_mac_b64 = String::new();
+        content =
+            toml::to_string_pretty(&merged).map_err(|err| DotLockError::Crypto(err.to_string()))?;
+    }
     secure_fs::write_string_atomic(ours, &content, 0o700, 0o600)?;
 
     // Record the vault hash in the marker. When the secrets merge did not run
@@ -337,6 +348,12 @@ pub fn merge_metadata(
     }
 
     ours.version = ours.version.max(theirs.version).max(2);
+    // M3: the merged vault must never look older than either side to a
+    // machine that already anchored the newer epoch. The MAC stays ours' (it
+    // is stale whenever the merge changed anything); the merge driver forces
+    // a pending-merge marker for any content change so `dl reconcile` reseals
+    // before the next regular unlock.
+    ours.vault_epoch = ours.vault_epoch.max(theirs.vault_epoch);
     let mut report = VaultMergeReport::default();
     merge_authorized_signers(&mut ours, &theirs, base.as_ref(), &mut report);
     merge_recipients(&mut ours, theirs, base, &mut report);
@@ -630,6 +647,8 @@ mod driver_tests {
             secrets_hash_nonce_b64: "hash_nonce".to_string(),
             secrets_hash_b64: "hash".to_string(),
             secrets_hash_sha256_b64: "hash_plain".to_string(),
+            vault_epoch: 0,
+            metadata_mac_b64: String::new(),
         }
     }
 

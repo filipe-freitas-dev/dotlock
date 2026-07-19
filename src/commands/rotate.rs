@@ -3,11 +3,14 @@ use colored::Colorize;
 use crate::{
     cli::{args::RotateCommand, present::print_ratchet_summary},
     commands::context::{VaultContext, rotate_project_key},
-    crypto::{ask_master_password, update_master_password_metadata},
+    crypto::{
+        ask_master_password, integrity::seal_vault_metadata, update_master_password_metadata,
+    },
     domain::model::DotLockResult,
     storage::{
-        project::VAULT_FILE,
-        vault_file::{record_vault_write, save_vault_metadata},
+        project::{SECRETS_FILE, VAULT_FILE},
+        vault_file::record_vault_write,
+        vault_txn::{VaultPairWrite, commit_vault_pair},
     },
 };
 
@@ -23,7 +26,15 @@ pub fn run(command: RotateCommand) -> DotLockResult<()> {
             let passphrase = ask_master_password()?;
             update_master_password_metadata(&mut metadata, &dek, &passphrase)?;
             record_vault_write(&mut metadata);
-            save_vault_metadata(VAULT_FILE, &metadata)?;
+            seal_vault_metadata(&mut metadata, &dek)?;
+            commit_vault_pair(
+                std::path::Path::new(VAULT_FILE),
+                std::path::Path::new(SECRETS_FILE),
+                VaultPairWrite {
+                    metadata: &metadata,
+                    secrets_lock_bytes: None,
+                },
+            )?;
             println!("{} master password rotated", "ok:".green().bold());
             Ok(())
         }

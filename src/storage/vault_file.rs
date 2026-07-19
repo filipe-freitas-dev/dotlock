@@ -196,6 +196,8 @@ mod tests {
             secrets_hash_nonce_b64: general_purpose::STANDARD.encode(encrypted.nonce),
             secrets_hash_b64: general_purpose::STANDARD.encode(encrypted.ciphertext),
             secrets_hash_sha256_b64: "hash_plain".to_string(),
+            vault_epoch: 0,
+            metadata_mac_b64: String::new(),
         }
     }
 

@@ -54,7 +54,13 @@ pub fn update_master_password_metadata(
 
     master_key.zeroize();
 
-    let wrapped = wrap_dek(&kek, dek, &metadata.project, &metadata.environment)?;
+    let wrapped = wrap_dek(
+        &kek,
+        dek,
+        &metadata.project,
+        &metadata.environment,
+        metadata.kek_version,
+    )?;
 
     kek.zeroize();
 
@@ -172,6 +178,9 @@ pub fn initialize_vault_keys(project: &str, environment: &str) -> DotLockResult<
         secrets_hash_nonce_b64: String::new(),
         secrets_hash_b64: String::new(),
         secrets_hash_sha256_b64: String::new(),
+
+        vault_epoch: 0,
+        metadata_mac_b64: String::new(),
     };
     update_master_password_metadata(&mut metadata, &dek, &passphrase)?;
 

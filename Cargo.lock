@@ -452,6 +452,7 @@ dependencies = [
  "colored",
  "getrandom 0.4.2",
  "hkdf",
+ "hmac 0.13.0",
  "inquire",
  "libc",
  "predicates",
