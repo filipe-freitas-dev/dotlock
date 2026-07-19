@@ -1,6 +1,6 @@
 [package]
 name = "dotlock-bin"
-version = "0.1.6"
+version = "1.0.0"
 edition = "2024"
 description = "Encrypted project-local environment variables manager"
 license = "MIT OR Apache-2.0"
