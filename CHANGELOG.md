@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-07-19
+
+### Added
+
+- **Non-interactive unlock for shared vaults.** The certificate (identity)
+  passphrase prompt now honors the same non-interactive sources as the master
+  password: `--password-stdin`, `--password-file`,
+  `DOTLOCK_MASTER_PASSWORD`, and the new dedicated
+  `DOTLOCK_IDENTITY_PASSPHRASE` environment variable (precedence:
+  `DOTLOCK_IDENTITY_PASSPHRASE` > `--password-stdin` > `--password-file` >
+  `DOTLOCK_MASTER_PASSWORD`). Shared-vault `dl get` and `dl run` with a
+  passphrase-protected identity now work in CI. Without a TTY and without any
+  source, commands fail with the actionable no-TTY error instead of hanging.
+- `dl cert init` and `dl cert migrate` can now create a passphrase-encrypted
+  identity non-interactively using the same sources.
+- `dl cert show` now reports whether the identity's private key is
+  passphrase-encrypted (`passphrase: yes/no`), without prompting.
+
 ## [1.0.1] - 2026-07-19
 
 ### Fixed
