@@ -81,17 +81,25 @@ pub fn run(command: CertCommand) -> DotLockResult<()> {
             rekey_current_project_recipient(new_identity)
         }
         CertCommand::Show => {
-            let identity = load_local_identity()?;
+            // Metadata only: `show` must tell the user whether the private
+            // key is passphrase-protected WITHOUT decrypting it (so it never
+            // prompts — the answer to "why am I being asked for a
+            // passphrase?" cannot itself ask for the passphrase).
+            let meta = load_local_identity_metadata()?;
             println!(
                 "{} {}",
                 "fingerprint:".cyan().bold(),
-                identity.fingerprint.bold()
+                meta.fingerprint.bold()
             );
+            println!("{} {}", "algorithm:".cyan().bold(), meta.alg.bold());
             println!(
                 "{} {}",
-                "algorithm:".cyan().bold(),
-                crate::crypto::share::identity_alg_for_private_key(&identity.private_key_pem)?
-                    .bold()
+                "passphrase:".cyan().bold(),
+                if meta.encrypted {
+                    "yes (private key is encrypted; unlocks will ask for it)".bold()
+                } else {
+                    "no (private key is stored unencrypted)".bold()
+                }
             );
             println!(
                 "{} {}",

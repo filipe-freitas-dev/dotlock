@@ -108,6 +108,16 @@ pub fn set_password_flag_source(source: Option<PasswordFlagSource>) {
     let _ = PASSWORD_FLAG_SOURCE.set(source);
 }
 
+/// Drops the memoized non-interactive password so tests that set
+/// `DOTLOCK_MASTER_PASSWORD` never leak a cached value into later tests in
+/// the same process.
+#[cfg(test)]
+pub(crate) fn clear_resolved_password_for_tests() {
+    if let Ok(mut cached) = RESOLVED_PASSWORD.lock() {
+        *cached = None;
+    }
+}
+
 fn read_password_from_stdin() -> DotLockResult<Zeroizing<String>> {
     use std::io::BufRead;
     let mut line = Zeroizing::new(String::new());
@@ -167,9 +177,24 @@ fn non_interactive_password() -> DotLockResult<Option<Zeroizing<String>>> {
     Ok(resolved)
 }
 
+/// Non-interactive source for the LOCAL IDENTITY passphrase. Only one
+/// credential is needed per unlock (identity passphrase in shared mode,
+/// master password in master-password mode), so the FG2 sources feed
+/// whichever prompt actually fires. Precedence: `DOTLOCK_IDENTITY_PASSPHRASE`
+/// (dedicated, for environments that must carry BOTH credentials at once) >
+/// the shared FG2 sources (`--password-stdin` > `--password-file` >
+/// `DOTLOCK_MASTER_PASSWORD`). The shared sources stay memoized, so
+/// `--password-stdin` still consumes only the first line of stdin, once.
+pub(crate) fn non_interactive_identity_passphrase() -> DotLockResult<Option<Zeroizing<String>>> {
+    match std::env::var("DOTLOCK_IDENTITY_PASSPHRASE") {
+        Ok(value) if !value.is_empty() => Ok(Some(Zeroizing::new(value))),
+        _ => non_interactive_password(),
+    }
+}
+
 /// Gate for the interactive prompts: without a TTY the raw `inquire` failure
 /// is replaced by an actionable error pointing at the FG2 sources.
-fn ensure_tty_for_prompt() -> DotLockResult<()> {
+pub(crate) fn ensure_tty_for_prompt() -> DotLockResult<()> {
     if std::io::stdin().is_terminal() {
         Ok(())
     } else {

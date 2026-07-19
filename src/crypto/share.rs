@@ -218,6 +218,10 @@ pub fn decrypt_private_key_pem(
 }
 
 /// Identity algorithm tag for a private key PEM (Ed25519 or legacy RSA).
+/// Production code reads the tag from `identity.toml` instead (so `dl cert
+/// show` never has to decrypt the key); tests use this to assert the on-disk
+/// key material really matches the recorded algorithm.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn identity_alg_for_private_key(private_key_pem: &str) -> DotLockResult<&'static str> {
     Ok(match parse_private_key(private_key_pem)? {
         PrivateIdentityKey::Ed25519(_) => IDENTITY_ALG_ED25519,

@@ -115,7 +115,18 @@ pub(crate) fn clear_session_signer() {
     }
 }
 
+/// Existing-passphrase entry point (every load of a passphrase-encrypted
+/// identity). The FG2 non-interactive sources satisfy this prompt too —
+/// `DOTLOCK_IDENTITY_PASSPHRASE` first, then `--password-stdin` /
+/// `--password-file` / `DOTLOCK_MASTER_PASSWORD` — so shared-vault unlocks
+/// work in CI. A wrong non-interactive passphrase still fails the PKCS#8
+/// decrypt; there is no weaker path. Only called for `encrypted = true`
+/// identities: a plain identity never reaches any passphrase prompt.
 fn prompt_identity_passphrase() -> DotLockResult<Zeroizing<String>> {
+    if let Some(passphrase) = crate::crypto::non_interactive_identity_passphrase()? {
+        return Ok(passphrase);
+    }
+    crate::crypto::ensure_tty_for_prompt()?;
     Password::new("Local identity passphrase:")
         .with_display_mode(PasswordDisplayMode::Masked)
         .with_help_message("used to decrypt your local shared-access key")
@@ -129,7 +140,15 @@ fn prompt_identity_passphrase() -> DotLockResult<Zeroizing<String>> {
         })
 }
 
+/// New-passphrase entry point (`dl cert init` / `dl cert migrate` without
+/// `--plain`). Accepts the same non-interactive sources as
+/// [`prompt_identity_passphrase`], so a passphrase-protected identity can be
+/// created in CI; otherwise a TTY is required for the confirmed prompt.
 fn prompt_new_identity_passphrase() -> DotLockResult<Zeroizing<String>> {
+    if let Some(passphrase) = crate::crypto::non_interactive_identity_passphrase()? {
+        return Ok(passphrase);
+    }
+    crate::crypto::ensure_tty_for_prompt()?;
     Password::new("Choose a passphrase for the local identity:")
         .with_display_mode(PasswordDisplayMode::Masked)
         .with_help_message("this protects your local private key on disk")
@@ -537,6 +556,148 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         unsafe {
             std::env::remove_var("DOTLOCK_IDENTITY_DIR");
+        }
+    }
+
+    /// Issue #1 regression: a PLAIN identity (`encrypted = false`) must NEVER
+    /// reach a passphrase prompt. There is no TTY and no non-interactive
+    /// source here, so any prompt attempt would fail the load — a successful
+    /// load PROVES no prompt fired.
+    #[test]
+    fn plain_identity_never_prompts_for_a_passphrase() {
+        let _guard = env_lock().lock().expect("lock");
+        let dir = temp_dir();
+        let saved_master = std::env::var("DOTLOCK_MASTER_PASSWORD").ok();
+        unsafe {
+            std::env::set_var("DOTLOCK_IDENTITY_DIR", &dir);
+            std::env::remove_var("DOTLOCK_IDENTITY_PASSPHRASE");
+            std::env::remove_var("DOTLOCK_MASTER_PASSWORD");
+        }
+        crate::crypto::clear_resolved_password_for_tests();
+        super::clear_session_signer();
+
+        let meta = initialize_local_identity_with_options(false, true).expect("init identity");
+        assert!(
+            !meta.encrypted,
+            "--plain identity must record encrypted = false"
+        );
+        super::clear_session_signer();
+
+        let loaded = load_local_identity()
+            .expect("a plain identity must load without any passphrase prompt");
+        assert_eq!(loaded.fingerprint, meta.fingerprint);
+
+        super::clear_session_signer();
+        let _ = fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("DOTLOCK_IDENTITY_DIR");
+            if let Some(value) = saved_master {
+                std::env::set_var("DOTLOCK_MASTER_PASSWORD", value);
+            }
+        }
+    }
+
+    /// Issue #2: the non-interactive sources satisfy the identity passphrase.
+    /// `DOTLOCK_IDENTITY_PASSPHRASE` (dedicated) and the shared FG2 fallback
+    /// (`DOTLOCK_MASTER_PASSWORD` here) both decrypt the identity with no TTY;
+    /// a wrong value fails the decrypt; and with no source at all the load
+    /// fails with the actionable `NoTtyForPassword` error, not a raw inquire
+    /// failure.
+    #[test]
+    fn encrypted_identity_honors_non_interactive_passphrase_sources() {
+        use crate::crypto::share::{IdentityProtection, generate_identity};
+        use crate::domain::error::DotLockError;
+
+        let _guard = env_lock().lock().expect("lock");
+        let dir = temp_dir();
+        let saved_master = std::env::var("DOTLOCK_MASTER_PASSWORD").ok();
+        unsafe {
+            std::env::set_var("DOTLOCK_IDENTITY_DIR", &dir);
+            std::env::remove_var("DOTLOCK_IDENTITY_PASSPHRASE");
+            std::env::remove_var("DOTLOCK_MASTER_PASSWORD");
+        }
+        crate::crypto::clear_resolved_password_for_tests();
+        super::clear_session_signer();
+
+        let passphrase = "Corr3ct-Horse!";
+        let generated =
+            generate_identity(IdentityProtection::Encrypted(passphrase)).expect("identity");
+        let meta = LocalIdentityMetadata {
+            fingerprint: generated.fingerprint.clone(),
+            encrypted: true,
+            alg: crate::crypto::share::IDENTITY_ALG_ED25519.to_string(),
+        };
+        let content = toml::to_string_pretty(&meta).expect("meta");
+        secure_fs::write_string_atomic(
+            &super::metadata_path().expect("meta path"),
+            &content,
+            0o700,
+            0o600,
+        )
+        .expect("write meta");
+        secure_fs::write_string_atomic(
+            &super::private_key_path().expect("private path"),
+            &generated.private_key_pem,
+            0o700,
+            0o600,
+        )
+        .expect("write private");
+        secure_fs::write_string_atomic(
+            &super::public_key_path().expect("public path"),
+            &generated.public_key_pem,
+            0o700,
+            0o644,
+        )
+        .expect("write public");
+
+        // No TTY (cargo test) + no non-interactive source: the clear,
+        // actionable error — never a raw inquire "not a TTY" failure.
+        let err = load_local_identity().expect_err("no source and no TTY must fail");
+        assert!(
+            matches!(err, DotLockError::NoTtyForPassword),
+            "expected NoTtyForPassword, got: {err:?}"
+        );
+
+        // The dedicated env var decrypts the identity non-interactively.
+        unsafe {
+            std::env::set_var("DOTLOCK_IDENTITY_PASSPHRASE", passphrase);
+        }
+        let loaded = load_local_identity().expect("env passphrase must decrypt the identity");
+        assert_eq!(loaded.fingerprint, generated.fingerprint);
+        assert!(loaded.private_key_pem.contains("BEGIN PRIVATE KEY"));
+
+        // A wrong non-interactive passphrase must FAIL the decrypt, never
+        // silently proceed (session signer cleared so the cached decrypt
+        // cannot mask the failure).
+        super::clear_session_signer();
+        unsafe {
+            std::env::set_var("DOTLOCK_IDENTITY_PASSPHRASE", "wrong-passphrase");
+        }
+        load_local_identity().expect_err("a wrong non-interactive passphrase must fail");
+
+        // The shared FG2 sources are the fallback: with no dedicated var set,
+        // DOTLOCK_MASTER_PASSWORD feeds the identity prompt (one credential
+        // per unlock).
+        super::clear_session_signer();
+        crate::crypto::clear_resolved_password_for_tests();
+        unsafe {
+            std::env::remove_var("DOTLOCK_IDENTITY_PASSPHRASE");
+            std::env::set_var("DOTLOCK_MASTER_PASSWORD", passphrase);
+        }
+        let loaded =
+            load_local_identity().expect("shared FG2 source must decrypt the identity too");
+        assert_eq!(loaded.fingerprint, generated.fingerprint);
+
+        super::clear_session_signer();
+        crate::crypto::clear_resolved_password_for_tests();
+        let _ = fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("DOTLOCK_IDENTITY_PASSPHRASE");
+            std::env::remove_var("DOTLOCK_MASTER_PASSWORD");
+            std::env::remove_var("DOTLOCK_IDENTITY_DIR");
+            if let Some(value) = saved_master {
+                std::env::set_var("DOTLOCK_MASTER_PASSWORD", value);
+            }
         }
     }
 

@@ -250,6 +250,24 @@ A minimal CI job (GitHub Actions):
 
 **Security tradeoff:** every non-interactive source feeds the exact same unlock path as the prompt (Argon2id key derivation, project-key unwrap, metadata MAC and rollback-epoch verification) — there is no weaker CI unlock. Prefer `--password-stdin` or `--password-file` over the env var. The password buffer is zeroized in memory in all cases.
 
+### Certificate (identity) passphrase in CI
+
+Shared-vault unlocks don't use the master password — they decrypt your **local identity** (see [Team Sharing](#team-sharing)), which asks for the identity passphrase when the private key is passphrase-protected. Only one credential is ever needed per unlock, so the same non-interactive sources satisfy whichever prompt fires: with a shared vault, `--password-stdin` / `--password-file` / `DOTLOCK_MASTER_PASSWORD` supply the **identity passphrase** instead.
+
+```bash
+# CI unlock of a shared vault with a passphrase-protected identity.
+printf '%s\n' "$IDENTITY_PASSPHRASE" | dl run --password-stdin -- ./deploy.sh
+```
+
+For environments that need **both** credentials in the same command (e.g. `dl share grant`, which unlocks with the master password *and* signs with your identity), the dedicated `DOTLOCK_IDENTITY_PASSPHRASE` environment variable feeds only the identity prompt and takes precedence over the shared sources for it:
+
+```bash
+DOTLOCK_IDENTITY_PASSPHRASE="$ID_PASS" \
+  dl share grant --pubkey peer.pub --label peer --password-file /run/secrets/master
+```
+
+A wrong non-interactive passphrase fails the identity decrypt exactly like a mistyped one; a **plain** identity (`dl cert init --plain`) never asks for a passphrase at all — `dl cert show` tells you which kind you have.
+
 ### Machine-readable output — `--json`
 
 The global `--json` flag switches read commands to structured JSON on stdout (human output stays the default). Exit codes are unchanged.
@@ -365,15 +383,17 @@ dl cert init --plain    # unencrypted private key (controlled automation only)
 dl cert init --force    # replace an existing identity
 ```
 
-Each developer or CI environment does this once before requesting shared access.
+Each developer or CI environment does this once before requesting shared access. The passphrase prompt accepts the [non-interactive sources](#certificate-identity-passphrase-in-ci) too, so a passphrase-protected identity can be created in CI: `printf '%s\n' "$ID_PASS" | dl cert init --password-stdin`.
 
 ### Show or export the public key — `dl cert show` / `dl cert export-pub`
 
 ```bash
-dl cert show                  # fingerprint and paths of the active identity
+dl cert show                  # fingerprint, algorithm, passphrase state and paths
 dl cert export-pub alice.pub  # write the public key to a file
 dl cert export-pub            # print it
 ```
+
+`cert show` reports `passphrase: yes/no` — whether the private key on disk is passphrase-encrypted (i.e. whether unlocks will ask for a passphrase) — without decrypting it, so it never prompts.
 
 Use `export-pub` when sending your public key to a vault owner.
 
@@ -664,7 +684,8 @@ dl config unset auto_fetch_remote
 | Variable | Default | Effect |
 |---|---|---|
 | `DOTLOCK_ENV` | unset | Selects the environment vault; overridden by `--env`, overrides the `dl env use` selection |
-| `DOTLOCK_MASTER_PASSWORD` | unset | Non-interactive master password; overridden by `--password-stdin` / `--password-file` (preferred — env vars can leak in CI logs and process listings) |
+| `DOTLOCK_MASTER_PASSWORD` | unset | Non-interactive master password; overridden by `--password-stdin` / `--password-file` (preferred — env vars can leak in CI logs and process listings). In shared mode the same sources feed the identity passphrase instead |
+| `DOTLOCK_IDENTITY_PASSPHRASE` | unset | Non-interactive **identity** passphrase; takes precedence over the shared sources for the identity prompt only — use it when one command needs both credentials (e.g. `dl share grant`) |
 | `DOTLOCK_CACHE_TTL` | `15` | Cached project key lifetime in seconds, capped at 300; `0` makes entries expire immediately (effectively disabling the cache) |
 | `DOTLOCK_CACHE_DIR` | `$HOME/.lock` on Unix, `%LOCALAPPDATA%\dotlock` on Windows | Overrides the session cache root |
 | `DOTLOCK_SHARED_CACHE` | off | Set to `1`, `true`, `TRUE`, `yes` or `YES` to enable caching in shared mode |
@@ -720,7 +741,7 @@ dl config unset auto_fetch_remote
 | `dl reconcile` | `rec` | Review and re-sign a vault combined by the Git merge driver |
 | `dl repair [--dry-run] [--prune] [--yes]` | `rep` | Diagnose and recover a vault whose integrity hash is out of sync |
 
-Global flags, accepted by every command: `--json` (machine-readable output for `list`, `get`, `share list`, `audit show`, `provider list`), `--password-stdin` / `--password-file FILE` (non-interactive master password; see [CI usage](#non-interactive--ci-usage)), and `--env NAME` (operate on a named environment's vault; see [Multiple Environments](#multiple-environments)).
+Global flags, accepted by every command: `--json` (machine-readable output for `list`, `get`, `share list`, `audit show`, `provider list`), `--password-stdin` / `--password-file FILE` (non-interactive master password — or identity passphrase in shared mode; see [CI usage](#non-interactive--ci-usage)), and `--env NAME` (operate on a named environment's vault; see [Multiple Environments](#multiple-environments)).
 
 ## License
 

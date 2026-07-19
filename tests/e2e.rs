@@ -1205,7 +1205,10 @@ fn fresh_shared_setup_uses_modern_crypto_with_zero_rsa() {
         .args(["cert", "show"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("ed25519"));
+        .stdout(predicate::str::contains("ed25519"))
+        // Discoverability: `cert show` states whether the private key is
+        // passphrase-protected, so "why am I being prompted?" has an answer.
+        .stdout(predicate::str::contains("passphrase: no"));
 
     let pubkey = env.project.join("me.pub.pem");
     env.dl()
@@ -1241,6 +1244,96 @@ fn fresh_shared_setup_uses_modern_crypto_with_zero_rsa() {
         .assert()
         .success()
         .stdout("bar-value\n");
+}
+
+/// Non-interactive identity passphrase (CI): the FG2 sources satisfy the
+/// certificate passphrase too. A passphrase-protected identity is created via
+/// `cert init --password-stdin` (no PTY), granted shared access, and then —
+/// with the session cache dropped and no master password anywhere — the vault
+/// unlocks through the encrypted identity with the passphrase fed by
+/// `--password-stdin` and by `DOTLOCK_IDENTITY_PASSPHRASE`. A wrong
+/// passphrase fails, and no source + no TTY fails with the actionable error.
+#[test]
+fn shared_vault_with_encrypted_identity_unlocks_non_interactively() {
+    const IDENTITY_PASSPHRASE: &str = "1d3ntity-Pass!";
+
+    let env = TestEnv::new();
+    env.init_vault();
+    env.dl()
+        .args(["set", "FOO", "bar-value"])
+        .assert()
+        .success();
+
+    // Passphrase-protected identity created WITHOUT a PTY: the new-passphrase
+    // prompt accepts the same non-interactive sources.
+    env.dl()
+        .args(["cert", "init", "--password-stdin"])
+        .write_stdin(format!("{IDENTITY_PASSPHRASE}\n"))
+        .assert()
+        .success();
+
+    // `cert show` reveals the protection state without decrypting the key —
+    // it must succeed with no TTY and no passphrase source.
+    env.dl()
+        .args(["cert", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("passphrase: yes"));
+
+    // Grant shared access to this identity. This single command needs BOTH
+    // credentials (master password to unlock, identity passphrase to sign the
+    // grant), which is exactly what the dedicated env var disambiguates.
+    let pubkey = env.project.join("me.pub.pem");
+    env.dl()
+        .env("DOTLOCK_IDENTITY_PASSPHRASE", IDENTITY_PASSPHRASE)
+        .args(["cert", "export-pub"])
+        .arg(&pubkey)
+        .assert()
+        .success();
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .env("DOTLOCK_IDENTITY_PASSPHRASE", IDENTITY_PASSPHRASE)
+        .args(["share", "grant", "--pubkey"])
+        .arg(&pubkey)
+        .args(["--label", "me"])
+        .assert()
+        .success();
+
+    // Drop the session cache: every unlock below goes through the encrypted
+    // identity, with NO master password available anywhere.
+    env.dl().arg("lock").assert().success();
+
+    // No TTY + no source: the clear FG2 error, not a raw prompt failure.
+    env.dl()
+        .args(["get", "FOO"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--password-stdin"));
+
+    // --password-stdin feeds the identity passphrase (CI unlock).
+    env.dl()
+        .args(["get", "FOO", "--password-stdin"])
+        .write_stdin(format!("{IDENTITY_PASSPHRASE}\n"))
+        .assert()
+        .success()
+        .stdout("bar-value\n");
+
+    // The dedicated env var works too.
+    env.dl().arg("lock").assert().success();
+    env.dl()
+        .env("DOTLOCK_IDENTITY_PASSPHRASE", IDENTITY_PASSPHRASE)
+        .args(["get", "FOO"])
+        .assert()
+        .success()
+        .stdout("bar-value\n");
+
+    // A wrong non-interactive passphrase must fail the identity decrypt.
+    env.dl().arg("lock").assert().success();
+    env.dl()
+        .args(["get", "FOO", "--password-stdin"])
+        .write_stdin("wrong-passphrase\n")
+        .assert()
+        .failure();
 }
 
 /// Full grant -> revoke cycle on an envelope (v5+) vault, driven end to end
