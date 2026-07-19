@@ -206,6 +206,19 @@ pub fn load_local_identity() -> DotLockResult<LocalIdentity> {
 
     let metadata = load_local_identity_metadata()?;
 
+    // A passphrase-encrypted identity is decrypted at most ONCE per command:
+    // the first load registers the decrypted key as the session signer, and
+    // every later load in the same process (e.g. the per-secret SDK
+    // resolution after the unlock already decrypted it) reuses it instead of
+    // prompting for the passphrase again. The fingerprint check ensures a
+    // signer for a different identity is never handed out.
+    if metadata.encrypted
+        && let Some(identity) = session_signer()
+        && identity.fingerprint == metadata.fingerprint
+    {
+        return Ok(identity);
+    }
+
     let encrypted_private_key_pem = secure_fs::read_to_string(&private_path)?;
     let private_key_pem = if metadata.encrypted {
         let passphrase = prompt_identity_passphrase()?;
@@ -444,6 +457,83 @@ mod tests {
         assert_eq!(signer.fingerprint, meta.fingerprint);
         super::clear_session_signer();
 
+        let _ = fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::remove_var("DOTLOCK_IDENTITY_DIR");
+        }
+    }
+
+    /// Regression (double passphrase prompt): once a passphrase-encrypted
+    /// identity has been decrypted in this process (session signer
+    /// registered), a later `load_local_identity` in the same command must
+    /// reuse the decrypted key instead of prompting again — `dl get` on a
+    /// shared vault loads the identity once for the unlock and once for
+    /// per-secret SDK resolution, and used to prompt for the passphrase
+    /// twice. There is no TTY here, so any prompt attempt fails the load.
+    #[test]
+    fn encrypted_identity_reuses_session_signer_instead_of_reprompting() {
+        use crate::crypto::share::{IdentityProtection, generate_identity};
+
+        let _guard = env_lock().lock().expect("lock");
+        let dir = temp_dir();
+        unsafe {
+            std::env::set_var("DOTLOCK_IDENTITY_DIR", &dir);
+        }
+
+        let generated = generate_identity(IdentityProtection::Plain).expect("identity");
+        let meta = LocalIdentityMetadata {
+            fingerprint: generated.fingerprint.clone(),
+            encrypted: true,
+            alg: crate::crypto::share::IDENTITY_ALG_ED25519.to_string(),
+        };
+        let content = toml::to_string_pretty(&meta).expect("meta");
+        secure_fs::write_string_atomic(
+            &super::metadata_path().expect("meta path"),
+            &content,
+            0o700,
+            0o600,
+        )
+        .expect("write meta");
+        secure_fs::write_string_atomic(
+            &super::private_key_path().expect("private path"),
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nopaque\n-----END ENCRYPTED PRIVATE KEY-----\n",
+            0o700,
+            0o600,
+        )
+        .expect("write private");
+        secure_fs::write_string_atomic(
+            &super::public_key_path().expect("public path"),
+            &generated.public_key_pem,
+            0o700,
+            0o644,
+        )
+        .expect("write public");
+
+        // Simulate the first load of the command (the unlock path), which
+        // decrypts the identity and registers the session signer.
+        super::clear_session_signer();
+        super::register_session_signer(&super::LocalIdentity {
+            fingerprint: generated.fingerprint.clone(),
+            private_key_pem: generated.private_key_pem.clone(),
+            public_key_pem: generated.public_key_pem.clone(),
+        });
+
+        // The second load (e.g. per-secret SDK resolution) must reuse it.
+        let loaded = load_local_identity().expect("second load must reuse the session signer");
+        assert_eq!(loaded.fingerprint, generated.fingerprint);
+        assert_eq!(loaded.private_key_pem, generated.private_key_pem);
+
+        // A signer for a DIFFERENT identity must never be handed out: the
+        // load falls through to the real decrypt path (which fails here,
+        // since prompting is impossible without a TTY).
+        super::register_session_signer(&super::LocalIdentity {
+            fingerprint: "some-other-fp".to_string(),
+            private_key_pem: generated.private_key_pem.clone(),
+            public_key_pem: generated.public_key_pem.clone(),
+        });
+        load_local_identity().expect_err("mismatched session signer must not be reused");
+
+        super::clear_session_signer();
         let _ = fs::remove_dir_all(&dir);
         unsafe {
             std::env::remove_var("DOTLOCK_IDENTITY_DIR");
