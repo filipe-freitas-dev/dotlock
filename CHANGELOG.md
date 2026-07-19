@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-07-19
+
+### Fixed
+
+- Passphrase-encrypted local identities are now decrypted once per command and
+  reused for per-secret key resolution and audit signing, instead of
+  re-prompting for the identity passphrase on every secret. `dl get`, `dl run`,
+  and `dl exec` in shared vaults no longer prompt multiple times. The crypto
+  path is unchanged.
+
 ## [1.0.0] - 2026-07-19
 
 First stable release. The on-disk vault format, the CLI surface, and the

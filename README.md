@@ -15,7 +15,7 @@
 [![Cipher](https://img.shields.io/badge/Cipher-XChaCha20--Poly1305-FF1744?style=for-the-badge)](https://en.wikipedia.org/wiki/ChaCha20-Poly1305)
 [![KDF](https://img.shields.io/badge/KDF-Argon2id-7C4DFF?style=for-the-badge)](https://en.wikipedia.org/wiki/Argon2)
 [![Sharing](https://img.shields.io/badge/Sharing-Ed25519%20%2B%20X25519-00BFA5?style=for-the-badge)](https://en.wikipedia.org/wiki/Curve25519)
-[![Version](https://img.shields.io/badge/Version-1.0.0-4CAF50?style=for-the-badge)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-1.0.1-4CAF50?style=for-the-badge)](./CHANGELOG.md)
 
 </div>
 
@@ -39,7 +39,7 @@ DotLock is not a hosted production secret manager. For large production systems,
 
 ## Status
 
-DotLock is at `1.0.0`: the on-disk vault format, the CLI surface and the security model are stable, and vaults created with recent `0.1.x` releases keep working unchanged. It remains a local, file-based tool — see the [security model](#security-model) for what it does and does not protect against, and keep backups of `.lock/` as ordinary operational hygiene. Release history: [CHANGELOG.md](./CHANGELOG.md).
+DotLock is at `1.0.1`: the on-disk vault format, the CLI surface and the security model are stable, and vaults created with recent `0.1.x` releases keep working unchanged. It remains a local, file-based tool — see the [security model](#security-model) for what it does and does not protect against, and keep backups of `.lock/` as ordinary operational hygiene. Release history: [CHANGELOG.md](./CHANGELOG.md).
 
 ## Installation
 
