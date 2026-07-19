@@ -160,6 +160,24 @@ pub fn run(command: ShareCommand) -> DotLockResult<()> {
             ensure_project_initialized()?;
             let mut recipients = list_recipients(VAULT_FILE)?;
             recipients.sort_by(|a, b| a.label.cmp(&b.label));
+            if crate::cli::global::json_output() {
+                // FG1 schema: `[{"label", "fingerprint", "full_access",
+                // "allowed_secret_count"}]` — public metadata only, never key
+                // material.
+                let items: Vec<serde_json::Value> = recipients
+                    .iter()
+                    .map(|recipient| {
+                        serde_json::json!({
+                            "label": recipient.label,
+                            "fingerprint": recipient.public_key_fingerprint,
+                            "full_access": recipient.full_access,
+                            "allowed_secret_count": recipient.wrapped_sdks.len(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::Value::Array(items));
+                return Ok(());
+            }
             crate::cli::present::print_recipients_table(&recipients);
             Ok(())
         }

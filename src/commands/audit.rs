@@ -12,7 +12,12 @@ pub fn run(command: AuditCommand) -> DotLockResult<()> {
             verbose,
             since,
             action,
-        } => show_entries(verbose, since.as_deref(), action.as_deref()),
+        } => show_entries(
+            verbose,
+            since.as_deref(),
+            action.as_deref(),
+            crate::cli::global::json_output(),
+        ),
         AuditCommand::Verify { lax, strict: _ } => verify_log(!lax),
         AuditCommand::Path => {
             println!("{}", audit_log_path()?.display());

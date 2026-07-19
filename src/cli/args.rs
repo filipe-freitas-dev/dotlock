@@ -10,6 +10,20 @@ use crate::domain::model::Alg;
     about = "DotLock encrypts your project's environment variables."
 )]
 pub struct Cli {
+    /// Read the master password from the first line of stdin (FG2). Preferred
+    /// for CI over DOTLOCK_MASTER_PASSWORD, which can leak through process
+    /// listings and CI log captures of the environment.
+    #[arg(long, global = true, conflicts_with = "password_file")]
+    pub password_stdin: bool,
+    /// Read the master password from the first line of FILE (FG2). The file
+    /// is opened with the same symlink-safe reader used for vault files.
+    #[arg(long, global = true, value_name = "FILE")]
+    pub password_file: Option<PathBuf>,
+    /// Emit machine-readable JSON on stdout instead of human-formatted output
+    /// (supported by `list`, `get`, `share list`, `audit show`,
+    /// `provider list`) (FG1).
+    #[arg(long, global = true)]
+    pub json: bool,
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -321,6 +335,32 @@ mod cli_tests {
         GitArgs, GitCommand, ProviderArgs, ProviderCommand, RotateArgs, RotateCommand, ShareArgs,
         ShareCommand,
     };
+
+    #[test]
+    fn parses_global_json_and_password_flags_in_any_position() {
+        // Global flags are accepted before or after the subcommand.
+        let cli = Cli::try_parse_from(["dl", "list", "--json"]).expect("list --json");
+        assert!(cli.json);
+        assert!(matches!(cli.command, Commands::List));
+
+        let cli = Cli::try_parse_from(["dl", "--json", "get", "FOO"]).expect("--json get");
+        assert!(cli.json);
+
+        let cli =
+            Cli::try_parse_from(["dl", "get", "FOO", "--password-stdin"]).expect("password-stdin");
+        assert!(cli.password_stdin);
+        assert!(cli.password_file.is_none());
+
+        let cli = Cli::try_parse_from(["dl", "init", "--password-file", "/tmp/pw"])
+            .expect("password-file");
+        assert_eq!(cli.password_file.as_deref(), Some(std::path::Path::new("/tmp/pw")));
+
+        // The two explicit sources are mutually exclusive.
+        assert!(
+            Cli::try_parse_from(["dl", "list", "--password-stdin", "--password-file", "/tmp/pw"])
+                .is_err()
+        );
+    }
 
     #[test]
     fn parses_top_level_canonical_aliases() {

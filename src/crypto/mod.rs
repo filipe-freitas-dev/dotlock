@@ -7,11 +7,17 @@ pub mod sdk;
 pub mod secret_cipher;
 pub mod share;
 
+use std::{
+    io::IsTerminal,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+};
+
 use base64::{Engine as _, engine::general_purpose};
 use colored::Colorize;
 use inquire::{Confirm, Password, PasswordDisplayMode, Select, validator::Validation};
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     crypto::{
@@ -75,6 +81,102 @@ pub fn update_master_password_metadata(
     Ok(())
 }
 
+/// Explicit non-interactive master-password source selected on the command
+/// line (FG2). Precedence: explicit flag > `DOTLOCK_MASTER_PASSWORD` env var
+/// > interactive prompt (TTY only).
+#[derive(Clone, Debug)]
+pub enum PasswordFlagSource {
+    /// `--password-stdin`: the first line of stdin is the master password
+    /// (only the first line, so `dl set NAME --stdin` can still read the
+    /// secret value from the remainder of the pipe).
+    Stdin,
+    /// `--password-file FILE`: the first line of FILE is the master password.
+    File(PathBuf),
+}
+
+static PASSWORD_FLAG_SOURCE: OnceLock<Option<PasswordFlagSource>> = OnceLock::new();
+
+/// Memoized non-interactive password so a command that needs it twice (e.g.
+/// the auto-ratchet re-proof during a write) never re-consumes stdin. Held in
+/// a `Zeroizing` buffer; like the session key cache it lives for the (short)
+/// process lifetime only.
+static RESOLVED_PASSWORD: Mutex<Option<Zeroizing<String>>> = Mutex::new(None);
+
+/// Records the `--password-stdin`/`--password-file` selection; called exactly
+/// once from `main` before any command runs.
+pub fn set_password_flag_source(source: Option<PasswordFlagSource>) {
+    let _ = PASSWORD_FLAG_SOURCE.set(source);
+}
+
+fn read_password_from_stdin() -> DotLockResult<Zeroizing<String>> {
+    use std::io::BufRead;
+    let mut line = Zeroizing::new(String::new());
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(DotLockError::from)?;
+    while line.ends_with(['\r', '\n']) {
+        line.pop();
+    }
+    if line.is_empty() {
+        return Err(DotLockError::Io(
+            "no master password received on stdin (--password-stdin)".to_string(),
+        ));
+    }
+    Ok(line)
+}
+
+fn read_password_from_file(path: &Path) -> DotLockResult<Zeroizing<String>> {
+    // Symlink-safe open (M5), and the full file buffer is zeroized: only the
+    // first line is the password, but the rest must not linger either.
+    let content = Zeroizing::new(crate::storage::secure_fs::read_to_string(path)?);
+    let password = Zeroizing::new(content.lines().next().unwrap_or("").to_string());
+    if password.is_empty() {
+        return Err(DotLockError::Io(format!(
+            "no master password found on the first line of {}",
+            path.display()
+        )));
+    }
+    Ok(password)
+}
+
+fn password_from_env() -> Option<Zeroizing<String>> {
+    match std::env::var("DOTLOCK_MASTER_PASSWORD") {
+        Ok(value) if !value.is_empty() => Some(Zeroizing::new(value)),
+        _ => None,
+    }
+}
+
+/// Resolves the non-interactive master password, if any source is configured
+/// (FG2). Returns `Ok(None)` when the interactive prompt should run instead.
+fn non_interactive_password() -> DotLockResult<Option<Zeroizing<String>>> {
+    let mut cached = RESOLVED_PASSWORD
+        .lock()
+        .map_err(|_| DotLockError::Io("password source lock poisoned".to_string()))?;
+    if let Some(password) = cached.as_ref() {
+        return Ok(Some(password.clone()));
+    }
+    let resolved = match PASSWORD_FLAG_SOURCE.get().and_then(Option::as_ref) {
+        Some(PasswordFlagSource::Stdin) => Some(read_password_from_stdin()?),
+        Some(PasswordFlagSource::File(path)) => Some(read_password_from_file(path)?),
+        None => password_from_env(),
+    };
+    if let Some(password) = resolved.as_ref() {
+        *cached = Some(password.clone());
+    }
+    Ok(resolved)
+}
+
+/// Gate for the interactive prompts: without a TTY the raw `inquire` failure
+/// is replaced by an actionable error pointing at the FG2 sources.
+fn ensure_tty_for_prompt() -> DotLockResult<()> {
+    if std::io::stdin().is_terminal() {
+        Ok(())
+    } else {
+        Err(DotLockError::NoTtyForPassword)
+    }
+}
+
 fn map_inquire(err: inquire::InquireError) -> DotLockError {
     use inquire::InquireError::*;
     match err {
@@ -83,7 +185,7 @@ fn map_inquire(err: inquire::InquireError) -> DotLockError {
     }
 }
 
-fn prompt_typed_password() -> DotLockResult<String> {
+fn prompt_typed_password() -> DotLockResult<Zeroizing<String>> {
     let validator = |input: &str| match validate_password_strength(input) {
         Ok(()) => Ok(Validation::Valid),
         Err(DotLockError::WeakPassword { missing }) => {
@@ -99,10 +201,11 @@ fn prompt_typed_password() -> DotLockResult<String> {
         .with_custom_confirmation_message("Confirm master password:")
         .with_custom_confirmation_error_message("the passwords don't match")
         .prompt()
+        .map(Zeroizing::new)
         .map_err(map_inquire)
 }
 
-fn prompt_generated_password() -> DotLockResult<String> {
+fn prompt_generated_password() -> DotLockResult<Zeroizing<String>> {
     let pwd = generate_password(GENERATED_PASSWORD_LEN)?;
 
     println!();
@@ -128,10 +231,19 @@ fn prompt_generated_password() -> DotLockResult<String> {
     if !confirmed {
         return Err(DotLockError::Aborted);
     }
-    Ok(pwd)
+    Ok(Zeroizing::new(pwd))
 }
 
-pub fn ask_master_password() -> DotLockResult<String> {
+/// New-password entry point (`dl init`, `dl rotate master-password`). A
+/// non-interactive source (FG2) bypasses the picker but still goes through
+/// the strength gate; otherwise a TTY is required.
+pub fn ask_master_password() -> DotLockResult<Zeroizing<String>> {
+    if let Some(password) = non_interactive_password()? {
+        validate_password_strength(&password)?;
+        return Ok(password);
+    }
+    ensure_tty_for_prompt()?;
+
     let mode = Select::new(
         "How do you want to set the master password?",
         vec!["Generate a strong random one", "Type my own"],
@@ -187,14 +299,55 @@ pub fn initialize_vault_keys(project: &str, environment: &str) -> DotLockResult<
     Ok(InitializedVault { dek, metadata })
 }
 
-pub fn prompt_unlock_password() -> DotLockResult<String> {
+/// Existing-password entry point (every unlock). The FG2 non-interactive
+/// sources feed the exact same KDF/unwrap/MAC path as the prompt; there is no
+/// weaker unlock.
+pub fn prompt_unlock_password() -> DotLockResult<Zeroizing<String>> {
+    if let Some(password) = non_interactive_password()? {
+        return Ok(password);
+    }
+    ensure_tty_for_prompt()?;
+
     Password::new("Master password:")
         .with_display_mode(PasswordDisplayMode::Masked)
         .without_confirmation()
         .prompt()
-        .map_err(|err| match err {
-            inquire::InquireError::OperationCanceled
-            | inquire::InquireError::OperationInterrupted => DotLockError::Aborted,
-            other => DotLockError::Io(other.to_string()),
-        })
+        .map(Zeroizing::new)
+        .map_err(map_inquire)
+}
+
+#[cfg(test)]
+mod password_source_tests {
+    use super::read_password_from_file;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_file(name: &str, content: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("dotlock-pwfile-{name}-{unique}"));
+        std::fs::write(&path, content).expect("write password file");
+        path
+    }
+
+    #[test]
+    fn password_file_uses_only_the_first_line() {
+        let path = temp_file("first-line", "S3cret-Line!\ntrailing garbage\n");
+        let password = read_password_from_file(&path).expect("read password");
+        assert_eq!(password.as_str(), "S3cret-Line!");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn password_file_strips_crlf_and_rejects_empty() {
+        let path = temp_file("crlf", "S3cret-Line!\r\n");
+        let password = read_password_from_file(&path).expect("read password");
+        assert_eq!(password.as_str(), "S3cret-Line!");
+        let _ = std::fs::remove_file(&path);
+
+        let empty = temp_file("empty", "\n");
+        assert!(read_password_from_file(&empty).is_err());
+        let _ = std::fs::remove_file(&empty);
+    }
 }

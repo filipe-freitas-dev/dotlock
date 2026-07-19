@@ -244,19 +244,32 @@ fn read_entries_from_reader<R: Read>(path: &Path, reader: R) -> DotLockResult<Ve
     Ok(entries)
 }
 
-pub fn show_entries(verbose: bool, since: Option<&str>, action: Option<&str>) -> DotLockResult<()> {
+pub fn show_entries(
+    verbose: bool,
+    since: Option<&str>,
+    action: Option<&str>,
+    json: bool,
+) -> DotLockResult<()> {
     let path = audit_log_path()?;
     let since_ts = since.map(parse_since_date).transpose()?;
     let entries = read_all_entries(&path)?;
+    let entries = entries.into_iter().filter(|entry| {
+        !since_ts.is_some_and(|since| entry.ts < since)
+            && !action.is_some_and(|wanted| entry.action != wanted)
+    });
+
+    if json {
+        // FG1 schema: a JSON array of full audit entries (the same shape as
+        // the on-disk JSONL lines: ts/action/payload/hash-chain/signature).
+        let entries: Vec<AuditEntry> = entries.collect();
+        println!(
+            "{}",
+            serde_json::to_string(&entries).map_err(|e| DotLockError::Crypto(e.to_string()))?
+        );
+        return Ok(());
+    }
 
     for entry in entries {
-        if since_ts.is_some_and(|since| entry.ts < since) {
-            continue;
-        }
-        if action.is_some_and(|wanted| entry.action != wanted) {
-            continue;
-        }
-
         if verbose {
             println!(
                 "{} {} {} {}",

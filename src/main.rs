@@ -23,6 +23,15 @@ mod utils;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // FG1/FG2 globals: recorded once, before any command can prompt or print.
+    cli::global::set_json_output(cli.json);
+    crypto::set_password_flag_source(if cli.password_stdin {
+        Some(crypto::PasswordFlagSource::Stdin)
+    } else {
+        cli.password_file
+            .clone()
+            .map(crypto::PasswordFlagSource::File)
+    });
     match dispatch(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(DotLockError::Aborted) => ExitCode::from(130),

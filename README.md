@@ -193,6 +193,57 @@ dl logout
 
 **When:** Use after a sensitive session, before handing off a machine, or at the end of CI/scripted workflows.
 
+## Non-Interactive / CI Usage
+
+### Supply the master password without a prompt
+
+**What:** In headless environments (CI, scripts) the interactive password prompt cannot run. DotLock accepts the master password from three non-interactive sources, in this precedence order:
+
+1. `--password-stdin` — reads the password from the **first line of stdin** (so `dl set NAME --stdin --password-stdin` can still read the secret value from the rest of the pipe).
+2. `--password-file FILE` — reads the password from the first line of `FILE`, opened with the same symlink-safe reader used for vault files.
+3. `DOTLOCK_MASTER_PASSWORD` — environment variable, used when neither flag is passed.
+
+When a TTY is available and no source is set, the interactive prompt runs as usual. When there is no TTY and no source, the command fails with a clear error instead of a raw terminal failure. Both flags are global and work with every command, including `dl init` (where the password must still pass the strength check).
+
+**How:**
+
+```bash
+# CI unlock (preferred): the password never enters the process environment.
+printf '%s\n' "$MASTER_PASSWORD" | dl run --password-stdin -- ./deploy.sh
+dl get API_KEY --password-file /run/secrets/dotlock-password
+
+# Env var (simplest, but weaker: environment variables can leak through CI
+# log captures of the environment and are readable in /proc/<pid>/environ).
+DOTLOCK_MASTER_PASSWORD="$MASTER_PASSWORD" dl get API_KEY
+
+# Non-interactive init for ephemeral test environments.
+printf '%s\n' "$MASTER_PASSWORD" | dl init --password-stdin
+```
+
+**Security tradeoff:** every non-interactive source feeds the exact same unlock path as the prompt (Argon2id key derivation, DEK unwrap, metadata MAC and rollback-epoch verification) — there is no weaker CI unlock. Prefer `--password-stdin` or `--password-file` over the env var: environments are inherited by child processes and commonly echoed by CI debug logging. The password buffer is zeroized in memory in all cases.
+
+### Machine-readable output
+
+**What:** The global `--json` flag switches read commands to structured JSON on stdout (human output stays the default). Exit codes are unchanged.
+
+| Command | JSON shape |
+|---|---|
+| `dl list --json` | `[{"id": "<uuid>", "name": "<NAME>"}]` (never values) |
+| `dl get NAME --json` | `{"name": "<NAME>", "id": "<uuid>", "value": "<value>"}` |
+| `dl share list --json` | `[{"label", "fingerprint", "full_access", "allowed_secret_count"}]` |
+| `dl audit show --json` | array of full audit entries (same shape as the on-disk JSONL lines) |
+| `dl provider list --json` | `["<name>", ...]` |
+
+**How:**
+
+```bash
+dl list --json | jq -r '.[].name'
+dl get API_KEY --json | jq -r '.value'
+dl audit show --json --since 2026-01-01 | jq 'length'
+```
+
+`dl get --json` emits the secret value only because the user explicitly asked for that exact secret — the same exposure as the default piped output.
+
 ## Import and Export `.env` Files
 
 ### Import from `.env`
@@ -554,6 +605,7 @@ Aliases: `dl c show`, `dl c set`, `dl c unset`.
 | `DOTLOCK_HOME` | unset | Overrides the per-user state root (`$HOME/.lock` / `%LOCALAPPDATA%\dotlock`); required in environments without `HOME` |
 | `DOTLOCK_AUDIT_DIR` | `$HOME/.lock/audit` on Unix, `%LOCALAPPDATA%\dotlock\audit` on Windows | Overrides audit log storage |
 | `DOTLOCK_AUTO_FETCH` | unset | Set to `0`, `false`, `no` or `off` to disable auto-fetch for one command |
+| `DOTLOCK_MASTER_PASSWORD` | unset | Non-interactive master password for CI; overridden by `--password-stdin` / `--password-file` (preferred — env vars can leak in CI logs and process listings) |
 
 ## Command Reference
 
@@ -595,6 +647,8 @@ Aliases: `dl c show`, `dl c set`, `dl c unset`.
 | `dl provider info NAME` | `p info`, `provider i` | Show provider description |
 
 Compatibility aliases such as `add`, `rm`, `remove`, `del`, `delete`, `logout`, and `import` remain available, but the table above is the canonical long/short command set.
+
+Global flags (accepted by every command): `--json` (machine-readable output for `list`, `get`, `share list`, `audit show`, `provider list`), `--password-stdin` and `--password-file FILE` (non-interactive master password; see "Non-Interactive / CI Usage").
 
 ## How It Works
 

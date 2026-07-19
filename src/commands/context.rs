@@ -40,9 +40,10 @@ impl VaultContext {
         Ok(Self { metadata, access })
     }
 
-    /// Master-password-only unlock used by `share`/`rotate`: always prompts,
-    /// and returns the proven passphrase alongside the context.
-    pub fn unlock_with_master_password() -> DotLockResult<(Self, String)> {
+    /// Master-password-only unlock used by `share`/`rotate`: always requires
+    /// the master password (prompt or FG2 non-interactive source), and
+    /// returns the proven passphrase alongside the context.
+    pub fn unlock_with_master_password() -> DotLockResult<(Self, zeroize::Zeroizing<String>)> {
         ensure_project_initialized()?;
         let metadata = prepare_vault_access(VAULT_FILE)?;
         let (dek, passphrase) = unlock_vault_with_master_password_prepared(&metadata)?;

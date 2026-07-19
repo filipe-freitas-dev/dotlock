@@ -2,13 +2,11 @@
 //! directories. Every test gets its own project dir and its own
 //! `DOTLOCK_HOME`/`HOME`, so nothing touches the developer's real state.
 //!
-//! Master-password bootstrap: `dl` has no non-interactive unlock yet
-//! (`inquire` requires a TTY; Phase 4 FG2 will add
-//! `DOTLOCK_MASTER_PASSWORD`/`--password-stdin`). Until then `dl init` is
-//! driven through a pseudo-terminal via util-linux `script(1)`; after init the
-//! session key cache under `DOTLOCK_HOME` keeps every subsequent command
-//! non-interactive. Tests that need an initialized vault are skipped (with a
-//! message) when `script` is unavailable.
+//! Master-password bootstrap (FG2): `dl init --password-stdin` reads the
+//! password from the first line of stdin, so no pseudo-terminal is needed.
+//! After init the session key cache under `DOTLOCK_HOME` keeps subsequent
+//! commands non-interactive; tests that drop the cache re-unlock via
+//! `DOTLOCK_MASTER_PASSWORD` or `--password-file`.
 
 use std::fs;
 use std::path::PathBuf;
@@ -53,27 +51,14 @@ impl TestEnv {
         cmd
     }
 
-    /// Initializes the vault by driving `dl init` through a pty (`script`).
-    /// Returns `false` (test should skip) when no pty helper is available.
-    fn init_vault(&self) -> bool {
-        if !script_available() {
-            eprintln!("skipping: util-linux `script` not available for pty-driven `dl init`");
-            return false;
-        }
-
-        // Keystrokes: arrow-down + Enter selects "Type my own" in the
-        // password-mode picker, then the password is typed and confirmed.
-        let keystrokes = format!("\x1b[B\r{MASTER_PASSWORD}\r{MASTER_PASSWORD}\r");
-
-        let mut cmd = Command::new("script");
-        cmd.current_dir(&self.project)
-            .env("DOTLOCK_HOME", &self.home)
-            .env("HOME", &self.home)
-            .arg("-qec")
-            .arg(format!("{} init", env!("CARGO_BIN_EXE_dl")))
-            .arg("/dev/null")
-            .write_stdin(keystrokes);
-        cmd.assert().success();
+    /// Initializes the vault non-interactively (FG2): the master password is
+    /// fed through `--password-stdin`, so no pty helper is needed.
+    fn init_vault(&self) {
+        self.dl()
+            .args(["init", "--password-stdin"])
+            .write_stdin(format!("{MASTER_PASSWORD}\n"))
+            .assert()
+            .success();
 
         assert!(
             self.project.join(".lock/vault.toml").exists(),
@@ -83,20 +68,11 @@ impl TestEnv {
             self.project.join(".lock/secrets.lock").exists(),
             "`dl init` must create .lock/secrets.lock"
         );
-        true
     }
 
     fn lock_path(&self, name: &str) -> PathBuf {
         self.project.join(".lock").join(name)
     }
-}
-
-fn script_available() -> bool {
-    std::process::Command::new("script")
-        .arg("--version")
-        .output()
-        .map(|out| out.status.success())
-        .is_ok_and(|ok| ok)
 }
 
 #[test]
@@ -135,26 +111,132 @@ fn commands_fail_cleanly_before_init() {
 }
 
 #[test]
-fn init_without_a_tty_fails_gracefully() {
+fn init_without_a_tty_fails_with_actionable_error() {
     let env = TestEnv::new();
-    // No pty: the interactive prompt cannot run, and the failure must be a
-    // clean error (no panic) that leaves no usable vault behind.
+    // FG2: with no TTY and no non-interactive source, the failure must be a
+    // clean, actionable error (not the raw inquire "not a TTY" failure) that
+    // points at DOTLOCK_MASTER_PASSWORD / --password-stdin and leaves no
+    // usable vault behind.
     env.dl()
         .arg("init")
         .write_stdin(format!("{MASTER_PASSWORD}\n{MASTER_PASSWORD}\n"))
         .assert()
         .failure()
-        .stderr(predicate::str::contains("error:"))
+        .stderr(predicate::str::contains("no TTY"))
+        .stderr(predicate::str::contains("DOTLOCK_MASTER_PASSWORD"))
+        .stderr(predicate::str::contains("--password-stdin"))
         .stderr(predicate::str::contains("panicked").not());
     assert!(!env.project.join(".lock/vault.toml").exists());
+}
+
+/// FG2: non-interactive unlock. The env var and `--password-file` feed the
+/// same Argon2id -> DEK-unwrap -> MAC/epoch path as the interactive prompt,
+/// so a wrong password is rejected identically.
+#[test]
+fn non_interactive_unlock_via_env_var_and_password_file() {
+    let env = TestEnv::new();
+    env.init_vault();
+
+    env.dl().args(["set", "FOO", "bar-value"]).assert().success();
+
+    // Drop the session cache so the next command must actually unlock.
+    env.dl().arg("lock").assert().success();
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["get", "FOO"])
+        .assert()
+        .success()
+        .stdout("bar-value\n");
+
+    // A wrong password goes through the same KDF/unwrap path and fails.
+    env.dl().arg("lock").assert().success();
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", "Wr0ng!Passw0rd!!")
+        .args(["get", "FOO"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid master password"));
+
+    // --password-file: only the first line is the password.
+    let password_file = env.home.join("master.pw");
+    fs::write(&password_file, format!("{MASTER_PASSWORD}\n")).expect("write password file");
+    env.dl().arg("lock").assert().success();
+    env.dl()
+        .args(["get", "FOO", "--password-file"])
+        .arg(&password_file)
+        .assert()
+        .success()
+        .stdout("bar-value\n");
+
+    // --password-stdin unlocks reads too (first line only).
+    env.dl().arg("lock").assert().success();
+    env.dl()
+        .args(["get", "FOO", "--password-stdin"])
+        .write_stdin(format!("{MASTER_PASSWORD}\n"))
+        .assert()
+        .success()
+        .stdout("bar-value\n");
+}
+
+/// FG1: `--json` emits valid machine-readable JSON for read commands.
+#[test]
+fn json_output_for_list_get_share_and_provider() {
+    let env = TestEnv::new();
+    env.init_vault();
+
+    env.dl().args(["set", "FOO", "bar-value"]).assert().success();
+
+    // list --json: array of {id, name}, no values.
+    let out = env.dl().args(["list", "--json"]).output().expect("run list");
+    assert!(out.status.success());
+    let listed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("list --json must be valid JSON");
+    let items = listed.as_array().expect("list --json must be an array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["name"], "FOO");
+    assert!(items[0]["id"].as_str().is_some_and(|id| !id.is_empty()));
+    assert!(items[0].get("value").is_none(), "list must not leak values");
+
+    // get --json: {name, id, value}.
+    let out = env
+        .dl()
+        .args(["get", "FOO", "--json"])
+        .output()
+        .expect("run get");
+    assert!(out.status.success());
+    let got: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("get --json must be valid JSON");
+    assert_eq!(got["name"], "FOO");
+    assert_eq!(got["value"], "bar-value");
+    assert_eq!(got["id"], items[0]["id"]);
+
+    // share list --json: no recipients yet -> empty array.
+    let out = env
+        .dl()
+        .args(["share", "list", "--json"])
+        .output()
+        .expect("run share list");
+    assert!(out.status.success());
+    let recipients: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("share list --json must be valid JSON");
+    assert_eq!(recipients, serde_json::json!([]));
+
+    // provider list --json: array of provider names (none on this PATH).
+    let out = env
+        .dl()
+        .args(["provider", "list", "--json"])
+        .output()
+        .expect("run provider list");
+    assert!(out.status.success());
+    let providers: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("provider list --json must be valid JSON");
+    assert!(providers.is_array());
 }
 
 #[test]
 fn secret_lifecycle_set_get_list_export_run_unset() {
     let env = TestEnv::new();
-    if !env.init_vault() {
-        return;
-    }
+    env.init_vault();
 
     // set: value round-trips through the encrypted vault.
     env.dl()
@@ -228,9 +310,7 @@ fn secret_lifecycle_set_get_list_export_run_unset() {
 #[test]
 fn set_reads_secret_value_from_stdin() {
     let env = TestEnv::new();
-    if !env.init_vault() {
-        return;
-    }
+    env.init_vault();
 
     env.dl()
         .args(["set", "PIPED", "--stdin"])
@@ -261,9 +341,7 @@ fn set_reads_secret_value_from_stdin() {
 #[test]
 fn pending_merge_marker_blocks_access_until_reconciled() {
     let env = TestEnv::new();
-    if !env.init_vault() {
-        return;
-    }
+    env.init_vault();
 
     env.dl()
         .args(["set", "FOO", "bar-value"])
@@ -309,9 +387,7 @@ fn pending_merge_marker_blocks_access_until_reconciled() {
 #[test]
 fn tampered_vault_metadata_is_refused() {
     let env = TestEnv::new();
-    if !env.init_vault() {
-        return;
-    }
+    env.init_vault();
 
     env.dl()
         .args(["set", "FOO", "bar-value"])
@@ -338,9 +414,7 @@ fn tampered_vault_metadata_is_refused() {
 #[test]
 fn restored_older_vault_pair_is_refused_as_rollback() {
     let env = TestEnv::new();
-    if !env.init_vault() {
-        return;
-    }
+    env.init_vault();
 
     env.dl()
         .args(["set", "FOO", "old-value"])
@@ -382,9 +456,7 @@ fn restored_older_vault_pair_is_refused_as_rollback() {
 #[test]
 fn tampered_secrets_file_is_refused() {
     let env = TestEnv::new();
-    if !env.init_vault() {
-        return;
-    }
+    env.init_vault();
 
     env.dl()
         .args(["set", "FOO", "bar-value"])

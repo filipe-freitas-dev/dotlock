@@ -5,6 +5,9 @@ pub enum DotLockError {
     #[error("invalid master password")]
     InvalidMasterPassword,
 
+    #[error("no TTY available to prompt for the master password")]
+    NoTtyForPassword,
+
     #[error("master password is weak: missing {missing}")]
     WeakPassword { missing: String },
 
@@ -92,6 +95,9 @@ impl DotLockError {
             DotLockError::InvalidMasterPassword => {
                 Some("check caps lock and your keyboard layout, then try again")
             }
+            DotLockError::NoTtyForPassword => Some(
+                "set DOTLOCK_MASTER_PASSWORD, or pass --password-stdin / --password-file <path> (preferred: env vars can leak in CI logs and process listings)",
+            ),
             DotLockError::WeakPassword { .. } => {
                 Some("use at least 12 characters with lowercase, uppercase, a digit and a symbol")
             }

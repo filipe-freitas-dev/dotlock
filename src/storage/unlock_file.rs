@@ -235,12 +235,13 @@ fn unlock_vault_with_dek(
     Ok(dek)
 }
 
-/// Master-password unlock against already-loaded metadata: prompts, unwraps
-/// the DEK, verifies integrity, refreshes the session cache, and records the
-/// audit entry — without re-reading `vault.toml`.
+/// Master-password unlock against already-loaded metadata: prompts (or takes
+/// the FG2 non-interactive source), unwraps the DEK, verifies integrity,
+/// refreshes the session cache, and records the audit entry — without
+/// re-reading `vault.toml`.
 pub fn unlock_vault_with_master_password_prepared(
     metadata: &crate::crypto::VaultKeyMetadata,
-) -> DotLockResult<(ProjectKey, String)> {
+) -> DotLockResult<(ProjectKey, zeroize::Zeroizing<String>)> {
     let passphrase = prompt_unlock_password()?;
     let dek = unwrap_dek_with_passphrase(metadata, &passphrase)?;
     let dek = unlock_vault_with_dek(metadata, dek)?;
