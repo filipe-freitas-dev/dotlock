@@ -34,9 +34,11 @@ jobs:
         with:
           tool: cargo-audit,cargo-deny
       # RUSTSEC-2023-0071 (rsa "Marvin" timing side-channel, no upstream fix)
-      # is a documented, accepted risk — rationale and planned X25519
-      # migration in docs/adr/0001-crypto-dependencies.md. Any OTHER advisory
-      # fails the build.
+      # is a documented, accepted risk. Since the Ed25519/X25519 migration,
+      # RSA decryption is reachable ONLY on the legacy-interop path
+      # (`dl cert migrate` / not-yet-migrated vaults), never in normal ops —
+      # see docs/adr/0001-crypto-dependencies.md. Any OTHER advisory fails
+      # the build.
       - name: cargo audit
         run: cargo audit --ignore RUSTSEC-2023-0071
       - name: cargo deny (advisories + licenses)

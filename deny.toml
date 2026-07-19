@@ -10,11 +10,14 @@ all-features = true
 # are denied by default.
 ignore = [
     # rsa 0.9.x "Marvin" timing side-channel; no upstream fix available.
-    # Used only for local identity key wrapping/signing in share mode, where
-    # there is no remote timing oracle (short-lived CLI process, one unwrap
-    # per unlock). Accepted with a planned migration to X25519 (crypto_box)
-    # as its own milestone — see docs/adr/0001-crypto-dependencies.md.
-    { id = "RUSTSEC-2023-0071", reason = "no upstream fix; local-CLI-only RSA decryption, no remote timing oracle; migration to X25519 tracked in ADR 0001" },
+    # Since the Ed25519/X25519 migration, NO normal operation performs RSA
+    # decryption: new identities are Ed25519, wraps are X25519 sealed boxes,
+    # and signatures are Ed25519. The vulnerable primitive (RSA private-key
+    # decryption) is reachable ONLY for legacy interop — unlocking a vault
+    # whose recipient entry predates `dl cert migrate`, and the single final
+    # unwrap performed by the migration itself. Local short-lived CLI, no
+    # remote timing oracle. See docs/adr/0001-crypto-dependencies.md.
+    { id = "RUSTSEC-2023-0071", reason = "no upstream fix; RSA decryption only reachable on the legacy-interop/migration path (`dl cert migrate`), never in normal ops; see ADR 0001" },
 ]
 # Unmaintained TRANSITIVE crates (e.g. `fxhash` via `inquire`,
 # RUSTSEC-2025-0057) are monitored, not fatal — we cannot fix them without

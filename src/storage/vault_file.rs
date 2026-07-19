@@ -7,7 +7,7 @@ use crate::{
         VaultKeyMetadata,
         integrity::{decrypt_hash, encrypt_hash},
         sdk,
-        share::{RECIPIENT_ALG, wrap_dek_for_public_key_b64},
+        share::{recipient_alg_for_public_key_b64, wrap_dek_for_public_key_b64},
     },
     domain::{error::DotLockError, keys::ProjectKey, model::DotLockResult},
     storage::secure_fs,
@@ -143,9 +143,12 @@ pub fn rotate_project_key_wrapping(
             recipients_skipped += 1;
             continue;
         }
+        // The wrap dispatches on the recipient's key type (X25519 sealed box
+        // or legacy RSA-OAEP), so mixed vaults rotate correctly; the alg tag
+        // is normalized to match the key.
         recipient.wrapped_dek_b64 =
             wrap_dek_for_public_key_b64(new_project_key.as_bytes(), &recipient.public_key_b64)?;
-        recipient.alg = RECIPIENT_ALG.to_string();
+        recipient.alg = recipient_alg_for_public_key_b64(&recipient.public_key_b64)?.to_string();
         recipients_rewrapped += 1;
     }
 
@@ -343,6 +346,59 @@ mod tests {
         assert!(
             crate::crypto::integrity::decrypt_hash(&nonce, &ciphertext, &old_project_key).is_err()
         );
+    }
+
+    /// Mixed-recipient rotation (ADR 0001 transition window): one legacy RSA
+    /// recipient and one modern Ed25519 recipient both receive the fresh
+    /// project key, each wrapped with THEIR key's algorithm — RSA-OAEP (a
+    /// public-key operation, not Marvin-affected) and X25519 sealed box.
+    #[test]
+    fn rotate_project_key_wrapping_handles_mixed_rsa_and_ed25519_recipients() {
+        use crate::crypto::share::{
+            IdentityProtection, RECIPIENT_ALG, RECIPIENT_ALG_X25519, encode_public_key_b64,
+            generate_identity, generate_legacy_rsa_identity, unwrap_dek_with_private_key,
+        };
+
+        let old_project_key = ProjectKey::new([8u8; 32]);
+        let new_project_key = ProjectKey::new([9u8; 32]);
+        let legacy = generate_legacy_rsa_identity(IdentityProtection::Plain).expect("legacy");
+        let modern = generate_identity(IdentityProtection::Plain).expect("modern");
+
+        let mut metadata = metadata();
+        for (identity, alg) in [(&legacy, RECIPIENT_ALG), (&modern, RECIPIENT_ALG_X25519)] {
+            metadata.recipients.push(crate::crypto::VaultRecipient {
+                id: identity.fingerprint.clone(),
+                label: identity.fingerprint.clone(),
+                alg: alg.to_string(),
+                public_key_fingerprint: identity.fingerprint.clone(),
+                public_key_b64: encode_public_key_b64(&identity.public_key_pem).expect("pub b64"),
+                wrapped_dek_b64: crate::crypto::share::wrap_dek_for_public_key(
+                    old_project_key.as_bytes(),
+                    &identity.public_key_pem,
+                )
+                .expect("wrap old key"),
+                wrapped_sdks: std::collections::HashMap::new(),
+                grant_signature_b64: String::new(),
+                grant_signer_fingerprint: String::new(),
+                full_access: true,
+            });
+        }
+
+        let summary =
+            rotate_project_key_wrapping(&mut metadata, &old_project_key, &new_project_key)
+                .expect("rotate");
+
+        assert_eq!(summary.recipients_rewrapped, 2);
+        for (index, identity) in [&legacy, &modern].into_iter().enumerate() {
+            let recipient = &metadata.recipients[index];
+            let unwrapped =
+                unwrap_dek_with_private_key(&recipient.wrapped_dek_b64, &identity.private_key_pem)
+                    .expect("unwrap rotated key");
+            assert_eq!(&unwrapped, new_project_key.as_bytes());
+        }
+        // Alg tags stay true to each recipient's key type.
+        assert_eq!(metadata.recipients[0].alg, RECIPIENT_ALG);
+        assert_eq!(metadata.recipients[1].alg, RECIPIENT_ALG_X25519);
     }
 
     /// H3 sink: once the vault has authorized signers, a rotation never wraps

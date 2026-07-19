@@ -8,8 +8,9 @@ use crate::{
         dek::generate_dek,
         integrity::seal_vault_metadata,
         share::{
-            RECIPIENT_ALG, encode_public_key_b64, fingerprint_public_key, sign_recipient_grant,
-            verify_recipient_grant, wrap_dek_for_public_key, wrap_dek_for_public_key_b64,
+            RECIPIENT_ALG_X25519, encode_public_key_b64, fingerprint_public_key,
+            recipient_alg_for_public_key, sign_recipient_grant, verify_recipient_grant,
+            wrap_dek_for_public_key, wrap_dek_for_public_key_b64,
         },
         update_master_password_metadata,
     },
@@ -156,6 +157,78 @@ pub fn bless_recipient_grants(
     Ok(blessed)
 }
 
+/// RSA-exit migration (ADR 0001): rewrites the recipient entry identified by
+/// `old_fingerprint` to the caller's NEW (Ed25519) identity — new
+/// public key/fingerprint/alg, project key rewrapped as an X25519 sealed box,
+/// per-secret SDKs rewrapped, and the grant re-signed by the new identity —
+/// then reseals the metadata MAC and commits transactionally. Only reachable
+/// with a proven project key (`dek`), i.e. full-access authority: the same
+/// authority every `authorized_signers` mutation already requires. Other
+/// recipients are untouched, so mixed RSA/X25519 vaults keep working during a
+/// team's transition window.
+pub fn migrate_recipient_identity(
+    vault_path: &str,
+    metadata: &mut VaultKeyMetadata,
+    old_fingerprint: &str,
+    new_identity: &LocalIdentity,
+    dek: &ProjectKey,
+) -> DotLockResult<VaultRecipient> {
+    let position = metadata
+        .recipients
+        .iter()
+        .position(|recipient| recipient.public_key_fingerprint == old_fingerprint)
+        .ok_or_else(|| DotLockError::RecipientNotFound {
+            query: old_fingerprint.to_string(),
+        })?;
+
+    let new_fingerprint = fingerprint_public_key(&new_identity.public_key_pem)?;
+    let public_key_b64 = encode_public_key_b64(&new_identity.public_key_pem)?;
+    let wrapped_dek_b64 = if metadata.recipients[position].wrapped_dek_b64.is_empty() {
+        String::new()
+    } else {
+        wrap_dek_for_public_key(dek.as_bytes(), &new_identity.public_key_pem)?
+    };
+    // Rewrap this recipient's per-secret SDKs under the new key (sourced from
+    // the canonical DEK wrappings, which the caller just proved they hold).
+    let allowed_ids: Vec<String> = metadata.recipients[position]
+        .wrapped_sdks
+        .keys()
+        .cloned()
+        .collect();
+    let wrapped_sdks = wrap_allowed_sdks(
+        metadata,
+        &new_identity.public_key_pem,
+        dek,
+        Some(&allowed_ids),
+    )?;
+
+    // The migrating user proved full-key authority, so they become an
+    // authorized signer (exactly like a granting owner) and re-sign their own
+    // grant under the new key.
+    ensure_authorized_signer(metadata, new_identity)?;
+    let payload = recipient_grant_payload(
+        &metadata.project_uuid,
+        &new_fingerprint,
+        &public_key_b64,
+        &new_identity.fingerprint,
+    );
+    let grant_signature_b64 = sign_recipient_grant(&payload, &new_identity.private_key_pem)?;
+
+    let recipient = &mut metadata.recipients[position];
+    recipient.public_key_fingerprint = new_fingerprint;
+    recipient.public_key_b64 = public_key_b64;
+    recipient.alg = RECIPIENT_ALG_X25519.to_string();
+    recipient.wrapped_dek_b64 = wrapped_dek_b64;
+    recipient.wrapped_sdks = wrapped_sdks;
+    recipient.grant_signature_b64 = grant_signature_b64;
+    recipient.grant_signer_fingerprint = new_identity.fingerprint.clone();
+    let migrated = recipient.clone();
+
+    metadata.version = metadata.version.max(8);
+    seal_and_commit_metadata(vault_path, metadata, dek)?;
+    Ok(migrated)
+}
+
 /// Flips the vault into shared mode. `access_mode` is covered by the metadata
 /// MAC (M2), so this now requires a proven project key: callers must unlock
 /// with full access first.
@@ -210,6 +283,12 @@ pub fn grant_recipient_with_secret_ids(
 
     let fingerprint = fingerprint_public_key(public_key_pem)?;
     let public_key_b64 = encode_public_key_b64(public_key_pem)?;
+    // Wrapping algorithm follows the recipient's key type: X25519 sealed box
+    // for modern Ed25519 keys, RSA-OAEP only for legacy RSA keys.
+    let recipient_alg = recipient_alg_for_public_key(public_key_pem)?;
+    if recipient_alg == RECIPIENT_ALG_X25519 {
+        metadata.version = metadata.version.max(8);
+    }
     let full_access = allowed_secret_ids.is_none();
     let wrapped_dek_b64 = if full_access {
         wrap_dek_for_public_key(dek.as_bytes(), public_key_pem)?
@@ -250,7 +329,7 @@ pub fn grant_recipient_with_secret_ids(
         existing.wrapped_dek_b64 = wrapped_dek_b64;
         existing.wrapped_sdks = wrapped_sdks;
         existing.full_access = full_access;
-        existing.alg = RECIPIENT_ALG.to_string();
+        existing.alg = recipient_alg.to_string();
         existing.grant_signature_b64 = grant_signature_b64;
         existing.grant_signer_fingerprint = grant_signer_fingerprint;
         let recipient = existing.clone();
@@ -264,7 +343,7 @@ pub fn grant_recipient_with_secret_ids(
     let recipient = VaultRecipient {
         id: Uuid::new_v4().to_string(),
         label: label.to_string(),
-        alg: RECIPIENT_ALG.to_string(),
+        alg: recipient_alg.to_string(),
         public_key_fingerprint: fingerprint,
         public_key_b64,
         wrapped_dek_b64,
@@ -742,6 +821,120 @@ mod tests {
         assert!(!granted.full_access);
         assert!(granted.wrapped_sdks.contains_key("foo-id"));
         assert!(!granted.wrapped_sdks.contains_key("bar-id"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// RSA-exit migration (ADR 0001): a vault whose recipient entry is a
+    /// legacy RSA wrap is rekeyed to an Ed25519/X25519 identity by
+    /// `migrate_recipient_identity` — afterwards the modern key unwraps the
+    /// project key, the grant verifies under Ed25519, the resealed MAC is
+    /// valid, and the legacy RSA key is no longer referenced by the vault.
+    #[test]
+    fn migrate_recipient_identity_rekeys_from_rsa_to_ed25519() {
+        use crate::{
+            crypto::{
+                integrity::verify_metadata_mac,
+                share::{
+                    RECIPIENT_ALG, RECIPIENT_ALG_X25519, encode_public_key_b64,
+                    generate_legacy_rsa_identity, unwrap_dek_with_private_key,
+                    wrap_dek_for_public_key,
+                },
+            },
+            storage::{
+                identity::LocalIdentity,
+                shared_access::{migrate_recipient_identity, recipient_grant_is_valid},
+            },
+        };
+
+        let path = temp_file("shared-access-migrate");
+        let dek = ProjectKey::new([4u8; 32]);
+        let legacy = generate_legacy_rsa_identity(IdentityProtection::Plain).expect("legacy");
+        let mut metadata = metadata();
+        metadata.access_mode = AccessMode::Shared;
+        metadata.wrapped_sdks_under_dek.insert(
+            "foo-id".to_string(),
+            crate::crypto::sdk::wrap_sdk_for_project_key(
+                &crate::domain::keys::SecretKey::new([6u8; 32]),
+                &dek,
+            )
+            .expect("wrap sdk"),
+        );
+        metadata.recipients.push(crate::crypto::VaultRecipient {
+            id: "me".to_string(),
+            label: "me".to_string(),
+            alg: RECIPIENT_ALG.to_string(),
+            public_key_fingerprint: legacy.fingerprint.clone(),
+            public_key_b64: encode_public_key_b64(&legacy.public_key_pem).expect("pub b64"),
+            wrapped_dek_b64: wrap_dek_for_public_key(dek.as_bytes(), &legacy.public_key_pem)
+                .expect("legacy wrap"),
+            wrapped_sdks: std::collections::HashMap::from([(
+                "foo-id".to_string(),
+                wrap_dek_for_public_key(&[6u8; 32], &legacy.public_key_pem).expect("sdk wrap"),
+            )]),
+            full_access: true,
+            grant_signature_b64: String::new(),
+            grant_signer_fingerprint: String::new(),
+        });
+        save_vault_metadata(&path, &metadata).expect("save vault");
+
+        // The legacy identity CAN unwrap before migration (one last time).
+        let unwrapped = unwrap_dek_with_private_key(
+            &metadata.recipients[0].wrapped_dek_b64,
+            &legacy.private_key_pem,
+        )
+        .expect("legacy unwrap");
+        assert_eq!(&unwrapped, dek.as_bytes());
+
+        let modern = generate_identity(IdentityProtection::Plain).expect("modern identity");
+        let new_identity = LocalIdentity {
+            fingerprint: modern.fingerprint.clone(),
+            private_key_pem: modern.private_key_pem.clone(),
+            public_key_pem: modern.public_key_pem.clone(),
+        };
+        let migrated = migrate_recipient_identity(
+            path.to_str().expect("path"),
+            &mut load_vault_metadata(&path).expect("load vault"),
+            &legacy.fingerprint,
+            &new_identity,
+            &dek,
+        )
+        .expect("migrate recipient");
+
+        let reloaded = load_vault_metadata(&path).expect("reload vault");
+        assert_eq!(reloaded.recipients.len(), 1);
+        let recipient = &reloaded.recipients[0];
+        // Rekeyed: modern alg + fingerprint; the RSA material is gone.
+        assert_eq!(recipient.alg, RECIPIENT_ALG_X25519);
+        assert_eq!(recipient.public_key_fingerprint, modern.fingerprint);
+        assert_eq!(migrated.public_key_fingerprint, modern.fingerprint);
+        let raw = fs::read_to_string(&path).expect("raw vault");
+        assert!(!raw.contains(&legacy.fingerprint), "RSA fingerprint gone");
+        // The NEW key unwraps the project key and the rewrapped SDK; the
+        // legacy key no longer can.
+        let unwrapped =
+            unwrap_dek_with_private_key(&recipient.wrapped_dek_b64, &modern.private_key_pem)
+                .expect("modern unwrap");
+        assert_eq!(&unwrapped, dek.as_bytes());
+        assert!(
+            unwrap_dek_with_private_key(&recipient.wrapped_dek_b64, &legacy.private_key_pem)
+                .is_err()
+        );
+        let sdk = unwrap_dek_with_private_key(
+            recipient.wrapped_sdks.get("foo-id").expect("sdk rewrapped"),
+            &modern.private_key_pem,
+        )
+        .expect("modern sdk unwrap");
+        assert_eq!(sdk, [6u8; 32]);
+        // The grant is re-signed under Ed25519 by the (now authorized) new
+        // identity, the version was bumped, and the MAC reseals correctly.
+        assert!(recipient_grant_is_valid(
+            &reloaded.project_uuid,
+            &reloaded.authorized_signers,
+            recipient
+        ));
+        assert!(reloaded.version >= 8);
+        verify_metadata_mac(&reloaded, &dek).expect("resealed MAC verifies");
 
         let _ = fs::remove_file(path);
     }

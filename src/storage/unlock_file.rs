@@ -17,7 +17,10 @@ use crate::{
     storage::{
         cache::{invalidate_cache, read_cached_dek_for, write_cached_dek_for},
         epoch_anchor,
-        identity::{load_local_identity, load_local_identity_metadata},
+        identity::{
+            LocalIdentity, load_legacy_identity, load_legacy_identity_metadata,
+            load_local_identity, load_local_identity_metadata,
+        },
         pending_merge::ensure_no_pending_merge,
         project::secrets_file,
         vault_file::load_vault_metadata,
@@ -62,6 +65,46 @@ impl UnlockAccess {
     }
 }
 
+/// Recipient entry matching one of the local identities: the current one
+/// first, then the archived legacy (RSA) identity that `dl cert migrate`
+/// keeps around until every project has been rekeyed. Returns the matching
+/// recipient and whether it resolved through the legacy identity.
+fn find_local_recipient(
+    metadata: &crate::crypto::VaultKeyMetadata,
+) -> Option<(&crate::crypto::VaultRecipient, bool)> {
+    if let Ok(identity_meta) = load_local_identity_metadata()
+        && let Some(recipient) = metadata
+            .recipients
+            .iter()
+            .find(|recipient| recipient.public_key_fingerprint == identity_meta.fingerprint)
+    {
+        return Some((recipient, false));
+    }
+    if let Ok(legacy_meta) = load_legacy_identity_metadata()
+        && let Some(recipient) = metadata
+            .recipients
+            .iter()
+            .find(|recipient| recipient.public_key_fingerprint == legacy_meta.fingerprint)
+    {
+        return Some((recipient, true));
+    }
+    None
+}
+
+/// Loads the identity selected by [`find_local_recipient`], nudging legacy
+/// unlocks toward `dl cert migrate` (the RSA-decryption exit, ADR 0001).
+fn load_matched_identity(legacy: bool) -> DotLockResult<LocalIdentity> {
+    if legacy {
+        eprintln!(
+            "{} unlocking with the archived legacy (RSA) identity; run {} in this project to finish the migration",
+            "warn:".yellow().bold(),
+            "dl cert migrate".bold()
+        );
+        return load_legacy_identity();
+    }
+    load_local_identity()
+}
+
 /// Resolves any interrupted vault-pair transaction before the vault is read,
 /// and refuses to proceed while a pending-merge marker exists: merged content
 /// was never signed by a key holder, so every unlock (interactive or CI) must
@@ -103,13 +146,9 @@ pub fn unlock_full_for_reconcile(path: &str) -> DotLockResult<ProjectKey> {
     let metadata = load_vault_metadata(path)?;
 
     if metadata.access_mode == AccessMode::Shared
-        && let Ok(identity_meta) = load_local_identity_metadata()
-        && let Some(recipient) = metadata
-            .recipients
-            .iter()
-            .find(|recipient| recipient.public_key_fingerprint == identity_meta.fingerprint)
+        && let Some((recipient, legacy)) = find_local_recipient(&metadata)
         && !recipient.wrapped_dek_b64.is_empty()
-        && let Ok(identity) = load_local_identity()
+        && let Ok(identity) = load_matched_identity(legacy)
     {
         let dek = ProjectKey::new(unwrap_dek_with_private_key(
             &recipient.wrapped_dek_b64,
@@ -137,13 +176,9 @@ pub fn unlock_full_for_repair(
     metadata: &crate::crypto::VaultKeyMetadata,
 ) -> DotLockResult<ProjectKey> {
     if metadata.access_mode == AccessMode::Shared
-        && let Ok(identity_meta) = load_local_identity_metadata()
-        && let Some(recipient) = metadata
-            .recipients
-            .iter()
-            .find(|recipient| recipient.public_key_fingerprint == identity_meta.fingerprint)
+        && let Some((recipient, legacy)) = find_local_recipient(metadata)
         && !recipient.wrapped_dek_b64.is_empty()
-        && let Ok(identity) = load_local_identity()
+        && let Ok(identity) = load_matched_identity(legacy)
     {
         let dek = ProjectKey::new(unwrap_dek_with_private_key(
             &recipient.wrapped_dek_b64,
@@ -158,6 +193,37 @@ pub fn unlock_full_for_repair(
     let dek = unwrap_dek_with_passphrase(metadata, &passphrase)?;
     verify_metadata_mac(metadata, &dek)?;
     record_unlock_best_effort("password", metadata);
+    Ok(dek)
+}
+
+/// RSA-exit unlock used exclusively by `dl cert migrate`: recovers the
+/// project key through the ARCHIVED legacy identity's recipient entry — the
+/// one deliberate, final RSA decryption for this project — and runs the full
+/// M2+M3 trust chain (metadata MAC, rollback anchor, secrets integrity)
+/// before the caller rewrites the recipient entry under the new key.
+pub fn unlock_full_with_legacy_identity(
+    metadata: &crate::crypto::VaultKeyMetadata,
+) -> DotLockResult<ProjectKey> {
+    let legacy_meta = load_legacy_identity_metadata()?;
+    let recipient = metadata
+        .recipients
+        .iter()
+        .find(|recipient| recipient.public_key_fingerprint == legacy_meta.fingerprint)
+        .ok_or_else(|| DotLockError::RecipientNotFound {
+            query: legacy_meta.fingerprint.clone(),
+        })?;
+    if recipient.wrapped_dek_b64.is_empty() {
+        return Err(DotLockError::AccessDenied {
+            secret: "a limited recipient cannot rekey their own entry; ask an owner to re-grant your new public key".to_string(),
+        });
+    }
+    let identity = load_legacy_identity()?;
+    let dek = ProjectKey::new(unwrap_dek_with_private_key(
+        &recipient.wrapped_dek_b64,
+        &identity.private_key_pem,
+    )?);
+    verify_metadata_and_secrets(metadata, &dek)?;
+    record_unlock_best_effort("identity", metadata);
     Ok(dek)
 }
 
@@ -288,15 +354,13 @@ pub fn unlock_vault_with_master_password_prepared(
 fn try_unlock_vault_with_local_identity(
     metadata: &crate::crypto::VaultKeyMetadata,
 ) -> DotLockResult<UnlockAccess> {
-    let identity_meta = load_local_identity_metadata()?;
-    let recipient = metadata
-        .recipients
-        .iter()
-        .find(|recipient| recipient.public_key_fingerprint == identity_meta.fingerprint)
-        .ok_or_else(|| DotLockError::RecipientNotFound {
-            query: identity_meta.fingerprint.clone(),
-        })?;
-    let identity = load_local_identity()?;
+    let (recipient, legacy) = find_local_recipient(metadata).ok_or_else(|| {
+        let query = load_local_identity_metadata()
+            .map(|identity_meta| identity_meta.fingerprint)
+            .unwrap_or_default();
+        DotLockError::RecipientNotFound { query }
+    })?;
+    let identity = load_matched_identity(legacy)?;
     if recipient.wrapped_dek_b64.is_empty() && !recipient.wrapped_sdks.is_empty() {
         verify_public_secrets_hash(secrets_file(), metadata)?;
         record_unlock_best_effort("identity", metadata);
@@ -441,5 +505,92 @@ mod tests {
                 .into_read_key()
                 .is_read_only_placeholder()
         );
+    }
+
+    /// Legacy-identity fallback (ADR 0001): after `dl cert migrate`, a vault
+    /// that still references the OLD (RSA) fingerprint resolves through the
+    /// archived legacy identity; a vault already rekeyed to the new
+    /// fingerprint resolves through the current identity.
+    #[test]
+    fn find_local_recipient_falls_back_to_the_archived_legacy_identity() {
+        use crate::storage::{identity::test_identity_env_lock, secure_fs};
+
+        let _guard = test_identity_env_lock().lock().expect("lock");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("dotlock-unlock-legacy-{unique}"));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        unsafe {
+            std::env::set_var("DOTLOCK_IDENTITY_DIR", &dir);
+        }
+        let write = |name: &str, content: &str| {
+            secure_fs::write_string_atomic(&dir.join(name), content, 0o700, 0o600)
+                .expect("write identity file");
+        };
+        write(
+            "identity.toml",
+            "fingerprint = \"new-fp\"\nencrypted = false\nalg = \"ed25519\"\n",
+        );
+        write(
+            "identity.legacy.toml",
+            "fingerprint = \"old-fp\"\nencrypted = false\n",
+        );
+
+        let mut metadata = toml::from_str::<crate::crypto::VaultKeyMetadata>(
+            r#"
+version = 5
+project_uuid = "project"
+project = "dotlock"
+environment = "dev"
+kdf = "argon2id"
+salt_b64 = "salt"
+memory_kib = 1
+iterations = 1
+parallelism = 1
+kek_version = 1
+wrapped_dek_nonce_b64 = "nonce"
+wrapped_dek_b64 = "wrapped"
+secrets_hash_nonce_b64 = "hash_nonce"
+secrets_hash_b64 = "hash"
+"#,
+        )
+        .expect("metadata");
+        let recipient_with = |fingerprint: &str| crate::crypto::VaultRecipient {
+            id: fingerprint.to_string(),
+            label: fingerprint.to_string(),
+            alg: "rsa-oaep-sha256".to_string(),
+            public_key_fingerprint: fingerprint.to_string(),
+            public_key_b64: "cHVi".to_string(),
+            wrapped_dek_b64: "wrapped".to_string(),
+            wrapped_sdks: std::collections::HashMap::new(),
+            full_access: true,
+            grant_signature_b64: String::new(),
+            grant_signer_fingerprint: String::new(),
+        };
+
+        // Pre-migration vault: only the legacy fingerprint matches.
+        metadata.recipients = vec![recipient_with("old-fp")];
+        let (recipient, legacy) =
+            super::find_local_recipient(&metadata).expect("legacy fallback match");
+        assert!(legacy);
+        assert_eq!(recipient.public_key_fingerprint, "old-fp");
+
+        // Rekeyed vault: the current identity wins (no legacy fallback).
+        metadata.recipients = vec![recipient_with("new-fp"), recipient_with("old-fp")];
+        let (recipient, legacy) =
+            super::find_local_recipient(&metadata).expect("current identity match");
+        assert!(!legacy);
+        assert_eq!(recipient.public_key_fingerprint, "new-fp");
+
+        // No matching recipient at all: no identity unlock is attempted.
+        metadata.recipients = vec![recipient_with("someone-else")];
+        assert!(super::find_local_recipient(&metadata).is_none());
+
+        unsafe {
+            std::env::remove_var("DOTLOCK_IDENTITY_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

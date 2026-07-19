@@ -232,6 +232,13 @@ pub enum CertCommand {
     /// Show the local identity fingerprint and paths
     #[command(alias = "sh")]
     Show,
+    /// Migrate a legacy RSA identity to Ed25519/X25519 and rekey this
+    /// project's recipient entry
+    #[command(alias = "m")]
+    Migrate {
+        #[arg(long, short = 'p')]
+        plain: bool,
+    },
     /// Print or save the local public key
     #[command(alias = "x")]
     ExportPub { path: Option<PathBuf> },

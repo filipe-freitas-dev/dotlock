@@ -617,6 +617,7 @@ mod tests {
         let meta = LocalIdentityMetadata {
             fingerprint: "encrypted-fp".to_string(),
             encrypted: true,
+            alg: crate::crypto::share::IDENTITY_ALG_ED25519.to_string(),
         };
         let content = toml::to_string_pretty(&meta).expect("meta");
         secure_fs::write_string_atomic(&dir.join("identity.toml"), &content, 0o700, 0o600)

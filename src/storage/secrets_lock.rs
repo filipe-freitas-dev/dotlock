@@ -25,7 +25,10 @@ use crate::{
         model::{Alg, DotLockResult},
     },
     storage::{
-        identity::{load_local_identity, load_local_identity_metadata},
+        identity::{
+            LocalIdentity, load_legacy_identity, load_legacy_identity_metadata,
+            load_local_identity, load_local_identity_metadata,
+        },
         project::secrets_file,
         secure_fs,
         vault_file::{load_vault_metadata, record_vault_write},
@@ -333,10 +336,15 @@ fn reject_limited_identity_write(metadata: &crate::crypto::VaultKeyMetadata) -> 
     if metadata.access_mode != AccessMode::Shared {
         return Ok(());
     }
-    let Ok(identity_meta) = load_local_identity_metadata() else {
-        return Ok(());
-    };
-    metadata.reject_limited_identity_write_for_fingerprint(&identity_meta.fingerprint)
+    if let Ok(identity_meta) = load_local_identity_metadata() {
+        metadata.reject_limited_identity_write_for_fingerprint(&identity_meta.fingerprint)?;
+    }
+    // The archived legacy identity (pre `dl cert migrate`) is still "us":
+    // a limited legacy recipient must not write either.
+    if let Ok(legacy_meta) = load_legacy_identity_metadata() {
+        metadata.reject_limited_identity_write_for_fingerprint(&legacy_meta.fingerprint)?;
+    }
+    Ok(())
 }
 
 pub fn migrate_all_secrets_to_envelope(
@@ -552,22 +560,34 @@ fn secret_sdk_from_local_identity(
     metadata: &crate::crypto::VaultKeyMetadata,
     secret: &SecretRecord,
 ) -> DotLockResult<Option<SecretKey>> {
-    let Ok(identity_meta) = load_local_identity_metadata() else {
-        return Ok(None);
-    };
-    let Some(recipient) = metadata
-        .recipients
-        .iter()
-        .find(|recipient| recipient.public_key_fingerprint == identity_meta.fingerprint)
-    else {
-        return Ok(None);
-    };
-    let Some(wrapped_sdk) = recipient.wrapped_sdks.get(&secret.id) else {
-        return Ok(None);
-    };
-    let identity = load_local_identity()?;
-    unwrap_dek_with_private_key(wrapped_sdk, &identity.private_key_pem)
-        .map(|sdk| Some(SecretKey::new(sdk)))
+    // Current identity first; the archived legacy (RSA) identity from
+    // `dl cert migrate` still resolves limited grants that predate the
+    // migration (a limited recipient cannot rekey their own entry — they
+    // stay on RSA until an owner re-grants their new public key).
+    type IdentityLoader = fn() -> DotLockResult<LocalIdentity>;
+    let candidates: [(_, IdentityLoader); 2] = [
+        (load_local_identity_metadata(), load_local_identity),
+        (load_legacy_identity_metadata(), load_legacy_identity),
+    ];
+    for (identity_meta, load) in candidates {
+        let Ok(identity_meta) = identity_meta else {
+            continue;
+        };
+        let Some(recipient) = metadata
+            .recipients
+            .iter()
+            .find(|recipient| recipient.public_key_fingerprint == identity_meta.fingerprint)
+        else {
+            continue;
+        };
+        let Some(wrapped_sdk) = recipient.wrapped_sdks.get(&secret.id) else {
+            continue;
+        };
+        let identity = load()?;
+        return unwrap_dek_with_private_key(wrapped_sdk, &identity.private_key_pem)
+            .map(|sdk| Some(SecretKey::new(sdk)));
+    }
+    Ok(None)
 }
 
 /// Resolves the key that decrypts `secret` from the project key, surfacing
@@ -1056,6 +1076,7 @@ mod tests {
         let identity_meta = crate::storage::identity::LocalIdentityMetadata {
             fingerprint: "limited-fp".to_string(),
             encrypted: false,
+            alg: crate::crypto::share::IDENTITY_ALG_ED25519.to_string(),
         };
         let meta_content = toml::to_string_pretty(&identity_meta).expect("identity meta");
         crate::storage::secure_fs::write_string_atomic(

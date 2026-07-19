@@ -1173,3 +1173,65 @@ fn get_piped_output_stays_bare_with_and_without_reveal() {
         .success()
         .stdout("bar-value\n");
 }
+
+/// RSA-exit (ADR 0001): a fresh setup — `dl cert init` identity plus a shared
+/// grant — is Ed25519/X25519 end to end: the identity reports `ed25519`, the
+/// vault records an `x25519-sealedbox` recipient (never the legacy RSA alg),
+/// and after dropping the session cache the vault unlocks via the modern
+/// identity with no password and zero RSA operations.
+#[test]
+fn fresh_shared_setup_uses_modern_crypto_with_zero_rsa() {
+    let env = TestEnv::new();
+    env.init_vault();
+    env.dl()
+        .args(["set", "FOO", "bar-value"])
+        .assert()
+        .success();
+
+    // New identities are Ed25519 (no passphrase so the test stays
+    // non-interactive; passphrase protection is orthogonal to the algorithm).
+    env.dl()
+        .args(["cert", "init", "--plain"])
+        .assert()
+        .success();
+    env.dl()
+        .args(["cert", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ed25519"));
+
+    let pubkey = env.project.join("me.pub.pem");
+    env.dl()
+        .args(["cert", "export-pub"])
+        .arg(&pubkey)
+        .assert()
+        .success();
+
+    env.dl()
+        .env("DOTLOCK_MASTER_PASSWORD", MASTER_PASSWORD)
+        .args(["share", "grant", "--pubkey"])
+        .arg(&pubkey)
+        .args(["--label", "me"])
+        .assert()
+        .success();
+
+    // The vault records the modern wrapping algorithm — and no RSA one.
+    let vault = fs::read_to_string(env.lock_path("vault.toml")).expect("read vault.toml");
+    assert!(
+        vault.contains("x25519-sealedbox"),
+        "recipient must be wrapped with the X25519 sealed box:\n{vault}"
+    );
+    assert!(
+        !vault.contains("rsa-oaep-sha256"),
+        "a fresh setup must contain zero RSA material:\n{vault}"
+    );
+
+    // Drop the session cache: the next read unlocks through the Ed25519
+    // identity (sealed-box open), with no master password available.
+    env.dl().arg("lock").assert().success();
+    env.dl()
+        .args(["get", "FOO"])
+        .assert()
+        .success()
+        .stdout("bar-value\n");
+}
